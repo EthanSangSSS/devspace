@@ -191,3 +191,186 @@ await shutdownDuringReserve;
 assert.equal(raceRegistry.snapshot().state, "closed");
 assert.equal(raceRegistry.snapshot().current, 0);
 assert.equal(raceRegistry.snapshot().pendingReservations, 0);
+
+// Ordinary request activity uses the same opaque lease accounting as
+// initialization. Idle ordering is established when the final lease releases.
+now = 0;
+const leaseRegistry = new McpSessionRegistry<FakeTransport>({
+  maxSessions: 2,
+  now: () => now,
+});
+const older = createTransport();
+const newer = createTransport();
+const olderReservation = await leaseRegistry.reserve();
+const olderInitializationLease = await leaseRegistry.commit(
+  olderReservation,
+  "older",
+  older,
+);
+assert.ok(olderInitializationLease);
+assert.equal(leaseRegistry.release(olderInitializationLease), true);
+
+now = 1_000;
+const newerReservation = await leaseRegistry.reserve();
+const newerInitializationLease = await leaseRegistry.commit(
+  newerReservation,
+  "newer",
+  newer,
+);
+assert.ok(newerInitializationLease);
+assert.equal(leaseRegistry.release(newerInitializationLease), true);
+
+const newerLease = leaseRegistry.acquire("newer");
+assert.ok(newerLease);
+assert.equal(leaseRegistry.snapshot().active, 1);
+now = 5_000;
+assert.equal(leaseRegistry.release(newerLease), true);
+assert.equal(leaseRegistry.snapshot().active, 0);
+
+const evictionReservation = await leaseRegistry.reserve();
+assert.equal(older.closeCalls, 1);
+assert.equal(leaseRegistry.acquire("older"), undefined);
+const survivingNewerLease = leaseRegistry.acquire("newer");
+assert.ok(survivingNewerLease);
+assert.equal(leaseRegistry.release(survivingNewerLease), true);
+assert.equal(leaseRegistry.snapshot().pendingReservations, 1);
+assert.equal(leaseRegistry.cancel(evictionReservation), true);
+
+// Disposal removes ownership before awaiting close and is idempotent. A
+// transport_close callback converges on ownership removal without closing the
+// already-closed transport recursively.
+const disposeRegistry = new McpSessionRegistry<FakeTransport>();
+const disposedTransport = createTransport();
+const disposedReservation = await disposeRegistry.reserve();
+const disposedInitializationLease = await disposeRegistry.commit(
+  disposedReservation,
+  "dispose-me",
+  disposedTransport,
+);
+assert.ok(disposedInitializationLease);
+assert.equal(disposeRegistry.release(disposedInitializationLease), true);
+assert.deepEqual(
+  await disposeRegistry.dispose("dispose-me", "capacity_eviction"),
+  { sessionId: "dispose-me" },
+);
+assert.equal(disposedTransport.closeCalls, 1);
+assert.equal(
+  await disposeRegistry.dispose("dispose-me", "capacity_eviction"),
+  undefined,
+);
+assert.equal(disposedTransport.closeCalls, 1);
+
+const onCloseTransport = createTransport();
+const onCloseReservation = await disposeRegistry.reserve();
+const onCloseInitializationLease = await disposeRegistry.commit(
+  onCloseReservation,
+  "already-closed",
+  onCloseTransport,
+);
+assert.ok(onCloseInitializationLease);
+assert.equal(disposeRegistry.release(onCloseInitializationLease), true);
+assert.deepEqual(
+  await disposeRegistry.dispose("already-closed", "transport_close"),
+  { sessionId: "already-closed" },
+);
+assert.equal(onCloseTransport.closeCalls, 0);
+
+// Shutdown fences new work synchronously, then drains active leases before
+// closing transports when requests finish within the bounded drain window.
+let finishGracefulTimeout: (() => void) | undefined;
+const gracefulRegistry = new McpSessionRegistry<FakeTransport>({
+  waitForTimeout: () =>
+    new Promise<void>((resolve) => {
+      finishGracefulTimeout = resolve;
+    }),
+});
+const gracefulTransport = createTransport();
+const gracefulReservation = await gracefulRegistry.reserve();
+const gracefulInitializationLease = await gracefulRegistry.commit(
+  gracefulReservation,
+  "graceful",
+  gracefulTransport,
+);
+assert.ok(gracefulInitializationLease);
+assert.equal(gracefulRegistry.release(gracefulInitializationLease), true);
+const gracefulLease = gracefulRegistry.acquire("graceful");
+assert.ok(gracefulLease);
+
+let gracefulCloseSettled = false;
+const gracefulClose = gracefulRegistry
+  .closeAll({ drainTimeoutMs: 35_000 })
+  .finally(() => {
+    gracefulCloseSettled = true;
+  });
+await Promise.resolve();
+assert.equal(gracefulRegistry.snapshot().state, "closing");
+assert.equal(gracefulTransport.closeCalls, 0);
+assert.equal(gracefulCloseSettled, false);
+await assert.rejects(
+  gracefulRegistry.reserve(),
+  (error: unknown) =>
+    error instanceof McpSessionAdmissionError && error.reason === "closing",
+);
+assert.equal(gracefulRegistry.acquire("graceful"), undefined);
+assert.equal(gracefulRegistry.release(gracefulLease), true);
+await gracefulClose;
+assert.equal(gracefulTransport.closeCalls, 1);
+assert.equal(gracefulRegistry.snapshot().state, "closed");
+finishGracefulTimeout?.();
+
+// If the drain deadline wins, shutdown detaches/closes active sessions and
+// clears lease bookkeeping so a late release is harmless.
+let finishForcedTimeout: (() => void) | undefined;
+const forcedRegistry = new McpSessionRegistry<FakeTransport>({
+  waitForTimeout: () =>
+    new Promise<void>((resolve) => {
+      finishForcedTimeout = resolve;
+    }),
+});
+const forcedTransport = createTransport();
+const forcedReservation = await forcedRegistry.reserve();
+const forcedInitializationLease = await forcedRegistry.commit(
+  forcedReservation,
+  "forced",
+  forcedTransport,
+);
+assert.ok(forcedInitializationLease);
+assert.equal(forcedRegistry.release(forcedInitializationLease), true);
+const forcedLease = forcedRegistry.acquire("forced");
+assert.ok(forcedLease);
+const forcedClose = forcedRegistry.closeAll({ drainTimeoutMs: 35_000 });
+await Promise.resolve();
+assert.equal(forcedRegistry.snapshot().state, "closing");
+assert.equal(forcedTransport.closeCalls, 0);
+finishForcedTimeout?.();
+await forcedClose;
+assert.equal(forcedTransport.closeCalls, 1);
+assert.equal(forcedRegistry.snapshot().state, "closed");
+assert.equal(forcedRegistry.release(forcedLease), false);
+
+// A reservation obtained before shutdown cannot commit afterward. The
+// uncommitted transport is closed exactly once and never enters the registry.
+let finishCommitRaceTimeout: (() => void) | undefined;
+const commitRaceRegistry = new McpSessionRegistry<FakeTransport>({
+  waitForTimeout: () =>
+    new Promise<void>((resolve) => {
+      finishCommitRaceTimeout = resolve;
+    }),
+});
+const commitRaceReservation = await commitRaceRegistry.reserve();
+const commitRaceClose = commitRaceRegistry.closeAll({ drainTimeoutMs: 35_000 });
+const lateTransport = createTransport();
+assert.equal(
+  await commitRaceRegistry.commit(
+    commitRaceReservation,
+    "late",
+    lateTransport,
+  ),
+  false,
+);
+assert.equal(lateTransport.closeCalls, 1);
+finishCommitRaceTimeout?.();
+await commitRaceClose;
+assert.equal(commitRaceRegistry.snapshot().current, 0);
+assert.equal(commitRaceRegistry.snapshot().pendingReservations, 0);
+assert.equal(commitRaceRegistry.snapshot().state, "closed");

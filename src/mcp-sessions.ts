@@ -83,13 +83,17 @@ export interface McpSessionRegistryOptions {
   onEvent?: (event: McpSessionLifecycleEvent) => void;
 }
 
+export const MCP_SESSION_DRAIN_TIMEOUT_MS = 35_000;
+
 export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   private readonly sessions = new Map<string, McpSessionEntry<TTransport>>();
   private readonly reservations = new Set<number>();
   private readonly leases = new Map<number, string>();
   private readonly now: () => number;
   private readonly maxSessions: number;
+  private readonly waitForTimeout: (ms: number) => Promise<void>;
   private readonly onEvent?: (event: McpSessionLifecycleEvent) => void;
+  private readonly drainWaiters = new Set<() => void>();
   private state: McpSessionRegistryState = "running";
   private nextReservationToken = 1;
   private nextLeaseToken = 1;
@@ -102,6 +106,9 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   constructor(options: McpSessionRegistryOptions = {}) {
     this.now = options.now ?? Date.now;
     this.maxSessions = options.maxSessions ?? 64;
+    this.waitForTimeout =
+      options.waitForTimeout ??
+      ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     this.onEvent = options.onEvent;
     if (!Number.isInteger(this.maxSessions) || this.maxSessions < 1) {
       throw new Error("MCP session max must be a positive integer");
@@ -207,6 +214,17 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return this.reservations.delete(reservation.token);
   }
 
+  acquire(sessionId: string): McpSessionLease<TTransport> | undefined {
+    if (this.state !== "running") return undefined;
+    const entry = this.sessions.get(sessionId);
+    if (!entry || entry.disposing) return undefined;
+
+    entry.inFlight += 1;
+    const token = this.nextLeaseToken++;
+    this.leases.set(token, sessionId);
+    return { token, sessionId, transport: entry.transport };
+  }
+
   release(lease: McpSessionLease<TTransport>): boolean {
     const sessionId = this.leases.get(lease.token);
     if (sessionId === undefined) return false;
@@ -217,8 +235,31 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     if (entry.inFlight <= 0) return false;
 
     entry.inFlight -= 1;
-    if (entry.inFlight === 0) entry.idleSince = this.now();
+    if (entry.inFlight === 0) {
+      entry.idleSince = this.now();
+      this.notifyDrainWaitersIfIdle();
+    }
     return true;
+  }
+
+  async dispose(
+    sessionId: string,
+    reason: McpSessionDisposeReason,
+    context: McpSessionOperationContext = {},
+  ): Promise<McpSessionCloseResult | undefined> {
+    const detached = this.detach(sessionId, reason);
+    if (!detached) return undefined;
+    if (reason === "transport_close") {
+      this.closedTotal += 1;
+      this.emit({
+        type: "closed",
+        sessionId,
+        reason,
+        requestId: context.requestId,
+      });
+      return { sessionId };
+    }
+    return this.closeDetached(detached, context);
   }
 
   // Compatibility surface retained only until server wiring migrates to the
@@ -261,10 +302,23 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return Promise.all(detached.map((session) => this.closeDetached(session)));
   }
 
-  async closeAll(): Promise<McpSessionCloseResult[]> {
+  async closeAll(
+    options: { drainTimeoutMs?: number } = {},
+  ): Promise<McpSessionCloseResult[]> {
     if (this.state === "closed") return [];
-    this.state = "closing";
-    this.reservations.clear();
+    if (this.state === "running") {
+      this.state = "closing";
+      this.reservations.clear();
+    }
+
+    const drainTimeoutMs =
+      options.drainTimeoutMs ?? MCP_SESSION_DRAIN_TIMEOUT_MS;
+    if (this.activeCount() > 0) {
+      await Promise.race([
+        this.waitForActiveDrain(),
+        this.waitForTimeout(drainTimeoutMs),
+      ]);
+    }
 
     const detached: DetachedSession<TTransport>[] = [];
     for (const sessionId of [...this.sessions.keys()]) {
@@ -277,7 +331,33 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
       detached.map((session) => this.closeDetached(session)),
     );
     this.state = "closed";
+    this.notifyAllDrainWaiters();
     return results;
+  }
+
+  private activeCount(): number {
+    let active = 0;
+    for (const entry of this.sessions.values()) {
+      if (entry.inFlight > 0) active += 1;
+    }
+    return active;
+  }
+
+  private waitForActiveDrain(): Promise<void> {
+    if (this.activeCount() === 0) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      this.drainWaiters.add(resolve);
+    });
+  }
+
+  private notifyDrainWaitersIfIdle(): void {
+    if (this.activeCount() !== 0) return;
+    this.notifyAllDrainWaiters();
+  }
+
+  private notifyAllDrainWaiters(): void {
+    for (const resolve of this.drainWaiters) resolve();
+    this.drainWaiters.clear();
   }
 
   private oldestIdleSession(): { sessionId: string; idleSince: number } | undefined {
