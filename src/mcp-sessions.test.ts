@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { McpSessionRegistry } from "./mcp-sessions.js";
+import {
+  McpSessionAdmissionError,
+  McpSessionRegistry,
+} from "./mcp-sessions.js";
 
 interface FakeTransport {
   closeCalls: number;
@@ -84,3 +87,25 @@ finishDelayedClose?.();
 await delayedClose;
 assert.equal(delayedCloseResolved, true);
 assert.equal(registry.size, 0);
+
+// Bounded admission must reserve capacity before any asynchronous transport
+// creation can oversubscribe the configured session cap.
+now = 0;
+const bounded = new McpSessionRegistry<FakeTransport>({
+  maxSessions: 2,
+  now: () => now,
+});
+const r1 = await bounded.reserve({ requestId: "r1" });
+const r2 = await bounded.reserve({ requestId: "r2" });
+assert.equal(bounded.snapshot().pendingReservations, 2);
+await assert.rejects(
+  bounded.reserve({ requestId: "r3" }),
+  (error: unknown) =>
+    error instanceof McpSessionAdmissionError && error.reason === "capacity",
+);
+assert.equal(
+  bounded.snapshot().current + bounded.snapshot().pendingReservations,
+  2,
+);
+assert.equal(bounded.cancel(r1), true);
+assert.equal(bounded.cancel(r2), true);

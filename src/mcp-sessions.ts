@@ -7,6 +7,28 @@ export interface McpSessionCloseResult {
   error?: unknown;
 }
 
+export class McpSessionAdmissionError extends Error {
+  readonly reason: "capacity";
+
+  constructor(reason: "capacity") {
+    super(`MCP session admission rejected: ${reason}`);
+    this.name = "McpSessionAdmissionError";
+    this.reason = reason;
+  }
+}
+
+export interface McpSessionReservation {
+  readonly id: number;
+}
+
+export interface McpSessionRegistrySnapshot {
+  state: "running";
+  current: number;
+  active: number;
+  pendingReservations: number;
+  max: number;
+}
+
 interface McpSessionEntry<TTransport> {
   transport: TTransport;
   lastActivityAt: number;
@@ -14,18 +36,47 @@ interface McpSessionEntry<TTransport> {
 
 export interface McpSessionRegistryOptions {
   now?: () => number;
+  maxSessions?: number;
 }
 
 export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   private readonly sessions = new Map<string, McpSessionEntry<TTransport>>();
   private readonly now: () => number;
+  private readonly maxSessions: number;
+  private readonly reservations = new Set<McpSessionReservation>();
+  private nextReservationId = 1;
 
   constructor(options: McpSessionRegistryOptions = {}) {
     this.now = options.now ?? Date.now;
+    this.maxSessions = options.maxSessions ?? Number.MAX_SAFE_INTEGER;
   }
 
   get size(): number {
     return this.sessions.size;
+  }
+
+  async reserve(_context: { requestId?: string } = {}): Promise<McpSessionReservation> {
+    if (this.sessions.size + this.reservations.size >= this.maxSessions) {
+      throw new McpSessionAdmissionError("capacity");
+    }
+
+    const reservation = { id: this.nextReservationId++ };
+    this.reservations.add(reservation);
+    return reservation;
+  }
+
+  cancel(reservation: McpSessionReservation): boolean {
+    return this.reservations.delete(reservation);
+  }
+
+  snapshot(): McpSessionRegistrySnapshot {
+    return {
+      state: "running",
+      current: this.sessions.size,
+      active: 0,
+      pendingReservations: this.reservations.size,
+      max: this.maxSessions,
+    };
   }
 
   register(sessionId: string, transport: TTransport): void {
