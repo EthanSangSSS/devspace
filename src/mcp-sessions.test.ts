@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { McpSessionRegistry } from "./mcp-sessions.js";
+import {
+  McpSessionAdmissionError,
+  McpSessionRegistry,
+} from "./mcp-sessions.js";
 
 interface FakeTransport {
   closeCalls: number;
@@ -71,8 +74,9 @@ const delayedTransport: FakeTransport = {
     });
   },
 };
-registry.register("delayed", delayedTransport);
-const delayedClose = registry.closeAll();
+const delayedRegistry = new McpSessionRegistry<FakeTransport>();
+delayedRegistry.register("delayed", delayedTransport);
+const delayedClose = delayedRegistry.closeAll();
 void delayedClose.then(() => {
   delayedCloseResolved = true;
 });
@@ -83,4 +87,107 @@ assert.equal(delayedTransport.closeCalls, 1);
 finishDelayedClose?.();
 await delayedClose;
 assert.equal(delayedCloseResolved, true);
-assert.equal(registry.size, 0);
+assert.equal(delayedRegistry.size, 0);
+
+// Bounded admission is reserved synchronously so concurrent initializations
+// cannot oversubscribe the configured session cap.
+now = 0;
+const bounded = new McpSessionRegistry<FakeTransport>({
+  maxSessions: 2,
+  now: () => now,
+});
+const r1 = await bounded.reserve({ requestId: "r1" });
+const r2 = await bounded.reserve({ requestId: "r2" });
+assert.equal(bounded.snapshot().pendingReservations, 2);
+await assert.rejects(
+  bounded.reserve({ requestId: "r3" }),
+  (error: unknown) =>
+    error instanceof McpSessionAdmissionError && error.reason === "capacity",
+);
+assert.equal(
+  bounded.snapshot().current + bounded.snapshot().pendingReservations,
+  2,
+);
+assert.equal(bounded.cancel(r1), true);
+assert.equal(bounded.cancel(r2), true);
+
+// A committed-but-still-initializing session owns an initialization lease and
+// is therefore active/protected at capacity until the outer initialize request
+// releases that lease.
+const initRegistry = new McpSessionRegistry<FakeTransport>({
+  maxSessions: 1,
+  now: () => now,
+});
+const initAReservation = await initRegistry.reserve();
+const initATransport = createTransport();
+const initA = await initRegistry.commit(
+  initAReservation,
+  "a",
+  initATransport,
+);
+assert.ok(initA);
+assert.equal(initRegistry.snapshot().active, 1);
+
+await assert.rejects(
+  initRegistry.reserve(),
+  (error: unknown) =>
+    error instanceof McpSessionAdmissionError && error.reason === "capacity",
+);
+assert.equal(initRegistry.snapshot().current, 1);
+assert.equal(initRegistry.snapshot().active, 1);
+assert.equal(initATransport.closeCalls, 0);
+
+now = 1_000;
+assert.equal(initRegistry.release(initA), true);
+assert.equal(initRegistry.release(initA), false);
+assert.equal(initRegistry.snapshot().active, 0);
+const afterInitialize = await initRegistry.reserve();
+assert.equal(initRegistry.snapshot().current, 0);
+assert.equal(initRegistry.snapshot().pendingReservations, 1);
+assert.equal(initATransport.closeCalls, 1);
+assert.equal(initRegistry.cancel(afterInitialize), true);
+
+// If an idle eviction close is still in flight when shutdown begins, the
+// pending reservation must be fenced and never returned to its caller.
+let finishEvictionClose: (() => void) | undefined;
+const raceRegistry = new McpSessionRegistry<FakeTransport>({
+  maxSessions: 1,
+  now: () => now,
+});
+const raceAReservation = await raceRegistry.reserve();
+const raceATransport: FakeTransport = {
+  closeCalls: 0,
+  close() {
+    this.closeCalls += 1;
+    return new Promise<void>((resolve) => {
+      finishEvictionClose = resolve;
+    });
+  },
+};
+const raceALease = await raceRegistry.commit(
+  raceAReservation,
+  "race-a",
+  raceATransport,
+);
+assert.ok(raceALease);
+assert.equal(raceRegistry.release(raceALease), true);
+
+let reserveSettled = false;
+const pendingReserve = raceRegistry.reserve().finally(() => {
+  reserveSettled = true;
+});
+await Promise.resolve();
+assert.equal(raceATransport.closeCalls, 1);
+assert.equal(reserveSettled, false);
+
+const shutdownDuringReserve = raceRegistry.closeAll();
+finishEvictionClose?.();
+await assert.rejects(
+  pendingReserve,
+  (error: unknown) =>
+    error instanceof McpSessionAdmissionError && error.reason === "closing",
+);
+await shutdownDuringReserve;
+assert.equal(raceRegistry.snapshot().state, "closed");
+assert.equal(raceRegistry.snapshot().current, 0);
+assert.equal(raceRegistry.snapshot().pendingReservations, 0);
