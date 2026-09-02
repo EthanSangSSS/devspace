@@ -14,6 +14,8 @@ const DEFAULT_ARTIFACT_MAX_FILE_BYTES = 100 * 1024 * 1024;
 export interface ServerConfig {
   host: string;
   port: number;
+  mcpMaxSessions: number;
+  runtimeSnapshotIntervalMs: number;
   oauth: OAuthConfig;
   allowedRoots: string[];
   allowedHosts: string[];
@@ -143,6 +145,21 @@ function parsePositiveInteger(
   return parsed;
 }
 
+function parseBoundedInteger(
+  value: string | undefined,
+  fallback: number,
+  name: string,
+  min: number,
+  max: number,
+): number {
+  if (!value) return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+    throw new Error(`Invalid ${name}: ${value}`);
+  }
+  return parsed;
+}
+
 function parseLoggingConfig(env: NodeJS.ProcessEnv): LoggingConfig {
   return {
     level: parseLogLevel(env.DEVSPACE_LOG_LEVEL),
@@ -226,6 +243,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   return {
     host,
     port,
+    mcpMaxSessions: parsePositiveInteger(
+      env.DEVSPACE_MCP_MAX_SESSIONS,
+      64,
+      "DEVSPACE_MCP_MAX_SESSIONS",
+      4096,
+    ),
+    runtimeSnapshotIntervalMs: parseBoundedInteger(
+      env.DEVSPACE_RUNTIME_SNAPSHOT_INTERVAL_MS,
+      60_000,
+      "DEVSPACE_RUNTIME_SNAPSHOT_INTERVAL_MS",
+      1_000,
+      3_600_000,
+    ),
     oauth: parseOAuthConfig(env, files.auth.ownerToken),
     allowedRoots: parseAllowedRoots(env.DEVSPACE_ALLOWED_ROOTS ?? files.config.allowedRoots),
     allowedHosts: parseAllowedHosts(env.DEVSPACE_ALLOWED_HOSTS, derivedAllowedHosts),

@@ -28,6 +28,17 @@ assert.equal(loadConfig(baseEnv).devspaceAgentsDir, join(emptyConfigDir, "agents
 assert.equal(loadConfig(baseEnv).subagents, false);
 assert.equal(loadConfig(baseEnv).artifactsEnabled, false);
 assert.equal(loadConfig(baseEnv).artifactMaxFileBytes, 100 * 1024 * 1024);
+assert.equal(loadConfig(baseEnv).mcpMaxSessions, 64);
+assert.equal(loadConfig(baseEnv).runtimeSnapshotIntervalMs, 60_000);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_MCP_MAX_SESSIONS: "8" }).mcpMaxSessions,
+  8,
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_RUNTIME_SNAPSHOT_INTERVAL_MS: "1000" })
+    .runtimeSnapshotIntervalMs,
+  1_000,
+);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_ARTIFACTS: "1" }).artifactsEnabled, true);
 assert.equal(
   loadConfig({ ...baseEnv, DEVSPACE_ARTIFACT_MAX_FILE_BYTES: "123" }).artifactMaxFileBytes,
@@ -148,6 +159,26 @@ assert.throws(
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_ARTIFACT_MAX_FILE_BYTES: "0" }),
   /Invalid DEVSPACE_ARTIFACT_MAX_FILE_BYTES: 0/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_MCP_MAX_SESSIONS: "0" }),
+  /Invalid DEVSPACE_MCP_MAX_SESSIONS: 0/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_MCP_MAX_SESSIONS: "4097" }),
+  /Invalid DEVSPACE_MCP_MAX_SESSIONS: 4097/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_RUNTIME_SNAPSHOT_INTERVAL_MS: "999" }),
+  /Invalid DEVSPACE_RUNTIME_SNAPSHOT_INTERVAL_MS: 999/,
+);
+assert.throws(
+  () =>
+    loadConfig({
+      ...baseEnv,
+      DEVSPACE_RUNTIME_SNAPSHOT_INTERVAL_MS: "3600001",
+    }),
+  /Invalid DEVSPACE_RUNTIME_SNAPSHOT_INTERVAL_MS: 3600001/,
 );
 
 assert.equal(loadConfig(baseEnv).publicBaseUrl, "http://127.0.0.1:7676");
