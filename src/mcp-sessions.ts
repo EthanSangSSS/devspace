@@ -2,95 +2,285 @@ export interface ClosableMcpTransport {
   close(): Promise<void>;
 }
 
+export type McpSessionRegistryState = "running" | "closing" | "closed";
+
+export type McpSessionDisposeReason =
+  | "transport_close"
+  | "capacity_eviction"
+  | "idle_timeout"
+  | "server_shutdown"
+  | "initialize_failure";
+
+export type McpSessionAdmissionFailure = "capacity" | "closing";
+
+export interface McpSessionOperationContext {
+  requestId?: string;
+}
+
+export interface McpSessionReservation {
+  readonly token: number;
+}
+
+export interface McpSessionLease<TTransport> {
+  readonly token: number;
+  readonly sessionId: string;
+  readonly transport: TTransport;
+}
+
+export interface McpSessionRegistrySnapshot {
+  state: McpSessionRegistryState;
+  current: number;
+  active: number;
+  pendingReservations: number;
+  max: number;
+  createdTotal: number;
+  closedTotal: number;
+  evictedTotal: number;
+  closeErrorTotal: number;
+  capacityRejectedTotal: number;
+}
+
 export interface McpSessionCloseResult {
   sessionId: string;
   error?: unknown;
 }
 
+export interface McpSessionLifecycleEvent {
+  type: "created" | "closed" | "evicted" | "capacity_rejected" | "close_failed";
+  sessionId?: string;
+  reason?: McpSessionDisposeReason;
+  requestId?: string;
+  snapshot: McpSessionRegistrySnapshot;
+}
+
 export class McpSessionAdmissionError extends Error {
-  readonly reason: "capacity";
-
-  constructor(reason: "capacity") {
-    super(`MCP session admission rejected: ${reason}`);
-    this.name = "McpSessionAdmissionError";
-    this.reason = reason;
+  constructor(readonly reason: McpSessionAdmissionFailure) {
+    super(
+      reason === "capacity"
+        ? "MCP session capacity exhausted"
+        : "MCP session registry is closing",
+    );
   }
-}
-
-export interface McpSessionReservation {
-  readonly id: number;
-}
-
-export interface McpSessionRegistrySnapshot {
-  state: "running";
-  current: number;
-  active: number;
-  pendingReservations: number;
-  max: number;
 }
 
 interface McpSessionEntry<TTransport> {
   transport: TTransport;
-  lastActivityAt: number;
+  idleSince: number | undefined;
+  inFlight: number;
+  disposing: boolean;
+}
+
+interface DetachedSession<TTransport> {
+  sessionId: string;
+  transport: TTransport;
+  reason: McpSessionDisposeReason;
 }
 
 export interface McpSessionRegistryOptions {
   now?: () => number;
   maxSessions?: number;
+  waitForTimeout?: (ms: number) => Promise<void>;
+  onEvent?: (event: McpSessionLifecycleEvent) => void;
 }
+
+export const MCP_SESSION_DRAIN_TIMEOUT_MS = 35_000;
 
 export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   private readonly sessions = new Map<string, McpSessionEntry<TTransport>>();
+  private readonly reservations = new Set<number>();
+  private readonly leases = new Map<number, string>();
   private readonly now: () => number;
   private readonly maxSessions: number;
-  private readonly reservations = new Set<McpSessionReservation>();
-  private nextReservationId = 1;
+  private readonly waitForTimeout: (ms: number) => Promise<void>;
+  private readonly onEvent?: (event: McpSessionLifecycleEvent) => void;
+  private readonly drainWaiters = new Set<() => void>();
+  private state: McpSessionRegistryState = "running";
+  private nextReservationToken = 1;
+  private nextLeaseToken = 1;
+  private createdTotal = 0;
+  private closedTotal = 0;
+  private evictedTotal = 0;
+  private closeErrorTotal = 0;
+  private capacityRejectedTotal = 0;
 
   constructor(options: McpSessionRegistryOptions = {}) {
     this.now = options.now ?? Date.now;
-    this.maxSessions = options.maxSessions ?? Number.MAX_SAFE_INTEGER;
+    this.maxSessions = options.maxSessions ?? 64;
+    this.waitForTimeout =
+      options.waitForTimeout ??
+      ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    this.onEvent = options.onEvent;
+    if (!Number.isInteger(this.maxSessions) || this.maxSessions < 1) {
+      throw new Error("MCP session max must be a positive integer");
+    }
   }
 
   get size(): number {
     return this.sessions.size;
   }
 
-  async reserve(_context: { requestId?: string } = {}): Promise<McpSessionReservation> {
-    if (this.sessions.size + this.reservations.size >= this.maxSessions) {
-      throw new McpSessionAdmissionError("capacity");
-    }
-
-    const reservation = { id: this.nextReservationId++ };
-    this.reservations.add(reservation);
-    return reservation;
-  }
-
-  cancel(reservation: McpSessionReservation): boolean {
-    return this.reservations.delete(reservation);
-  }
-
   snapshot(): McpSessionRegistrySnapshot {
+    let active = 0;
+    for (const entry of this.sessions.values()) {
+      if (entry.inFlight > 0) active += 1;
+    }
     return {
-      state: "running",
+      state: this.state,
       current: this.sessions.size,
-      active: 0,
+      active,
       pendingReservations: this.reservations.size,
       max: this.maxSessions,
+      createdTotal: this.createdTotal,
+      closedTotal: this.closedTotal,
+      evictedTotal: this.evictedTotal,
+      closeErrorTotal: this.closeErrorTotal,
+      capacityRejectedTotal: this.capacityRejectedTotal,
     };
   }
 
-  register(sessionId: string, transport: TTransport): void {
+  async reserve(
+    context: McpSessionOperationContext = {},
+  ): Promise<McpSessionReservation> {
+    if (this.state !== "running") {
+      throw new McpSessionAdmissionError("closing");
+    }
+
+    let detached: DetachedSession<TTransport> | undefined;
+    if (this.sessions.size + this.reservations.size >= this.maxSessions) {
+      const oldestIdle = this.oldestIdleSession();
+      if (!oldestIdle) {
+        this.capacityRejectedTotal += 1;
+        this.emit({
+          type: "capacity_rejected",
+          requestId: context.requestId,
+        });
+        throw new McpSessionAdmissionError("capacity");
+      }
+      detached = this.detach(oldestIdle.sessionId, "capacity_eviction");
+    }
+
+    const token = this.nextReservationToken++;
+    this.reservations.add(token);
+
+    if (detached) await this.closeDetached(detached, context);
+    if (this.state !== "running" || !this.reservations.has(token)) {
+      this.reservations.delete(token);
+      throw new McpSessionAdmissionError("closing");
+    }
+    return { token };
+  }
+
+  async commit(
+    reservation: McpSessionReservation,
+    sessionId: string,
+    transport: TTransport,
+    context: McpSessionOperationContext = {},
+  ): Promise<McpSessionLease<TTransport> | false> {
+    const reserved = this.reservations.delete(reservation.token);
+    if (!reserved) {
+      await this.closeUncommitted(transport, context);
+      if (this.state !== "running") return false;
+      throw new Error("Unknown or already-consumed MCP session reservation");
+    }
+
+    if (this.state !== "running") {
+      await this.closeUncommitted(transport, context);
+      return false;
+    }
+
+    if (this.sessions.has(sessionId)) {
+      await this.closeUncommitted(transport, context);
+      throw new Error("Duplicate MCP session ID");
+    }
+
+    const leaseToken = this.nextLeaseToken++;
     this.sessions.set(sessionId, {
       transport,
-      lastActivityAt: this.now(),
+      idleSince: undefined,
+      inFlight: 1,
+      disposing: false,
+    });
+    this.leases.set(leaseToken, sessionId);
+    this.createdTotal += 1;
+    this.emit({
+      type: "created",
+      sessionId,
+      requestId: context.requestId,
+    });
+    return { token: leaseToken, sessionId, transport };
+  }
+
+  cancel(reservation: McpSessionReservation): boolean {
+    return this.reservations.delete(reservation.token);
+  }
+
+  acquire(sessionId: string): McpSessionLease<TTransport> | undefined {
+    if (this.state !== "running") return undefined;
+    const entry = this.sessions.get(sessionId);
+    if (!entry || entry.disposing) return undefined;
+
+    entry.inFlight += 1;
+    const token = this.nextLeaseToken++;
+    this.leases.set(token, sessionId);
+    return { token, sessionId, transport: entry.transport };
+  }
+
+  release(lease: McpSessionLease<TTransport>): boolean {
+    const sessionId = this.leases.get(lease.token);
+    if (sessionId === undefined) return false;
+    this.leases.delete(lease.token);
+
+    const entry = this.sessions.get(sessionId);
+    if (!entry) return false;
+    if (entry.inFlight <= 0) return false;
+
+    entry.inFlight -= 1;
+    if (entry.inFlight === 0) {
+      entry.idleSince = this.now();
+      this.notifyDrainWaitersIfIdle();
+    }
+    return true;
+  }
+
+  async dispose(
+    sessionId: string,
+    reason: McpSessionDisposeReason,
+    context: McpSessionOperationContext = {},
+  ): Promise<McpSessionCloseResult | undefined> {
+    const detached = this.detach(sessionId, reason);
+    if (!detached) return undefined;
+    if (reason === "transport_close") {
+      this.closedTotal += 1;
+      this.emit({
+        type: "closed",
+        sessionId,
+        reason,
+        requestId: context.requestId,
+      });
+      return { sessionId };
+    }
+    return this.closeDetached(detached, context);
+  }
+
+  // Compatibility surface retained only until server wiring migrates to the
+  // reservation/lease API in a later plan task.
+  register(sessionId: string, transport: TTransport): void {
+    if (this.state !== "running") {
+      throw new McpSessionAdmissionError("closing");
+    }
+    this.sessions.set(sessionId, {
+      transport,
+      idleSince: this.now(),
+      inFlight: 0,
+      disposing: false,
     });
   }
 
   get(sessionId: string): TTransport | undefined {
+    if (this.state !== "running") return undefined;
     const entry = this.sessions.get(sessionId);
-    if (!entry) return undefined;
-
-    entry.lastActivityAt = this.now();
+    if (!entry || entry.disposing) return undefined;
+    entry.idleSince = this.now();
     return entry.transport;
   }
 
@@ -100,39 +290,151 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
 
   async closeIdle(idleTimeoutMs: number): Promise<McpSessionCloseResult[]> {
     const cutoff = this.now() - idleTimeoutMs;
-    const idleSessions: Array<{ sessionId: string; transport: TTransport }> = [];
+    const detached: DetachedSession<TTransport>[] = [];
 
     for (const [sessionId, entry] of this.sessions) {
-      if (entry.lastActivityAt > cutoff) continue;
-
-      this.sessions.delete(sessionId);
-      idleSessions.push({ sessionId, transport: entry.transport });
+      if (entry.inFlight !== 0 || entry.idleSince === undefined) continue;
+      if (entry.idleSince > cutoff) continue;
+      const removed = this.detach(sessionId, "idle_timeout");
+      if (removed) detached.push(removed);
     }
 
-    return closeSessions(idleSessions);
+    return Promise.all(detached.map((session) => this.closeDetached(session)));
   }
 
-  async closeAll(): Promise<McpSessionCloseResult[]> {
-    const sessions = Array.from(this.sessions, ([sessionId, entry]) => ({
-      sessionId,
-      transport: entry.transport,
-    }));
-    this.sessions.clear();
-    return closeSessions(sessions);
-  }
-}
+  async closeAll(
+    options: { drainTimeoutMs?: number } = {},
+  ): Promise<McpSessionCloseResult[]> {
+    if (this.state === "closed") return [];
+    if (this.state === "running") {
+      this.state = "closing";
+      this.reservations.clear();
+    }
 
-async function closeSessions<TTransport extends ClosableMcpTransport>(
-  sessions: Array<{ sessionId: string; transport: TTransport }>,
-): Promise<McpSessionCloseResult[]> {
-  return Promise.all(
-    sessions.map(async ({ sessionId, transport }) => {
-      try {
-        await transport.close();
-        return { sessionId };
-      } catch (error) {
-        return { sessionId, error };
+    const drainTimeoutMs =
+      options.drainTimeoutMs ?? MCP_SESSION_DRAIN_TIMEOUT_MS;
+    if (this.activeCount() > 0) {
+      await Promise.race([
+        this.waitForActiveDrain(),
+        this.waitForTimeout(drainTimeoutMs),
+      ]);
+    }
+
+    const detached: DetachedSession<TTransport>[] = [];
+    for (const sessionId of [...this.sessions.keys()]) {
+      const removed = this.detach(sessionId, "server_shutdown");
+      if (removed) detached.push(removed);
+    }
+    this.leases.clear();
+
+    const results = await Promise.all(
+      detached.map((session) => this.closeDetached(session)),
+    );
+    this.state = "closed";
+    this.notifyAllDrainWaiters();
+    return results;
+  }
+
+  private activeCount(): number {
+    let active = 0;
+    for (const entry of this.sessions.values()) {
+      if (entry.inFlight > 0) active += 1;
+    }
+    return active;
+  }
+
+  private waitForActiveDrain(): Promise<void> {
+    if (this.activeCount() === 0) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      this.drainWaiters.add(resolve);
+    });
+  }
+
+  private notifyDrainWaitersIfIdle(): void {
+    if (this.activeCount() !== 0) return;
+    this.notifyAllDrainWaiters();
+  }
+
+  private notifyAllDrainWaiters(): void {
+    for (const resolve of this.drainWaiters) resolve();
+    this.drainWaiters.clear();
+  }
+
+  private oldestIdleSession(): { sessionId: string; idleSince: number } | undefined {
+    let oldest: { sessionId: string; idleSince: number } | undefined;
+    for (const [sessionId, entry] of this.sessions) {
+      if (entry.inFlight !== 0 || entry.idleSince === undefined || entry.disposing) {
+        continue;
       }
-    }),
-  );
+      if (!oldest || entry.idleSince < oldest.idleSince) {
+        oldest = { sessionId, idleSince: entry.idleSince };
+      }
+    }
+    return oldest;
+  }
+
+  private detach(
+    sessionId: string,
+    reason: McpSessionDisposeReason,
+  ): DetachedSession<TTransport> | undefined {
+    const entry = this.sessions.get(sessionId);
+    if (!entry || entry.disposing) return undefined;
+    entry.disposing = true;
+    this.sessions.delete(sessionId);
+    for (const [leaseToken, leasedSessionId] of this.leases) {
+      if (leasedSessionId === sessionId) this.leases.delete(leaseToken);
+    }
+    if (reason === "capacity_eviction") {
+      this.evictedTotal += 1;
+      this.emit({ type: "evicted", sessionId, reason });
+    }
+    return { sessionId, transport: entry.transport, reason };
+  }
+
+  private async closeDetached(
+    detached: DetachedSession<TTransport>,
+    context: McpSessionOperationContext = {},
+  ): Promise<McpSessionCloseResult> {
+    try {
+      await detached.transport.close();
+      this.closedTotal += 1;
+      this.emit({
+        type: "closed",
+        sessionId: detached.sessionId,
+        reason: detached.reason,
+        requestId: context.requestId,
+      });
+      return { sessionId: detached.sessionId };
+    } catch (error) {
+      this.closeErrorTotal += 1;
+      this.emit({
+        type: "close_failed",
+        sessionId: detached.sessionId,
+        reason: detached.reason,
+        requestId: context.requestId,
+      });
+      return { sessionId: detached.sessionId, error };
+    }
+  }
+
+  private async closeUncommitted(
+    transport: TTransport,
+    context: McpSessionOperationContext,
+  ): Promise<void> {
+    try {
+      await transport.close();
+    } catch {
+      this.closeErrorTotal += 1;
+      this.emit({
+        type: "close_failed",
+        requestId: context.requestId,
+      });
+    }
+  }
+
+  private emit(
+    event: Omit<McpSessionLifecycleEvent, "snapshot">,
+  ): void {
+    this.onEvent?.({ ...event, snapshot: this.snapshot() });
+  }
 }
