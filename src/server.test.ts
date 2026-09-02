@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -13,12 +14,53 @@ import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
-import { createMcpServer } from "./server.js";
+import {
+  createMcpServer,
+  createServer,
+  type CreateServerOptions,
+} from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 
 const execFileAsync = promisify(execFile);
+
+test("isolated MCP lifecycle controls keep public health minimal", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-mcp-options-test-"));
+  const config = loadConfig(writeTestDevspaceConfig(join(root, ".config"), {
+    server: { port: 1 },
+    workspaces: {
+      allowedRoots: [root],
+      worktreeRoot: join(root, ".worktrees"),
+    },
+    storage: { stateDir: join(root, ".state") },
+    skills: { agentDir: join(root, ".agent") },
+  }));
+  const options: CreateServerOptions = {
+    mcpMaxSessions: 1,
+    runtimeSnapshotIntervalMs: 1_000,
+  };
+  const running = createServer(config, options);
+  const httpServer = running.app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once("listening", resolve);
+    httpServer.once("error", reject);
+  });
+  t.after(async () => {
+    await new Promise<void>((resolve, reject) => {
+      httpServer.close((error) => (error ? reject(error) : resolve()));
+    });
+    await running.close();
+  });
+
+  const address = httpServer.address();
+  assert.ok(address && typeof address !== "string");
+  const response = await fetch(
+    `http://127.0.0.1:${(address as AddressInfo).port}/healthz`,
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, name: "devspace" });
+});
 
 test("tool modes expose the expected host-facing tool surface", async (t) => {
   const cases: Array<{
