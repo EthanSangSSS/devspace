@@ -35,6 +35,9 @@
     "schema:config": "tsx scripts/generate-config-schema.ts",
     "start": "node dist/cli.js serve",
     "test": "tsx --test --test-concurrency=1 \"src/**/*.test.ts\"",
+    "test:mcp-soak-metrics": "tsx scripts/mcp-session-soak.test.ts",
+    "test:mcp-soak": "tsx scripts/mcp-session-soak.ts",
+    "typecheck:mcp-soak": "tsc --ignoreConfig --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --esModuleInterop --skipLibCheck --types node scripts/mcp-session-soak.ts scripts/mcp-session-soak.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "keywords": [],

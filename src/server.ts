@@ -35,8 +35,10 @@ import {
 import { readFileTool } from "./pi-tools.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import {
+  MCP_SESSION_DRAIN_TIMEOUT_MS,
+  McpSessionAdmissionError,
   McpSessionRegistry,
-  type McpSessionCloseResult,
+  type McpSessionLease,
 } from "./mcp-sessions.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
@@ -76,6 +78,8 @@ type Transport = StreamableHTTPServerTransport;
 // session retention so abandoned MCP servers do not accumulate for the life of the process.
 const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
+const MCP_MAX_SESSIONS = 64;
+const MCP_RUNTIME_SNAPSHOT_INTERVAL_MS = 60_000;
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
 
 interface RunningServer {
@@ -704,6 +708,25 @@ export function createMcpServer(
 
 export interface CreateServerOptions {
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
+  mcpInitializeCommitBarrier?: (sessionId: string) => Promise<void>;
+  mcpMaxSessions?: number;
+  runtimeSnapshotIntervalMs?: number;
+}
+
+function logMcpRuntimeSnapshot(
+  config: ServerConfig,
+  transports: McpSessionRegistry<Transport>,
+): void {
+  const memory = process.memoryUsage();
+  logEvent(config.logging, "info", "mcp_runtime_snapshot", {
+    sessions: transports.snapshot(),
+    memory: {
+      heapUsedBytes: memory.heapUsed,
+      heapTotalBytes: memory.heapTotal,
+      rssBytes: memory.rss,
+    },
+    uptimeSeconds: process.uptime(),
+  });
 }
 
 export function createServer(
@@ -719,7 +742,29 @@ export function createServer(
     host: config.host,
     ...(allowedHosts ? { allowedHosts } : {}),
   });
-  const transports = new McpSessionRegistry<Transport>();
+  const transports = new McpSessionRegistry<Transport>({
+    maxSessions: options.mcpMaxSessions ?? MCP_MAX_SESSIONS,
+    onEvent: (event) => {
+      const names = {
+        created: "mcp_session_created",
+        closed: "mcp_session_closed",
+        evicted: "mcp_session_evicted",
+        capacity_rejected: "mcp_session_capacity_rejected",
+        close_failed: "mcp_session_close_failed",
+      } as const;
+      logEvent(
+        config.logging,
+        event.type === "close_failed" ? "warn" : "info",
+        names[event.type],
+        {
+          requestId: event.requestId,
+          reason: event.reason,
+          sessionIdPrefix: sessionIdPrefix(event.sessionId),
+          sessions: event.snapshot,
+        },
+      );
+    },
+  });
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
@@ -741,36 +786,15 @@ export function createServer(
     getLocalAgentProviderAvailabilitySnapshot(),
   );
 
-  const logSessionCloseResults = (
-    reason: "idle_timeout" | "server_shutdown",
-    results: McpSessionCloseResult[],
-  ) => {
-    for (const result of results) {
-      if (result.error) {
-        logEvent(config.logging, "warn", "mcp_session_close_failed", {
-          reason,
-          sessionIdPrefix: sessionIdPrefix(result.sessionId),
-          error:
-            result.error instanceof Error
-              ? result.error.message
-              : String(result.error),
-        });
-        continue;
-      }
-
-      logEvent(config.logging, "info", "mcp_session_closed", {
-        reason,
-        sessionIdPrefix: sessionIdPrefix(result.sessionId),
-      });
-    }
-  };
-
   const sessionCleanupTimer = setInterval(() => {
-    void transports
-      .closeIdle(MCP_SESSION_IDLE_TIMEOUT_MS)
-      .then((results) => logSessionCloseResults("idle_timeout", results));
+    void transports.closeIdle(MCP_SESSION_IDLE_TIMEOUT_MS);
   }, MCP_SESSION_CLEANUP_INTERVAL_MS);
   sessionCleanupTimer.unref();
+
+  const runtimeSnapshotTimer = setInterval(() => {
+    logMcpRuntimeSnapshot(config, transports);
+  }, options.runtimeSnapshotIntervalMs ?? MCP_RUNTIME_SNAPSHOT_INTERVAL_MS);
+  runtimeSnapshotTimer.unref();
 
   if (config.logging.trustProxy) {
     app.set("trust proxy", true);
@@ -863,35 +887,77 @@ export function createServer(
     });
 
     try {
-      let transport: Transport | undefined;
-
       if (sessionId) {
-        transport = transports.get(sessionId);
-        if (!transport) {
-          sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
+        const lease = transports.acquire(sessionId);
+        if (!lease) {
+          if (transports.snapshot().state !== "running") {
+            sendJsonRpcError(
+              res,
+              503,
+              -32001,
+              "MCP session resource temporarily unavailable",
+            );
+          } else {
+            sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
+          }
           return;
         }
-      } else if (initializeRequest) {
+
+        try {
+          await lease.transport.handleRequest(req, res, req.body);
+        } finally {
+          transports.release(lease);
+        }
+        return;
+      }
+
+      if (!initializeRequest) {
+        sendJsonRpcError(res, 400, -32000, "No valid MCP session");
+        return;
+      }
+
+      let reservation;
+      try {
+        reservation = await transports.reserve({ requestId });
+      } catch (error) {
+        if (error instanceof McpSessionAdmissionError) {
+          sendJsonRpcError(
+            res,
+            503,
+            -32001,
+            "MCP session resource temporarily unavailable",
+          );
+          return;
+        }
+        throw error;
+      }
+
+      let transport: Transport | undefined;
+      let committedSessionId: string | undefined;
+      let initializationLease: McpSessionLease<Transport> | undefined;
+      try {
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (newSessionId) => {
-            if (transport) transports.register(newSessionId, transport);
-            logEvent(config.logging, "info", "mcp_session_created", {
-              requestId,
-              sessionIdPrefix: sessionIdPrefix(newSessionId),
-              ...requestLogFields(req, config),
-            });
+          onsessioninitialized: async (newSessionId) => {
+            const lease = await transports.commit(
+              reservation,
+              newSessionId,
+              transport!,
+              { requestId },
+            );
+            if (!lease) {
+              throw new McpSessionAdmissionError("closing");
+            }
+            initializationLease = lease;
+            committedSessionId = newSessionId;
+            await options.mcpInitializeCommitBarrier?.(newSessionId);
           },
         });
 
         transport.onclose = () => {
           const closedSessionId = transport?.sessionId;
-          if (closedSessionId && transports.remove(closedSessionId)) {
-            logEvent(config.logging, "info", "mcp_session_closed", {
-              reason: "transport_close",
-              sessionIdPrefix: sessionIdPrefix(closedSessionId),
-            });
-          }
+          if (!closedSessionId) return;
+          void transports.dispose(closedSessionId, "transport_close");
         };
 
         const server = createMcpServer(
@@ -903,12 +969,29 @@ export function createServer(
           incomingArtifactAdapters,
         );
         await server.connect(transport);
-      } else {
-        sendJsonRpcError(res, 400, -32000, "No valid MCP session");
-        return;
+        await transport.handleRequest(req, res, req.body);
+        if (!committedSessionId) {
+          const canceled = transports.cancel(reservation);
+          if (canceled) await transport.close().catch(() => {});
+          throw new Error("MCP initialize completed without a committed session");
+        }
+      } catch (error) {
+        if (committedSessionId) {
+          await transports.dispose(
+            committedSessionId,
+            "initialize_failure",
+            { requestId },
+          );
+        } else if (transport) {
+          const canceled = transports.cancel(reservation);
+          if (canceled) await transport.close().catch(() => {});
+        } else {
+          transports.cancel(reservation);
+        }
+        throw error;
+      } finally {
+        if (initializationLease) transports.release(initializationLease);
       }
-
-      await transport.handleRequest(req, res, req.body);
     } catch (error) {
       logEvent(config.logging, "error", "mcp_request_error", {
         requestId,
@@ -928,8 +1011,10 @@ export function createServer(
     close: () => {
       closePromise ??= (async () => {
         clearInterval(sessionCleanupTimer);
-        const results = await transports.closeAll();
-        logSessionCloseResults("server_shutdown", results);
+        clearInterval(runtimeSnapshotTimer);
+        await transports.closeAll({
+          drainTimeoutMs: MCP_SESSION_DRAIN_TIMEOUT_MS,
+        });
         processSessions.shutdown();
         oauthProvider.close();
         workspaceStore.close?.();
