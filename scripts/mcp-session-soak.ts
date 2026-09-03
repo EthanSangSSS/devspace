@@ -1542,6 +1542,8 @@ export async function runStockControlWithDependencies(
 
   let processHandle: unknown;
   let evidence: StockControlEvidence;
+  let stopFailed = false;
+  let stopError: unknown;
   try {
     const runtime = await dependencies.prepareStockPackagedRuntime(root);
     processHandle = await dependencies.startCandidateProcess(
@@ -1582,11 +1584,21 @@ export async function runStockControlWithDependencies(
     evidence = { status: "INCONCLUSIVE" };
   } finally {
     if (processHandle !== undefined) {
-      await dependencies.stopCandidateProcess(processHandle).catch(() => {});
+      try {
+        await dependencies.stopCandidateProcess(processHandle);
+      } catch (error) {
+        stopFailed = true;
+        stopError = error;
+      }
     }
   }
 
   await dependencies.assertProductionBaselineIdentity();
+  if (stopFailed) {
+    throw stopError instanceof Error
+      ? stopError
+      : new Error("Stock control process did not stop cleanly");
+  }
   return evidence;
 }
 

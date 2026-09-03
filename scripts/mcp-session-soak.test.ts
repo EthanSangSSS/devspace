@@ -251,4 +251,32 @@ await assert.rejects(
 assert.equal(canaryCalls, 0);
 assert.equal(soakCalls, 0);
 
+// A stock process that cannot be stopped cleanly is a blocking gate failure,
+// not a diagnostic downgrade. Orchestration must stop before canary/soak.
+canaryCalls = 0;
+soakCalls = 0;
+await assert.rejects(
+  runGateOrchestration({
+    runStockControl: () =>
+      runStockControlWithDependencies(
+        stockDependencies({
+          stopCandidateProcess: async () => {
+            throw new Error("stock stop failed");
+          },
+        }),
+      ),
+    runActiveProtectionCanary: async () => {
+      canaryCalls += 1;
+      return passingCanary;
+    },
+    runCandidateSoak: async () => {
+      soakCalls += 1;
+      return passingSoak;
+    },
+  }),
+  /stock stop failed/,
+);
+assert.equal(canaryCalls, 0);
+assert.equal(soakCalls, 0);
+
 console.log("MCP_SOAK_METRICS_TEST=PASS");
