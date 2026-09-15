@@ -51,7 +51,10 @@ test("runtime introspection probes only local version/help and reports telemetry
   assert.equal(result.hostSettingsMutationRequired, false);
   assert.equal(result.workerStarted, false);
   assert.match(result.agyExecutableSha256, /^[0-9a-f]{64}$/);
-  assert.deepEqual((await readFile(callsPath, "utf8")).trim().split("\n"), ["--version", "--help"]);
+  assert.deepEqual(
+    (await readFile(callsPath, "utf8")).trim().split("\n").sort(),
+    ["--help", "--version"],
+  );
   assert.equal(JSON.stringify(result).includes("do-not-return"), false);
 });
 

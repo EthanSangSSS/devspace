@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { accessSync, constants as fsConstants, readFileSync, realpathSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
+import { delimiter, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
@@ -23,6 +24,15 @@ import {
   registerArtifactTools,
 } from "./artifact-tools.js";
 import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
+import {
+  AgyDelegationService,
+  type AgyDelegationRequest,
+  type AgyDelegationResult,
+} from "./agy-delegation.js";
+import {
+  AGY_REQUIRED_EFFORT,
+  AGY_REQUIRED_MODEL,
+} from "./agy-delegation-types.js";
 import {
   createOpenAIIncomingArtifactAdapter,
   type IncomingArtifactAdapter,
@@ -704,6 +714,276 @@ function registerCodexProcessTools(
   );
 }
 
+type AgyDelegationToolService = Pick<AgyDelegationService, "inspectRuntime" | "delegate">;
+
+function registerAgyDelegationTools(
+  server: McpServer,
+  config: ServerConfig,
+  workspaces: WorkspaceRegistry,
+  service: AgyDelegationToolService,
+): void {
+  registerAppTool(
+    server,
+    "get_agy_runtime",
+    {
+      title: "Inspect Agy runtime",
+      description:
+        "Inspect the configured local Agy runtime and fixed delegation policy without starting an agent.",
+      inputSchema: {},
+      outputSchema: resultOutputSchema({
+        tool_surface_registered: z.literal(true),
+        tool_call_accepted: z.literal(true),
+        request_reached_devspace: z.literal(true),
+        policy_preflight_passed: z.literal(true),
+        worker_started: z.literal(false),
+        runtime_status: z.literal("available"),
+        agy_path: z.string(),
+        agy_version: z.string(),
+        agy_executable_sha256: z.string(),
+        requested_model: z.literal(AGY_REQUIRED_MODEL),
+        requested_effort: z.literal(AGY_REQUIRED_EFFORT),
+        required_flags_supported: z.boolean(),
+        telemetry_enabled: z.boolean(),
+        trusted_cli_auth_mode: z.string(),
+        runtime_session_state: z.literal("task-local-no-resume"),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      _meta: {},
+    },
+    async () => {
+      const startedAt = performance.now();
+      const runtime = await service.inspectRuntime();
+      const result = `Agy ${runtime.agyVersion} available; fixed model ${runtime.requiredModel}, effort ${runtime.requiredEffort}.`;
+      logToolCall(config, {
+        tool: "get_agy_runtime",
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        content: [textBlock(result)],
+        structuredContent: {
+          result,
+          tool_surface_registered: true,
+          tool_call_accepted: true,
+          request_reached_devspace: true,
+          policy_preflight_passed: true,
+          worker_started: false,
+          runtime_status: runtime.runtimeStatus,
+          agy_path: runtime.agyPath,
+          agy_version: runtime.agyVersion,
+          agy_executable_sha256: runtime.agyExecutableSha256,
+          requested_model: runtime.requiredModel,
+          requested_effort: runtime.requiredEffort,
+          required_flags_supported: runtime.requiredFlagsSupported,
+          telemetry_enabled: runtime.telemetryEnabled,
+          trusted_cli_auth_mode: runtime.trustedCliAuthMode,
+          runtime_session_state: "task-local-no-resume" as const,
+        },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "delegate_to_agy",
+    {
+      title: "Delegate to Agy",
+      description:
+        "Start one bounded local Agy agent task under a fixed least-privilege profile. A real run may contact the configured model provider. V1 forbids persistent project writes, external-state actions, hidden executor fallback, and model substitution.",
+      inputSchema: {
+        profile: z.enum(["repo-read", "repo-validate", "gui-inspect"]),
+        task: z.string().min(1),
+        dry_run: z.boolean().optional(),
+        requested_model: z.literal(AGY_REQUIRED_MODEL),
+        requested_effort: z.literal(AGY_REQUIRED_EFFORT),
+        workspaceId: z.string().optional().describe("Required for repo-read and repo-validate."),
+        expected_source_head: z.string().regex(/^[0-9a-f]{40}$/i).optional(),
+        allowed_read_paths: z.array(z.string().min(1)).min(1).optional(),
+        validation_commands: z.array(z.object({
+          argv: z.array(z.string().min(1)).min(1),
+        })).optional(),
+        target: z.object({
+          pid: z.number().int().positive(),
+          application_identity: z.string().min(1),
+          window_id: z.number().int().nonnegative(),
+        }).optional(),
+      },
+      outputSchema: resultOutputSchema({
+        ok: z.boolean(),
+        execution_id: z.string(),
+        profile: z.enum(["repo-read", "repo-validate", "gui-inspect"]),
+        dry_run: z.boolean(),
+        tool_surface_registered: z.boolean(),
+        tool_call_accepted: z.boolean(),
+        request_reached_devspace: z.boolean(),
+        policy_preflight_passed: z.boolean(),
+        worker_started: z.boolean(),
+        requested_model: z.literal(AGY_REQUIRED_MODEL),
+        resolved_model: z.string().optional(),
+        requested_effort: z.literal(AGY_REQUIRED_EFFORT),
+        effort_selection_verified: z.boolean(),
+        expected_source_head: z.string().optional(),
+        source_head: z.string().optional(),
+        source_fingerprint_before: z.string().optional(),
+        source_fingerprint_after: z.string().optional(),
+        runtime_telemetry_enabled: z.boolean().optional(),
+        runtime_session_state: z.string().optional(),
+        changed_persistent_paths: z.array(z.string()),
+        failure_class: z.string().optional(),
+        response: z.string().optional(),
+        validation_receipts: z.array(z.object({
+          index: z.number().int(),
+          argv: z.array(z.string()),
+          executable: z.string(),
+          sandboxed: z.literal(true),
+          exitCode: z.number().int(),
+          durationMs: z.number(),
+          stdoutArtifact: z.string(),
+          stderrArtifact: z.string(),
+        })).optional(),
+      }),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+      _meta: {},
+    },
+    async (input) => {
+      const startedAt = performance.now();
+      const dryRun = input.dry_run ?? false;
+      let request: AgyDelegationRequest;
+
+      if (input.profile === "gui-inspect") {
+        if (!input.target) {
+          return agyDelegationToolResponse(policyDeniedAgyResult(input.profile, dryRun));
+        }
+        request = {
+          profile: "gui-inspect",
+          task: input.task,
+          dryRun,
+          target: {
+            pid: input.target.pid,
+            applicationIdentity: input.target.application_identity,
+            windowId: input.target.window_id,
+          },
+        };
+      } else {
+        if (!input.workspaceId || !input.expected_source_head || !input.allowed_read_paths) {
+          return agyDelegationToolResponse(policyDeniedAgyResult(input.profile, dryRun));
+        }
+        const workspace = workspaces.getWorkspace(input.workspaceId);
+        request = {
+          profile: input.profile,
+          task: input.task,
+          dryRun,
+          repositoryRoot: workspace.root,
+          expectedSourceHead: input.expected_source_head,
+          allowedReadPaths: input.allowed_read_paths,
+          ...(input.validation_commands
+            ? { validationCommands: input.validation_commands.map((entry) => ({ argv: [...entry.argv] })) }
+            : {}),
+        };
+      }
+
+      const delegated = await service.delegate(request);
+      logToolCall(config, {
+        tool: "delegate_to_agy",
+        workspaceId: "workspaceId" in input ? input.workspaceId : undefined,
+        success: delegated.ok,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return agyDelegationToolResponse(delegated);
+    },
+  );
+}
+
+function policyDeniedAgyResult(
+  profile: "repo-read" | "repo-validate" | "gui-inspect",
+  dryRun: boolean,
+): AgyDelegationResult {
+  return {
+    ok: false,
+    envelope: {
+      schemaVersion: 1,
+      executionId: randomUUID(),
+      profile,
+      dryRun,
+      toolSurfaceRegistered: true,
+      toolCallAccepted: true,
+      requestReachedDevspace: true,
+      policyPreflightPassed: false,
+      workerStarted: false,
+      requestedModel: AGY_REQUIRED_MODEL,
+      requestedEffort: AGY_REQUIRED_EFFORT,
+      effortSelectionVerified: false,
+      changedPersistentPaths: [],
+      failureClass: "POLICY_DENIED",
+    },
+  };
+}
+
+function agyDelegationToolResponse(result: AgyDelegationResult) {
+  const envelope = result.envelope;
+  const text = result.ok
+    ? `Agy delegation ${envelope.executionId} completed for ${envelope.profile}.`
+    : `Agy delegation ${envelope.executionId} failed closed: ${envelope.failureClass ?? "UNKNOWN"}.`;
+  return {
+    content: [textBlock(text)],
+    structuredContent: {
+      result: text,
+      ok: result.ok,
+      execution_id: envelope.executionId,
+      profile: envelope.profile,
+      dry_run: envelope.dryRun,
+      tool_surface_registered: envelope.toolSurfaceRegistered,
+      tool_call_accepted: envelope.toolCallAccepted,
+      request_reached_devspace: envelope.requestReachedDevspace,
+      policy_preflight_passed: envelope.policyPreflightPassed,
+      worker_started: envelope.workerStarted,
+      requested_model: envelope.requestedModel,
+      ...(envelope.resolvedModel ? { resolved_model: envelope.resolvedModel } : {}),
+      requested_effort: envelope.requestedEffort,
+      effort_selection_verified: envelope.effortSelectionVerified,
+      ...(envelope.expectedSourceHead ? { expected_source_head: envelope.expectedSourceHead } : {}),
+      ...(envelope.sourceHead ? { source_head: envelope.sourceHead } : {}),
+      ...(envelope.sourceFingerprintBefore ? { source_fingerprint_before: envelope.sourceFingerprintBefore } : {}),
+      ...(envelope.sourceFingerprintAfter ? { source_fingerprint_after: envelope.sourceFingerprintAfter } : {}),
+      ...(envelope.runtimeTelemetryEnabled !== undefined
+        ? { runtime_telemetry_enabled: envelope.runtimeTelemetryEnabled }
+        : {}),
+      ...(envelope.runtimeSessionState ? { runtime_session_state: envelope.runtimeSessionState } : {}),
+      changed_persistent_paths: envelope.changedPersistentPaths,
+      ...(envelope.failureClass ? { failure_class: envelope.failureClass } : {}),
+      ...(result.ok && result.response !== undefined ? { response: result.response } : {}),
+      ...(result.ok && result.validationReceipts
+        ? { validation_receipts: result.validationReceipts }
+        : {}),
+    },
+  };
+}
+
+function resolveTrustedExecutable(command: string, env: NodeJS.ProcessEnv = process.env): string {
+  const pathValue = env.PATH ?? "";
+  for (const directory of pathValue.split(delimiter)) {
+    if (!directory) continue;
+    const candidate = resolvePath(directory, command);
+    try {
+      accessSync(candidate, fsConstants.X_OK);
+      return realpathSync(candidate);
+    } catch {
+      // Try the next PATH entry.
+    }
+  }
+  throw new Error(`Required executable not found in PATH: ${command}`);
+}
+
 export function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
@@ -711,6 +991,7 @@ export function createMcpServer(
   processSessions: ProcessSessionManager,
   resolveLocalAgentProviders: () => LocalAgentProviderStatus[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
+  injectedAgyDelegationService?: Pick<AgyDelegationService, "inspectRuntime" | "delegate">,
 ): McpServer {
   const server = new McpServer(
     {
@@ -724,6 +1005,14 @@ export function createMcpServer(
       instructions: serverInstructions(config),
     },
   );
+
+  if (config.agyDelegation.enabled) {
+    const agyDelegationService = injectedAgyDelegationService ?? new AgyDelegationService({
+      config: config.agyDelegation,
+      gitleaksPath: resolveTrustedExecutable("gitleaks"),
+    });
+    registerAgyDelegationTools(server, config, workspaces, agyDelegationService);
+  }
 
   registerAppResource(
     server,
