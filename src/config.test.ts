@@ -25,6 +25,27 @@ assert.equal(loadConfig(baseEnv).skillsEnabled, true);
 assert.equal(loadConfig(baseEnv).devspaceSkillsDir, join(emptyConfigDir, "skills"));
 assert.equal(loadConfig(baseEnv).devspaceAgentsDir, join(emptyConfigDir, "agents"));
 assert.deepEqual(loadConfig(baseEnv).subagents, { enabled: false, providers: [] });
+assert.deepEqual(loadConfig(baseEnv).agyDelegation, {
+  enabled: false,
+  agyPath: join(process.env.HOME ?? "", ".local", "bin", "agy"),
+  cuaDriverPath: join(process.env.HOME ?? "", ".local", "bin", "cua-driver"),
+  settingsPath: join(process.env.HOME ?? "", ".gemini", "antigravity-cli", "settings.json"),
+});
+assert.deepEqual(
+  loadConfig({
+    ...baseEnv,
+    DEVSPACE_AGY_DELEGATION: "1",
+    DEVSPACE_AGY_PATH: "/tmp/agy",
+    DEVSPACE_CUA_DRIVER_PATH: "/tmp/cua-driver",
+    DEVSPACE_AGY_SETTINGS_PATH: "/tmp/settings.json",
+  }).agyDelegation,
+  {
+    enabled: true,
+    agyPath: "/tmp/agy",
+    cuaDriverPath: "/tmp/cua-driver",
+    settingsPath: "/tmp/settings.json",
+  },
+);
 assert.equal(loadConfig(baseEnv).artifactsEnabled, false);
 assert.equal(loadConfig(baseEnv).artifactMaxFileBytes, 100 * 1024 * 1024);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_ARTIFACTS: "1" }).artifactsEnabled, true);

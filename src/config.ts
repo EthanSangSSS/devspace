@@ -5,6 +5,7 @@ import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
 import { devspaceAgentsDir, devspaceSkillsDir, loadDevspaceFiles } from "./user-config.js";
 import { resolveSubagentsConfig, type SubagentsConfig } from "./local-agent-config.js";
+import type { AgyDelegationConfig } from "./agy-delegation-types.js";
 
 export type ToolMode = "minimal" | "full" | "codex";
 export type WidgetMode = "off" | "changes" | "full";
@@ -30,6 +31,7 @@ export interface ServerConfig {
   devspaceSkillsDir: string;
   devspaceAgentsDir: string;
   subagents: SubagentsConfig;
+  agyDelegation: AgyDelegationConfig;
   agentDir: string;
   logging: LoggingConfig;
 }
@@ -208,6 +210,18 @@ function defaultAgentDir(): string {
   return join(homedir(), ".codex");
 }
 
+function defaultAgyPath(): string {
+  return join(homedir(), ".local", "bin", "agy");
+}
+
+function defaultCuaDriverPath(): string {
+  return join(homedir(), ".local", "bin", "cua-driver");
+}
+
+function defaultAgySettingsPath(): string {
+  return join(homedir(), ".gemini", "antigravity-cli", "settings.json");
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const files = loadDevspaceFiles(env);
   const host = env.HOST ?? files.config.host ?? "127.0.0.1";
@@ -249,6 +263,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     devspaceSkillsDir: devspaceSkillsDir(env),
     devspaceAgentsDir: devspaceAgentsDir(env),
     subagents: resolveSubagentsConfig(files.config.subagents, env),
+    agyDelegation: {
+      enabled: parseBoolean(env.DEVSPACE_AGY_DELEGATION),
+      agyPath: resolve(expandHomePath(env.DEVSPACE_AGY_PATH ?? defaultAgyPath())),
+      cuaDriverPath: resolve(expandHomePath(env.DEVSPACE_CUA_DRIVER_PATH ?? defaultCuaDriverPath())),
+      settingsPath: resolve(expandHomePath(env.DEVSPACE_AGY_SETTINGS_PATH ?? defaultAgySettingsPath())),
+    },
     agentDir: resolve(expandHomePath(env.DEVSPACE_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
     logging: parseLoggingConfig(env),
   };
