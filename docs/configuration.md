@@ -225,6 +225,52 @@ DEVSPACE_SKILL_PATHS="$HOME/.claude/skills,$HOME/company/skills" \
 npx @waishnav/devspace serve
 ```
 
+## Declarative Agy Delegation
+
+Declarative Agy delegation is an experimental, server-side capability and is
+disabled by default. It is separate from DevSpace's built-in Subagents system:
+enabling it does not enable `DEVSPACE_SUBAGENTS`, provider profiles, or
+`devspace agents` commands.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DEVSPACE_AGY_DELEGATION` | `0` | Register `get_agy_runtime` and `delegate_to_agy`. |
+| `DEVSPACE_AGY_PATH` | `~/.local/bin/agy` | Absolute/pinned Agy launcher used by the delegation service. |
+| `DEVSPACE_CUA_DRIVER_PATH` | `~/.local/bin/cua-driver` | CuaDriver executable used only by the `gui-inspect` broker. |
+| `DEVSPACE_AGY_SETTINGS_PATH` | `~/.gemini/antigravity-cli/settings.json` | Existing Agy settings file inspected for the telemetry preflight. |
+
+V1 fixes every real delegated run to:
+
+```text
+model  = gemini-3.8-flash-high
+effort = high
+```
+
+The public tool input repeats those values as exact literals; they are not
+general model-selection controls. Agy runs use `--output-format stream-json`
+and fail closed if the runtime does not report the exact model identity.
+
+Real runs require telemetry to already be disabled in the configured Agy
+settings. DevSpace does not change the user's persistent Agy settings to make a
+delegation pass. The worker uses a task-local HOME and does not use
+`--continue`, `--conversation`, or automatic permission bypass flags.
+
+Repository profiles also require `gitleaks` to be installed as an executable on
+the DevSpace service PATH. DevSpace resolves that executable to an absolute
+path before using it for the bounded snapshot preflight.
+
+The V1 profiles are:
+
+- `repo-read` — committed-HEAD read/search analysis only.
+- `repo-validate` — the same bounded snapshot plus declared validation commands
+  executed by DevSpace under a network-denied sandbox before Agy analysis.
+- `gui-inspect` — exact-window AX inspection through the CuaDriver broker; no
+  generic CuaDriver executable, raw pixel action surface, screenshot feed, or
+  text-entry capability is exposed to Agy.
+
+`delegate_to_agy` has no internal Codex or alternate-model fallback. Any later
+fallback is a separate host/controller decision.
+
 ## Logging
 
 | Variable | Default |
