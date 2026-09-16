@@ -12,6 +12,7 @@ import { parseAgyStream, verifyAgyCommandArguments } from "./agy-runtime.js";
 
 const execFileAsync = promisify(execFile);
 const AGY_PATH_ENV = "/opt/homebrew/opt/node@24/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+const RETRYABLE_STREAM_INTERRUPTION = "The stream was interrupted. Please continue the task you were working on.";
 
 export interface AgyHeadlessRunInput {
   agyPath: string;
@@ -85,47 +86,77 @@ export async function runAgyHeadless(input: AgyHeadlessRunInput): Promise<AgyHea
   ];
   verifyAgyCommandArguments(args);
 
-  let stdout: string;
-  try {
-    const result = await execFileAsync(input.agyPath, args, {
-      cwd: input.cwd,
-      env: buildAgyEnvironment(runtimeHome, runtimeTmp),
-      encoding: "utf8",
-      timeout: input.timeoutMs,
-      maxBuffer: 32 * 1024 * 1024,
-    });
-    stdout = result.stdout;
-  } catch (error) {
-    const captured = childText(error, "stdout");
-    if (captured.trim()) {
-      try {
-        parseAgyStream(captured.split(/\r?\n/));
-      } catch (parsedError) {
-        if (parsedError instanceof AgyDelegationError
-          && ["MODEL_MISMATCH", "MODEL_UNVERIFIED"].includes(parsedError.code)) {
-          throw parsedError;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let stdout: string;
+    try {
+      const result = await execFileAsync(input.agyPath, args, {
+        cwd: input.cwd,
+        env: buildAgyEnvironment(runtimeHome, runtimeTmp),
+        encoding: "utf8",
+        timeout: input.timeoutMs,
+        maxBuffer: 32 * 1024 * 1024,
+      });
+      stdout = result.stdout;
+    } catch (error) {
+      const captured = childText(error, "stdout");
+      if (captured.trim()) {
+        try {
+          parseAgyStream(captured.split(/\r?\n/));
+        } catch (parsedError) {
+          if (parsedError instanceof AgyDelegationError
+            && ["MODEL_MISMATCH", "MODEL_UNVERIFIED"].includes(parsedError.code)) {
+            throw parsedError;
+          }
         }
       }
+      if (isTimeout(error)) {
+        throw new AgyDelegationError("TIMEOUT", "Agy headless execution timed out.");
+      }
+      const code = childExitCode(error);
+      throw new AgyDelegationError(
+        code === undefined ? "AGY_START_FAILED" : "EXECUTOR_FAILURE",
+        `Agy headless execution failed${code === undefined ? "" : ` with exit code ${code}`}.`,
+      );
     }
-    if (isTimeout(error)) {
-      throw new AgyDelegationError("TIMEOUT", "Agy headless execution timed out.");
+
+    try {
+      const parsed = parseAgyStream(stdout.split(/\r?\n/));
+      return {
+        resolvedModel: parsed.resolvedModel,
+        response: parsed.response,
+        status: parsed.status,
+        effortSelectionVerified: true,
+        runtimeHome,
+        logPath,
+      };
+    } catch (error) {
+      if (attempt === 0 && isRetryableStreamInterruption(stdout, error)) continue;
+      throw error;
     }
-    const code = childExitCode(error);
-    throw new AgyDelegationError(
-      code === undefined ? "AGY_START_FAILED" : "EXECUTOR_FAILURE",
-      `Agy headless execution failed${code === undefined ? "" : ` with exit code ${code}`}.`,
-    );
   }
 
-  const parsed = parseAgyStream(stdout.split(/\r?\n/));
-  return {
-    resolvedModel: parsed.resolvedModel,
-    response: parsed.response,
-    status: parsed.status,
-    effortSelectionVerified: true,
-    runtimeHome,
-    logPath,
-  };
+  throw new AgyDelegationError("EXECUTOR_FAILURE", "Agy headless execution exhausted its retry budget.");
+}
+
+function isRetryableStreamInterruption(stdout: string, error: unknown): boolean {
+  if (!(error instanceof AgyDelegationError) || error.code !== "EXECUTOR_FAILURE") return false;
+  const resultEvents = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .flatMap((line) => {
+      try {
+        const event = JSON.parse(line) as Record<string, unknown>;
+        return event.event === "result" ? [event] : [];
+      } catch {
+        return [];
+      }
+    });
+  if (resultEvents.length !== 1) return false;
+  const result = resultEvents[0]?.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) return false;
+  const terminal = result as Record<string, unknown>;
+  return terminal.status === "ERROR" && terminal.error === RETRYABLE_STREAM_INTERRUPTION;
 }
 
 function defaultHostKeychainPath(): string | undefined {
