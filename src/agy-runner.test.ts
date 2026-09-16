@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -17,7 +17,9 @@ test("headless runner uses pinned model/effort, stateless flags, and ephemeral H
   const argsLog = join(root, "args.txt");
   const homeLog = join(root, "home.txt");
   const agyPath = join(root, "agy");
+  const hostKeychainPath = join(root, "login.keychain-db");
   await mkdir(workspace);
+  await writeFile(hostKeychainPath, "fake-keychain");
   await writeFile(agyPath, [
     "#!/bin/sh",
     `printf '%s\\n' \"$@\" > ${JSON.stringify(argsLog)}`,
@@ -34,6 +36,7 @@ test("headless runner uses pinned model/effort, stateless flags, and ephemeral H
     taskRoot,
     prompt: "Read README.md",
     timeoutMs: 5_000,
+    hostKeychainPath,
   });
 
   const args = (await readFile(argsLog, "utf8")).trim().split("\n");
@@ -50,6 +53,10 @@ test("headless runner uses pinned model/effort, stateless flags, and ephemeral H
   assert.equal(ephemeralHome.startsWith(taskRoot), true);
   const settings = JSON.parse(await readFile(join(ephemeralHome, ".gemini", "antigravity-cli", "settings.json"), "utf8"));
   assert.deepEqual(settings, { enableTelemetry: false });
+  assert.equal(
+    await readlink(join(ephemeralHome, "Library", "Keychains", "login.keychain-db")),
+    hostKeychainPath,
+  );
   assert.equal(result.resolvedModel, "gemini-3.8-flash-high");
   assert.equal(result.response, "first line\n");
 });

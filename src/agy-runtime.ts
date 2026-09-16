@@ -57,7 +57,7 @@ export async function inspectAgyRuntime(
   const executableBytes = await readFile(config.agyPath);
   const agyExecutableSha256 = createHash("sha256").update(executableBytes).digest("hex");
 
-  const [{ stdout: versionOutput }, { stdout: helpOutput }] = await Promise.all([
+  const [{ stdout: versionOutput }, { stdout: helpStdout, stderr: helpStderr }] = await Promise.all([
     execFileAsync(config.agyPath, ["--version"], { encoding: "utf8", timeout: 5_000 }),
     execFileAsync(config.agyPath, ["--help"], { encoding: "utf8", timeout: 5_000 }),
   ]).catch((error: unknown) => {
@@ -67,6 +67,7 @@ export async function inspectAgyRuntime(
     );
   });
 
+  const helpOutput = `${helpStdout}\n${helpStderr}`;
   const requiredFlagsSupported = REQUIRED_FLAGS.every((flag) => helpOutput.includes(flag));
   const telemetryEnabled = await readTelemetryEnabled(config.settingsPath);
 

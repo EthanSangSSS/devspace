@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import {
@@ -19,6 +20,7 @@ export interface AgyHeadlessRunInput {
   prompt: string;
   timeoutMs: number;
   jsonSchema?: string;
+  hostKeychainPath?: string;
 }
 
 export interface AgyHeadlessRunResult {
@@ -44,6 +46,10 @@ export async function runAgyHeadless(input: AgyHeadlessRunInput): Promise<AgyHea
     mkdir(configDir, { recursive: true, mode: 0o700 }),
     mkdir(runtimeTmp, { recursive: true, mode: 0o700 }),
   ]);
+  const hostKeychainPath = input.hostKeychainPath ?? defaultHostKeychainPath();
+  if (hostKeychainPath) {
+    await projectHostLoginKeychain(runtimeHome, hostKeychainPath);
+  }
   await writeFile(
     join(configDir, "settings.json"),
     `${JSON.stringify({ enableTelemetry: false }, null, 2)}\n`,
@@ -104,6 +110,52 @@ export async function runAgyHeadless(input: AgyHeadlessRunInput): Promise<AgyHea
     runtimeHome,
     logPath,
   };
+}
+
+function defaultHostKeychainPath(): string | undefined {
+  if (process.platform !== "darwin") return undefined;
+  return join(homedir(), "Library", "Keychains", "login.keychain-db");
+}
+
+async function projectHostLoginKeychain(runtimeHome: string, hostKeychainPath: string): Promise<void> {
+  let metadata;
+  try {
+    metadata = await lstat(hostKeychainPath);
+  } catch {
+    throw new AgyDelegationError(
+      "RUNTIME_STATE_POLICY_UNENFORCEABLE",
+      "Trusted cached-auth keychain is unavailable.",
+    );
+  }
+  const currentUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (!metadata.isFile() || metadata.isSymbolicLink() || (currentUid !== undefined && metadata.uid !== currentUid)) {
+    throw new AgyDelegationError(
+      "RUNTIME_STATE_POLICY_UNENFORCEABLE",
+      "Trusted cached-auth keychain must be a user-owned regular file.",
+    );
+  }
+  if ((metadata.mode & 0o022) !== 0) {
+    throw new AgyDelegationError(
+      "RUNTIME_STATE_POLICY_UNENFORCEABLE",
+      "Trusted cached-auth keychain must not be group- or world-writable.",
+    );
+  }
+
+  const keychainDir = join(runtimeHome, "Library", "Keychains");
+  const projectedKeychainPath = join(keychainDir, "login.keychain-db");
+  await mkdir(keychainDir, { recursive: true, mode: 0o700 });
+  try {
+    const projected = await lstat(projectedKeychainPath);
+    if (projected.isSymbolicLink() && await readlink(projectedKeychainPath) === hostKeychainPath) return;
+    throw new AgyDelegationError(
+      "RUNTIME_STATE_POLICY_UNENFORCEABLE",
+      "Task-local cached-auth keychain projection already exists with unexpected identity.",
+    );
+  } catch (error) {
+    if (error instanceof AgyDelegationError) throw error;
+    if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+  }
+  await symlink(hostKeychainPath, projectedKeychainPath);
 }
 
 export async function installAgyReadOnlyHookPolicy(

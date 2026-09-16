@@ -58,6 +58,31 @@ test("runtime introspection probes only local version/help and reports telemetry
   assert.equal(JSON.stringify(result).includes("do-not-return"), false);
 });
 
+test("runtime introspection accepts Agy help emitted on stderr", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-agy-runtime-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const agyPath = join(root, "agy");
+  const settingsPath = join(root, "settings.json");
+  await writeFile(agyPath, [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"--version\" ]; then echo 1.1.22; exit 0; fi",
+    `if [ \"$1\" = \"--help\" ]; then printf '%s\\n' ${requiredHelp.split("\n").map((value) => JSON.stringify(value)).join(" ")} >&2; exit 0; fi`,
+    "exit 2",
+    "",
+  ].join("\n"));
+  await chmod(agyPath, 0o700);
+  await writeFile(settingsPath, JSON.stringify({ enableTelemetry: false }));
+
+  const result = await inspectAgyRuntime({
+    enabled: true,
+    agyPath,
+    cuaDriverPath: join(root, "cua-driver"),
+    settingsPath,
+  });
+
+  assert.equal(result.requiredFlagsSupported, true);
+});
+
 test("real-run preflight rejects telemetry enabled without mutating settings", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-agy-runtime-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));

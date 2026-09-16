@@ -161,6 +161,15 @@ that requirement. Real runs use a task-local HOME, disable update routines, and
 do not use `--continue`, `--conversation`, or
 `--dangerously-skip-permissions`.
 
+On macOS, Agy's cached authentication is backed by the user's login Keychain.
+The task-local HOME therefore projects only the verified user-owned
+`login.keychain-db` path into its own `Library/Keychains` directory so the
+trusted Agy CLI can resolve its cached credential. DevSpace does not read or
+copy credential bytes into task state, prompts, tool arguments, artifacts, or
+MCP results. The projection is accepted only when the host keychain is a
+non-symlink regular file owned by the current user and is not group- or
+world-writable; an unexpected task-local projection fails closed.
+
 The model contract is fail-closed: the command contains the exact fixed model
 and effort, the worker emits stream JSON, and `init.model` must equal
 `gemini-3.8-flash-high`. Missing model telemetry is not treated as success.
