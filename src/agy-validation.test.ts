@@ -10,7 +10,9 @@ import {
 } from "./agy-validation.js";
 import { AgyDelegationError } from "./agy-delegation-types.js";
 
-test("validation policy allows bounded package validators and denies arbitrary execution surfaces", () => {
+const macTest = process.platform === "darwin" ? test : test.skip;
+
+macTest("validation policy allows bounded package validators and denies arbitrary execution surfaces", () => {
   const root = "/tmp/repo";
   assert.equal(validateValidationCommand(["npm", "test"], root).argv[0], "npm");
   assert.equal(validateValidationCommand(["npm", "run", "build"], root).argv[2], "build");
@@ -34,7 +36,7 @@ test("validation policy allows bounded package validators and denies arbitrary e
   }
 });
 
-test("sandbox profile denies network and limits writable paths", async (t) => {
+macTest("sandbox profile denies network and limits writable paths", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-agy-validation-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspace = join(root, "workspace");

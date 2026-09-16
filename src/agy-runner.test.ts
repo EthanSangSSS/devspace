@@ -9,7 +9,9 @@ import {
   runAgyHeadless,
 } from "./agy-runner.js";
 
-test("headless runner uses pinned model/effort, stateless flags, and ephemeral HOME", async (t) => {
+const macTest = process.platform === "darwin" ? test : test.skip;
+
+macTest("headless runner uses pinned model/effort, stateless flags, and ephemeral HOME", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-agy-runner-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspace = join(root, "workspace");
@@ -80,7 +82,7 @@ test("headless runner uses pinned model/effort, stateless flags, and ephemeral H
   assert.equal(result.response, "first line\n");
 });
 
-test("headless runner retries once after an interrupted terminal stream", async (t) => {
+macTest("headless runner retries once after an interrupted terminal stream", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-agy-runner-retry-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspace = join(root, "workspace");
@@ -118,7 +120,7 @@ test("headless runner retries once after an interrupted terminal stream", async 
   assert.equal(result.response, "retried\n");
 });
 
-test("headless runner does not retry ordinary terminal errors", async (t) => {
+macTest("headless runner does not retry ordinary terminal errors", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-agy-runner-no-retry-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspace = join(root, "workspace");

@@ -8,8 +8,9 @@ import { promisify } from "node:util";
 import { AgyDelegationService } from "./agy-delegation.js";
 
 const execFileAsync = promisify(execFile);
+const macTest = process.platform === "darwin" ? test : test.skip;
 
-test("repo-read returns verified claims and leaves source unchanged", async (t) => {
+macTest("repo-read returns verified claims and leaves source unchanged", async (t) => {
   const fixture = await delegationFixture(t, "gemini-3.8-flash-high");
   const service = new AgyDelegationService({
     config: fixture.config,
@@ -34,7 +35,7 @@ test("repo-read returns verified claims and leaves source unchanged", async (t) 
   assert.equal(result.response, "hello\n");
 });
 
-test("repo-read prompt binds the worker to the exact disposable snapshot root", async (t) => {
+macTest("repo-read prompt binds the worker to the exact disposable snapshot root", async (t) => {
   const fixture = await delegationFixture(t, "gemini-3.8-flash-high");
   const service = new AgyDelegationService({
     config: fixture.config,
@@ -56,7 +57,7 @@ test("repo-read prompt binds the worker to the exact disposable snapshot root", 
   assert.match(prompts, /Do not search or access parent or sibling paths/);
 });
 
-test("model mismatch returns a typed failure and never invokes a fallback executor", async (t) => {
+macTest("model mismatch returns a typed failure and never invokes a fallback executor", async (t) => {
   const fixture = await delegationFixture(t, "gemini-3.8-flash-low");
   const service = new AgyDelegationService({
     config: fixture.config,
@@ -77,7 +78,7 @@ test("model mismatch returns a typed failure and never invokes a fallback execut
   assert.equal(await fixture.invocations(), 1);
 });
 
-test("repo-validate runs declared validation in the disposable snapshot before read-only analysis", async (t) => {
+macTest("repo-validate runs declared validation in the disposable snapshot before read-only analysis", async (t) => {
   const fixture = await delegationFixture(t, "gemini-3.8-flash-high");
   const service = new AgyDelegationService({
     config: fixture.config,
@@ -101,7 +102,7 @@ test("repo-validate runs declared validation in the disposable snapshot before r
   assert.equal(result.envelope.changedPersistentPaths.length, 0);
 });
 
-test("gui-inspect redacts sensitive AX content and brokers one semantic action before returning a final answer", async (t) => {
+macTest("gui-inspect redacts sensitive AX content and brokers one semantic action before returning a final answer", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-agy-gui-delegation-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
 

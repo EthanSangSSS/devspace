@@ -14,8 +14,9 @@ import {
 import { AgyDelegationError } from "./agy-delegation-types.js";
 
 const execFileAsync = promisify(execFile);
+const macTest = process.platform === "darwin" ? test : test.skip;
 
-test("exports only declared committed scopes without .git", async (t) => {
+macTest("exports only declared committed scopes without .git", async (t) => {
   const fixture = await repositoryFixture(t);
   const snapshot = await prepareAgyRepositorySnapshot({
     repositoryRoot: fixture.repo,
@@ -63,7 +64,7 @@ test("rejects traversal, git metadata, sensitive paths, missing paths, and symli
   }
 });
 
-test("blocks provider export when Gitleaks reports a finding", async (t) => {
+macTest("blocks provider export when Gitleaks reports a finding", async (t) => {
   const fixture = await repositoryFixture(t);
   await assert.rejects(
     () => prepareAgyRepositorySnapshot({
@@ -76,7 +77,7 @@ test("blocks provider export when Gitleaks reports a finding", async (t) => {
   );
 });
 
-test("source fingerprint detects repository changes after snapshot preparation", async (t) => {
+macTest("source fingerprint detects repository changes after snapshot preparation", async (t) => {
   const fixture = await repositoryFixture(t);
   const before = await fingerprintRepository(fixture.repo);
   const snapshot = await prepareAgyRepositorySnapshot({

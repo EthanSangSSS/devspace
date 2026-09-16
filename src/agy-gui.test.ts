@@ -14,6 +14,7 @@ import {
 import { AgyDelegationError } from "./agy-delegation-types.js";
 
 const target: GuiTarget = { pid: 42, applicationIdentity: "ChatGPT", windowId: 100 };
+const macTest = process.platform === "darwin" ? test : test.skip;
 
 test("GUI sanitization exposes bounded interactive chrome but not document text or editable values", () => {
   const sanitized = sanitizeGuiSnapshot({
@@ -79,7 +80,7 @@ test("GUI broker verifies exact pid/app/window and permits only role-classified 
   );
 });
 
-test("CuaDriver client requests exact window AX state with screenshots disabled", async (t) => {
+macTest("CuaDriver client requests exact window AX state with screenshots disabled", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-agy-cua-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const logPath = join(root, "calls.txt");

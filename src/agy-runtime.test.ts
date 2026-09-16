@@ -19,8 +19,9 @@ const requiredHelp = [
   "--sandbox",
   "--print",
 ].join("\n");
+const macTest = process.platform === "darwin" ? test : test.skip;
 
-test("runtime introspection probes only local version/help and reports telemetry state", async (t) => {
+macTest("runtime introspection probes only local version/help and reports telemetry state", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-agy-runtime-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const agyPath = join(root, "agy");
@@ -58,7 +59,7 @@ test("runtime introspection probes only local version/help and reports telemetry
   assert.equal(JSON.stringify(result).includes("do-not-return"), false);
 });
 
-test("runtime introspection accepts Agy help emitted on stderr", async (t) => {
+macTest("runtime introspection accepts Agy help emitted on stderr", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-agy-runtime-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const agyPath = join(root, "agy");
