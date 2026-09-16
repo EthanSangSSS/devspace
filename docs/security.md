@@ -130,6 +130,12 @@ MCP tools instead of exposing Agy through arbitrary shell text. This is a
 least-privilege and auditability boundary; it is not a promise that every MCP
 host or platform will accept agent delegation.
 
+V1 Agy execution is supported and qualified only on macOS. The broader
+DevSpace server remains cross-platform, but Linux and Windows are not supported
+Agy runtime targets for this version. Platform-independent configuration,
+schema, parser, and MCP-surface tests still run cross-platform; macOS-specific
+Agy execution fixtures run only on macOS.
+
 ### Four state categories
 
 V1 distinguishes four kinds of state:

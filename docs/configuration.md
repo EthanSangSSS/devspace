@@ -149,6 +149,11 @@ disabled by default. It is separate from DevSpace's built-in Subagents system:
 enabling it does not enable Subagents, provider profiles, or
 `devspace agents` commands.
 
+V1 is supported and qualified only on macOS. DevSpace's core server remains
+cross-platform, but Linux and Windows are not supported Agy execution targets
+for this version. In particular, `repo-validate` fails closed outside macOS
+because its authoritative validation isolation uses Seatbelt.
+
 Configure it in `config.jsonc`:
 
 ```jsonc

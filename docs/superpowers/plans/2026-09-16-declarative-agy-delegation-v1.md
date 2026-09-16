@@ -1,5 +1,15 @@
 # Declarative Agy Delegation V1 Implementation Plan
 
+> **Historical plan — superseded where noted by the final implementation.**
+> This document preserves the task-by-task plan that was used during delivery;
+> it is not the current runtime contract. The shipped implementation stores the
+> feature gate and paths under `config.jsonc -> agyDelegation`, installs the
+> read-only PreToolUse policy in the task-local Agy config directory rather than
+> repository `.agents/hooks.json`, qualifies Agy execution on macOS only, and
+> performs at most one fresh (non-resume) retry for the observed
+> stream-interrupted terminal error. Refer to `docs/configuration.md` and
+> `docs/security.md` for current behavior.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add an opt-in DevSpace MCP surface for auditable, fail-closed Agy delegation with `get_agy_runtime` and `delegate_to_agy`, supporting `repo-read`, `repo-validate`, and `gui-inspect` without exposing arbitrary shell, persistent repository writes, unrestricted CuaDriver access, or hidden executor fallback.
