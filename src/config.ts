@@ -5,6 +5,7 @@ import type { LoggingConfig } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
 import { devspaceAgentsDir, devspaceSkillsDir, loadDevspaceFiles } from "./user-config.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
+import type { AgyDelegationConfig } from "./agy-delegation-types.js";
 
 export type { ToolMode } from "./config-schema.js";
 
@@ -27,6 +28,7 @@ export interface ServerConfig {
   devspaceSkillsDir: string;
   devspaceAgentsDir: string;
   subagents: SubagentsConfig;
+  agyDelegation: AgyDelegationConfig;
   agentDir: string;
   logging: LoggingConfig;
 }
@@ -75,6 +77,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     devspaceSkillsDir: devspaceSkillsDir(env),
     devspaceAgentsDir: devspaceAgentsDir(env),
     subagents: stored.subagents,
+    agyDelegation: {
+      enabled: stored.agyDelegation.enabled,
+      agyPath: normalizePath(stored.agyDelegation.agyPath),
+      cuaDriverPath: normalizePath(stored.agyDelegation.cuaDriverPath),
+      settingsPath: normalizePath(stored.agyDelegation.settingsPath),
+    },
     agentDir: normalizePath(stored.skills.agentDir),
     logging: {
       ...stored.logging,

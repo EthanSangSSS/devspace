@@ -12,6 +12,7 @@ import { loadConfig, type ServerConfig, type ToolMode } from "./config.js";
 import type { LocalAgentProviderAvailability } from "./local-agent-availability.js";
 import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
+import type { AgyDelegationService, AgyDelegationRequest, AgyDelegationResult } from "./agy-delegation.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import {
@@ -207,6 +208,73 @@ test("show_changes can reopen a historical review without advancing the checkpoi
   );
 });
 
+test("Agy delegation tools are hidden by default", async (t) => {
+  const context = await fixture(t);
+  const names = (await context.client.listTools()).tools.map((tool) => tool.name);
+  assert.equal(names.includes("get_agy_runtime"), false);
+  assert.equal(names.includes("delegate_to_agy"), false);
+});
+
+test("enabled Agy delegation exposes honest, fixed-policy MCP schemas", async (t) => {
+  const service = fakeAgyService();
+  const context = await fixture(t, { agyDelegationEnabled: true, agyService: service.service });
+  const tools = (await context.client.listTools()).tools;
+  const runtime = tools.find((tool) => tool.name === "get_agy_runtime");
+  const delegate = tools.find((tool) => tool.name === "delegate_to_agy");
+  assert.ok(runtime);
+  assert.ok(delegate);
+  assert.match(runtime.description ?? "", /without starting an agent/i);
+  assert.match(delegate.description ?? "", /bounded local Agy/i);
+  assert.match(delegate.description ?? "", /model provider/i);
+
+  const input = delegate.inputSchema as {
+    properties?: Record<string, { const?: unknown; enum?: unknown[] }>;
+  };
+  assert.deepEqual(input.properties?.profile?.enum, ["repo-read", "repo-validate", "gui-inspect"]);
+  assert.equal(input.properties?.requested_model?.const, "gemini-3.8-flash-high");
+  assert.equal(input.properties?.requested_effort?.const, "high");
+});
+
+test("delegate_to_agy dry-run resolves the workspace and does not start a worker", async (t) => {
+  const fake = fakeAgyService();
+  const context = await fixture(t, {
+    git: true,
+    agyDelegationEnabled: true,
+    agyService: fake.service,
+  });
+  const opened = structuredContent(await callOpen(context.client, context.project, "chat-agy"));
+  const head = (await execFileAsync("git", ["rev-parse", "HEAD"], {
+    cwd: context.project,
+    encoding: "utf8",
+  })).stdout.trim();
+
+  const result = await context.client.callTool({
+    name: "delegate_to_agy",
+    arguments: {
+      workspaceId: opened.workspaceId,
+      profile: "repo-read",
+      task: "Read README.md.",
+      dry_run: true,
+      requested_model: "gemini-3.8-flash-high",
+      requested_effort: "high",
+      expected_source_head: head,
+      allowed_read_paths: ["README.md"],
+    },
+  });
+
+  assert.equal(fake.requests.length, 1);
+  const request = fake.requests[0];
+  assert.equal(request?.profile, "repo-read");
+  if (request?.profile === "repo-read") {
+    assert.equal(request.repositoryRoot, context.project);
+    assert.equal(request.expectedSourceHead, head);
+    assert.equal(request.dryRun, true);
+  }
+  assert.equal(fake.workerStarts, 0);
+  assert.equal(structuredContent(result).worker_started, false);
+  assert.equal(structuredContent(result).policy_preflight_passed, true);
+});
+
 test("open_workspace keeps lifecycle flags out of model output and preserves complete card metadata", async (t) => {
   const providerNote = "available";
   const context = await fixture(t, {
@@ -342,6 +410,8 @@ async function fixture(
     subagents?: SubagentsConfig;
     toolMode?: ToolMode;
     uiEnabled?: boolean;
+    agyDelegationEnabled?: boolean;
+    agyService?: Pick<AgyDelegationService, "inspectRuntime" | "delegate">;
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -385,7 +455,7 @@ async function fixture(
     toolMode: options.toolMode ?? loadedConfig.toolMode,
     uiEnabled: options.uiEnabled ?? loadedConfig.uiEnabled,
   };
-  const config: ServerConfig = options.localAgentProviders
+  let config: ServerConfig = options.localAgentProviders
     ? {
         ...modeConfig,
         subagents: options.subagents ?? {
@@ -397,6 +467,12 @@ async function fixture(
         },
       }
     : modeConfig;
+  if (options.agyDelegationEnabled) {
+    config = {
+      ...config,
+      agyDelegation: { ...config.agyDelegation, enabled: true },
+    };
+  }
   const resolveProviderAvailability: () => LocalAgentProviderAvailability[] =
     typeof options.localAgentProviders === "function"
       ? options.localAgentProviders
@@ -414,6 +490,7 @@ async function fixture(
     new ProcessSessionManager(),
     resolveLocalAgentProviders,
     [],
+    options.agyService,
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "devspace-test-client", version: "1.0.0" });
@@ -437,6 +514,63 @@ async function fixture(
   });
 
   return { client, project };
+}
+
+function fakeAgyService(): {
+  service: Pick<AgyDelegationService, "inspectRuntime" | "delegate">;
+  requests: AgyDelegationRequest[];
+  workerStarts: number;
+} {
+  const requests: AgyDelegationRequest[] = [];
+  let workerStarts = 0;
+  return {
+    requests,
+    get workerStarts() {
+      return workerStarts;
+    },
+    service: {
+      async inspectRuntime() {
+        return {
+          runtimeStatus: "available" as const,
+          agyPath: "/tmp/agy",
+          agyVersion: "1.1.22",
+          agyExecutableSha256: "abc",
+          requiredModel: "gemini-3.8-flash-high" as const,
+          requiredEffort: "high" as const,
+          requiredFlagsSupported: true,
+          resolvedModelTelemetry: "available" as const,
+          trustedCliAuthMode: "cached-auth-required" as const,
+          telemetryEnabled: false as const,
+          telemetryDisableEnforcement: "available" as const,
+          taskLocalSessionEnforcement: "available" as const,
+          hostSettingsMutationRequired: false,
+          workerStarted: false as const,
+        };
+      },
+      async delegate(request: AgyDelegationRequest): Promise<AgyDelegationResult> {
+        requests.push(request);
+        if (!request.dryRun) workerStarts += 1;
+        return {
+          ok: true,
+          envelope: {
+            schemaVersion: 1,
+            executionId: "test-execution",
+            profile: request.profile,
+            dryRun: request.dryRun,
+            toolSurfaceRegistered: true,
+            toolCallAccepted: true,
+            requestReachedDevspace: true,
+            policyPreflightPassed: true,
+            workerStarted: !request.dryRun,
+            requestedModel: "gemini-3.8-flash-high",
+            requestedEffort: "high",
+            effortSelectionVerified: !request.dryRun,
+            changedPersistentPaths: [],
+          },
+        };
+      },
+    },
+  };
 }
 
 async function git(cwd: string, args: string[]): Promise<void> {

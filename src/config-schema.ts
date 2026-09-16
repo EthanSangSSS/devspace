@@ -41,6 +41,13 @@ const skillsConfigSchema = z.object({
   agentDir: z.string().trim().min(1).default("~/.codex"),
 }).strict().prefault({});
 
+const agyDelegationConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  agyPath: z.string().trim().min(1).default("~/.local/bin/agy"),
+  cuaDriverPath: z.string().trim().min(1).default("~/.local/bin/cua-driver"),
+  settingsPath: z.string().trim().min(1).default("~/.gemini/antigravity-cli/settings.json"),
+}).strict().prefault({});
+
 const loggingConfigSchema = z.object({
   level: z.enum(["silent", "error", "warn", "info", "debug"]).default("info"),
   format: z.enum(["json", "pretty"]).default("json"),
@@ -72,6 +79,7 @@ export const devspaceConfigSchema = z.object({
   artifacts: artifactsConfigSchema,
   skills: skillsConfigSchema,
   subagents: subagentsConfigSchema.default({ enabled: false, providers: [] }),
+  agyDelegation: agyDelegationConfigSchema,
   logging: loggingConfigSchema,
   oauth: oauthConfigSchema,
 }).strict();

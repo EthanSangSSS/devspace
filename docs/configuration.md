@@ -142,6 +142,63 @@ generated file into an open workspace. `artifacts.maxFileBytes` limits one
 streamed file. The secure publication path is currently available only on
 Linux; the tool is not registered on macOS, Windows, or BSD.
 
+## Declarative Agy Delegation
+
+Declarative Agy delegation is an experimental, server-side capability and is
+disabled by default. It is separate from DevSpace's built-in Subagents system:
+enabling it does not enable Subagents, provider profiles, or
+`devspace agents` commands.
+
+Configure it in `config.jsonc`:
+
+```jsonc
+{
+  "configVersion": 1,
+  "agyDelegation": {
+    "enabled": true,
+    "agyPath": "~/.local/bin/agy",
+    "cuaDriverPath": "~/.local/bin/cua-driver",
+    "settingsPath": "~/.gemini/antigravity-cli/settings.json"
+  }
+}
+```
+
+The section defaults to disabled. The three path fields default to the values
+shown above and are normalized using the same home-path rules as other stored
+DevSpace paths.
+
+V1 fixes every real delegated run to:
+
+```text
+model  = gemini-3.8-flash-high
+effort = high
+```
+
+The public tool input repeats those values as exact literals; they are not
+general model-selection controls. Agy runs use `--output-format stream-json`
+and fail closed if the runtime does not report the exact model identity.
+
+Real runs require telemetry to already be disabled in the configured Agy
+settings. DevSpace does not change the user's persistent Agy settings to make a
+delegation pass. The worker uses a task-local HOME and does not use
+`--continue`, `--conversation`, or automatic permission bypass flags.
+
+Repository profiles also require `gitleaks` to be installed as an executable on
+the DevSpace service PATH. DevSpace resolves that executable to an absolute
+path before using it for the bounded snapshot preflight.
+
+The V1 profiles are:
+
+- `repo-read` — committed-HEAD read/search analysis only.
+- `repo-validate` — the same bounded snapshot plus declared validation commands
+  executed by DevSpace under a network-denied sandbox before Agy analysis.
+- `gui-inspect` — exact-window AX inspection through the CuaDriver broker; no
+  generic CuaDriver executable, raw pixel action surface, screenshot feed, or
+  text-entry capability is exposed to Agy.
+
+`delegate_to_agy` has no internal Codex or alternate-model fallback. Any later
+fallback is a separate host/controller decision.
+
 ## Environment boundary
 
 Only two user-facing DevSpace environment variables remain:

@@ -23,6 +23,12 @@ try {
   assert.equal(defaults.skillsEnabled, true);
   assert.equal(defaults.artifactsEnabled, false);
   assert.deepEqual(defaults.subagents, { enabled: false, providers: [] });
+  assert.deepEqual(defaults.agyDelegation, {
+    enabled: false,
+    agyPath: resolve(homedir(), ".local", "bin", "agy"),
+    cuaDriverPath: resolve(homedir(), ".local", "bin", "cua-driver"),
+    settingsPath: resolve(homedir(), ".gemini", "antigravity-cli", "settings.json"),
+  });
   assert.deepEqual(defaults.logging, {
     level: "info",
     format: "json",
@@ -32,7 +38,6 @@ try {
     shellCommands: false,
     trustProxy: false,
   });
-
   writeDevspaceConfig({
     configVersion: 1,
     server: {
@@ -54,6 +59,12 @@ try {
     subagents: {
       enabled: true,
       providers: [{ id: "codex", enabled: true }],
+    },
+    agyDelegation: {
+      enabled: true,
+      agyPath: "~/bin/agy",
+      cuaDriverPath: "~/bin/cua-driver",
+      settingsPath: "~/agy-settings.json",
     },
     logging: {
       level: "debug",
@@ -96,6 +107,12 @@ try {
   assert.deepEqual(configured.skillPaths, ["~/skills"]);
   assert.equal(configured.agentDir, resolve(homedir(), "agent"));
   assert.equal(configured.subagents.enabled, true);
+  assert.deepEqual(configured.agyDelegation, {
+    enabled: true,
+    agyPath: resolve(homedir(), "bin", "agy"),
+    cuaDriverPath: resolve(homedir(), "bin", "cua-driver"),
+    settingsPath: resolve(homedir(), "agy-settings.json"),
+  });
   assert.equal(configured.oauth.ownerToken, "persisted-owner-token-long-enough");
   assert.equal(configured.oauth.accessTokenTtlSeconds, 120);
   assert.deepEqual(configured.oauth.scopes, ["devspace", "admin"]);

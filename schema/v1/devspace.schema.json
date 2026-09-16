@@ -208,6 +208,32 @@
       ],
       "additionalProperties": false
     },
+    "agyDelegation": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "agyPath": {
+          "default": "~/.local/bin/agy",
+          "type": "string",
+          "minLength": 1
+        },
+        "cuaDriverPath": {
+          "default": "~/.local/bin/cua-driver",
+          "type": "string",
+          "minLength": 1
+        },
+        "settingsPath": {
+          "default": "~/.gemini/antigravity-cli/settings.json",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
     "logging": {
       "default": {},
       "type": "object",
