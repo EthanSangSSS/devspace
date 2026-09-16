@@ -53,7 +53,9 @@ test("sandbox profile denies network and limits writable paths", async (t) => {
   assert.doesNotMatch(sandbox, /allow network/);
 });
 
-test("validation runner executes declared npm test in isolated writable state and records a receipt", async (t) => {
+test("validation runner executes declared npm test in isolated writable state and records a receipt", {
+  skip: process.platform !== "darwin" ? "authoritative validation isolation is macOS-only in V1" : false,
+}, async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-agy-validation-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspace = join(root, "workspace");
@@ -74,6 +76,28 @@ test("validation runner executes declared npm test in isolated writable state an
   assert.equal(receipts[0]?.sandboxed, true);
   assert.deepEqual(receipts[0]?.argv, ["npm", "test"]);
   assert.match(await readFile(join(artifacts, receipts[0]!.stdoutArtifact), "utf8"), /validation-ok/);
+});
+
+test("validation runner fails closed when authoritative macOS isolation is unavailable", async () => {
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  assert.ok(platformDescriptor);
+  Object.defineProperty(process, "platform", { ...platformDescriptor, value: "linux" });
+  try {
+    await assert.rejects(
+      runValidationCommands(
+        [{ argv: ["npm", "test"] }],
+        {
+          workspace: "/tmp/devspace-validation-non-darwin",
+          home: "/tmp/devspace-validation-non-darwin-home",
+          artifacts: "/tmp/devspace-validation-non-darwin-artifacts",
+          timeoutMs: 1_000,
+        },
+      ),
+      (error: unknown) => error instanceof AgyDelegationError && error.code === "NETWORK_POLICY_DENIED",
+    );
+  } finally {
+    Object.defineProperty(process, "platform", platformDescriptor);
+  }
 });
 
 function escapeRegExp(value: string): string {
