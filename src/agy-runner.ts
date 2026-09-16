@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readlink, realpath, symlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
@@ -42,6 +42,7 @@ export async function runAgyHeadless(input: AgyHeadlessRunInput): Promise<AgyHea
   const runtimeTmp = join(input.taskRoot, "agy-tmp");
   const configDir = join(runtimeHome, ".gemini", "antigravity-cli");
   const logPath = join(input.taskRoot, "agy.log");
+  const canonicalCwd = await realpath(input.cwd);
   await Promise.all([
     mkdir(configDir, { recursive: true, mode: 0o700 }),
     mkdir(runtimeTmp, { recursive: true, mode: 0o700 }),
@@ -50,9 +51,24 @@ export async function runAgyHeadless(input: AgyHeadlessRunInput): Promise<AgyHea
   if (hostKeychainPath) {
     await projectHostLoginKeychain(runtimeHome, hostKeychainPath);
   }
+  await installAgyReadOnlyHookPolicy(canonicalCwd, runtimeHome);
   await writeFile(
     join(configDir, "settings.json"),
-    `${JSON.stringify({ enableTelemetry: false }, null, 2)}\n`,
+    `${JSON.stringify({
+      enableTelemetry: false,
+      permissions: {
+        allow: [`read_file(${canonicalCwd})`],
+        deny: [
+          "write_file(*)",
+          "command(*)",
+          "unsandboxed(*)",
+          "read_url(*)",
+          "execute_url(*)",
+          "mcp(*)",
+        ],
+        ask: [],
+      },
+    }, null, 2)}\n`,
     { encoding: "utf8", mode: 0o600 },
   );
 
@@ -160,13 +176,14 @@ async function projectHostLoginKeychain(runtimeHome: string, hostKeychainPath: s
 
 export async function installAgyReadOnlyHookPolicy(
   workspace: string,
+  runtimeHome: string,
 ): Promise<InstalledAgyHookPolicy> {
-  const agentsDir = join(workspace, ".agents");
-  await rm(agentsDir, { recursive: true, force: true });
-  await mkdir(agentsDir, { recursive: true, mode: 0o700 });
-  const hookPath = join(agentsDir, "devspace-readonly-hook.mjs");
-  const hooksPath = join(agentsDir, "hooks.json");
-  await writeFile(hookPath, READ_ONLY_HOOK_SOURCE, { encoding: "utf8", mode: 0o700 });
+  const canonicalWorkspace = await realpath(workspace);
+  const hooksDir = join(runtimeHome, ".gemini", "config");
+  await mkdir(hooksDir, { recursive: true, mode: 0o700 });
+  const hookPath = join(hooksDir, "devspace-readonly-hook.mjs");
+  const hooksPath = join(hooksDir, "hooks.json");
+  await writeFile(hookPath, buildReadOnlyHookSource(canonicalWorkspace), { encoding: "utf8", mode: 0o700 });
   await chmod(hookPath, 0o700);
   await writeFile(
     hooksPath,
@@ -232,11 +249,16 @@ function isTimeout(error: unknown): boolean {
   ));
 }
 
-const READ_ONLY_HOOK_SOURCE = String.raw`import path from "node:path";
+function buildReadOnlyHookSource(workspace: string): string {
+  return String.raw`import fs from "node:fs";
+import path from "node:path";
+
+const ROOT = ${JSON.stringify(workspace)};
 
 const ALLOWED = new Set([
   "view_file",
   "read_file",
+  "list_dir",
   "list_directory",
   "grep_search",
   "find_by_name",
@@ -258,11 +280,8 @@ try {
 
 const name = input?.toolCall?.name;
 const args = input?.toolCall?.args ?? {};
-const roots = Array.isArray(input?.workspacePaths)
-  ? input.workspacePaths.filter((value) => typeof value === "string").map((value) => path.resolve(value))
-  : [];
 
-if (!ALLOWED.has(name) || roots.length === 0) {
+if (!ALLOWED.has(name)) {
   console.log(JSON.stringify({ decision: "deny", reason: "DevSpace V1 denies non-read or unknown tools." }));
   process.exit(0);
 }
@@ -281,8 +300,13 @@ for (const value of strings) {
     process.exit(0);
   }
   if (path.isAbsolute(value)) {
-    const target = path.resolve(value);
-    const inside = roots.some((root) => target === root || target.startsWith(root + path.sep));
+    let target;
+    try {
+      target = fs.realpathSync.native(value);
+    } catch {
+      target = path.resolve(value);
+    }
+    const inside = target === ROOT || target.startsWith(ROOT + path.sep);
     if (!inside) {
       console.log(JSON.stringify({ decision: "deny", reason: "DevSpace V1 denies reads outside the delegated workspace." }));
       process.exit(0);
@@ -292,3 +316,4 @@ for (const value of strings) {
 
 console.log(JSON.stringify({ decision: "allow", reason: "DevSpace V1 bounded read." }));
 `;
+}

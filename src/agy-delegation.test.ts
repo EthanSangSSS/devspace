@@ -34,6 +34,28 @@ test("repo-read returns verified claims and leaves source unchanged", async (t) 
   assert.equal(result.response, "hello\n");
 });
 
+test("repo-read prompt binds the worker to the exact disposable snapshot root", async (t) => {
+  const fixture = await delegationFixture(t, "gemini-3.8-flash-high");
+  const service = new AgyDelegationService({
+    config: fixture.config,
+    gitleaksPath: fixture.gitleaksPath,
+  });
+
+  const result = await service.delegate({
+    profile: "repo-read",
+    task: "Read README.md.",
+    dryRun: false,
+    repositoryRoot: fixture.repo,
+    expectedSourceHead: fixture.head,
+    allowedReadPaths: ["README.md"],
+  });
+
+  assert.equal(result.ok, true, JSON.stringify(result));
+  const prompts = await fixture.prompts();
+  assert.match(prompts, /Exact delegated workspace root: .*devspace-agy-repo-.*\/snapshot/);
+  assert.match(prompts, /Do not search or access parent or sibling paths/);
+});
+
 test("model mismatch returns a typed failure and never invokes a fallback executor", async (t) => {
   const fixture = await delegationFixture(t, "gemini-3.8-flash-low");
   const service = new AgyDelegationService({
@@ -154,6 +176,7 @@ async function delegationFixture(t: TestContext, model: string): Promise<{
   };
   gitleaksPath: string;
   invocations: () => Promise<number>;
+  prompts: () => Promise<string>;
 }> {
   const root = await mkdtemp(join(tmpdir(), "devspace-agy-delegation-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -169,6 +192,7 @@ async function delegationFixture(t: TestContext, model: string): Promise<{
   const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" })).stdout.trim();
 
   const invocationsPath = join(root, "invocations.txt");
+  const promptsPath = join(root, "prompts.txt");
   const agyPath = join(root, "agy");
   await writeFile(agyPath, [
     "#!/bin/sh",
@@ -177,6 +201,7 @@ async function delegationFixture(t: TestContext, model: string): Promise<{
     "  --help) printf '%s\\n' --model --effort --output-format --mode --sandbox --print; exit 0;;",
     "esac",
     `printf '%s\\n' invoked >> ${JSON.stringify(invocationsPath)}`,
+    `printf '%s\\n' "$2" >> ${JSON.stringify(promptsPath)}`,
     `printf '%s\\n' '{\"event\":\"init\",\"init\":{\"model\":\"${model}\"}}'`,
     "printf '%s\\n' '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"hello\\n\"}}'",
     "",
@@ -203,6 +228,7 @@ async function delegationFixture(t: TestContext, model: string): Promise<{
           : Promise.reject(error);
       }
     },
+    prompts: async () => readFile(promptsPath, "utf8"),
   };
 }
 

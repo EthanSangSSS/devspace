@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readlink, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -51,8 +51,27 @@ test("headless runner uses pinned model/effort, stateless flags, and ephemeral H
   assert.equal(args.includes("--dangerously-skip-permissions"), false);
   const ephemeralHome = await readFile(homeLog, "utf8");
   assert.equal(ephemeralHome.startsWith(taskRoot), true);
+  const canonicalWorkspace = await realpath(workspace);
   const settings = JSON.parse(await readFile(join(ephemeralHome, ".gemini", "antigravity-cli", "settings.json"), "utf8"));
-  assert.deepEqual(settings, { enableTelemetry: false });
+  assert.deepEqual(settings, {
+    enableTelemetry: false,
+    permissions: {
+      allow: [`read_file(${canonicalWorkspace})`],
+      deny: [
+        "write_file(*)",
+        "command(*)",
+        "unsandboxed(*)",
+        "read_url(*)",
+        "execute_url(*)",
+        "mcp(*)",
+      ],
+      ask: [],
+    },
+  });
+  assert.match(
+    await readFile(join(ephemeralHome, ".gemini", "config", "hooks.json"), "utf8"),
+    /"matcher": "\*"/,
+  );
   assert.equal(
     await readlink(join(ephemeralHome, "Library", "Keychains", "login.keychain-db")),
     hostKeychainPath,
@@ -64,20 +83,33 @@ test("headless runner uses pinned model/effort, stateless flags, and ephemeral H
 test("read-only hook allows bounded reads and denies writes, commands, and out-of-workspace reads", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-agy-hook-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const policy = await installAgyReadOnlyHookPolicy(root);
+  const workspace = join(root, "workspace");
+  const runtimeHome = join(root, "runtime-home");
+  await mkdir(workspace);
+  await writeFile(join(workspace, "README.md"), "# Test\n");
+  const policy = await installAgyReadOnlyHookPolicy(workspace, runtimeHome);
 
+  assert.equal(policy.hooksPath, join(runtimeHome, ".gemini", "config", "hooks.json"));
   assert.match(await readFile(policy.hooksPath, "utf8"), /"matcher": "\*"/);
   assert.deepEqual(
     await invokeHook(policy.hookPath, {
-      toolCall: { name: "view_file", args: { AbsolutePath: join(root, "README.md") } },
-      workspacePaths: [root],
+      toolCall: { name: "view_file", args: { AbsolutePath: join(workspace, "README.md") } },
+      workspacePaths: [],
+    }),
+    { decision: "allow", reason: "DevSpace V1 bounded read." },
+  );
+  assert.deepEqual(
+    await invokeHook(policy.hookPath, {
+      toolCall: { name: "list_dir", args: { DirectoryPath: workspace } },
+      workspacePaths: [],
     }),
     { decision: "allow", reason: "DevSpace V1 bounded read." },
   );
   for (const input of [
-    { toolCall: { name: "write_to_file", args: { TargetFile: join(root, "x") } }, workspacePaths: [root] },
-    { toolCall: { name: "run_command", args: { CommandLine: "pwd" } }, workspacePaths: [root] },
-    { toolCall: { name: "view_file", args: { AbsolutePath: "/etc/hosts" } }, workspacePaths: [root] },
+    { toolCall: { name: "write_to_file", args: { TargetFile: join(workspace, "x") } }, workspacePaths: [] },
+    { toolCall: { name: "run_command", args: { CommandLine: "pwd" } }, workspacePaths: [] },
+    { toolCall: { name: "view_file", args: { AbsolutePath: "/etc/hosts" } }, workspacePaths: [] },
+    { toolCall: { name: "find_by_name", args: { SearchDirectory: root, Pattern: "README.md" } }, workspacePaths: [] },
   ]) {
     const result = await invokeHook(policy.hookPath, input);
     assert.equal(result.decision, "deny");

@@ -18,7 +18,7 @@ import {
   type AgyRepositorySnapshot,
 } from "./agy-repository.js";
 import { inspectAgyRuntime, preflightAgyRealRun } from "./agy-runtime.js";
-import { installAgyReadOnlyHookPolicy, runAgyHeadless } from "./agy-runner.js";
+import { runAgyHeadless } from "./agy-runner.js";
 import {
   runValidationCommands,
   type ValidationCommandSpec,
@@ -155,7 +155,6 @@ export class AgyDelegationService {
         return { ok: true, envelope };
       }
 
-      await installAgyReadOnlyHookPolicy(snapshot.root);
       let validationReceipts: ValidationReceipt[] | undefined;
       if (request.profile === "repo-validate") {
         const artifacts = join(snapshot.root, ".devspace-validation");
@@ -173,7 +172,7 @@ export class AgyDelegationService {
         agyPath: this.options.config.agyPath,
         cwd: snapshot.root,
         taskRoot: snapshot.taskRoot,
-        prompt: buildRepositoryPrompt(request, validationReceipts),
+        prompt: buildRepositoryPrompt(request, snapshot.root, validationReceipts),
         timeoutMs: 5 * 60_000,
       });
       envelope.resolvedModel = run.resolvedModel;
@@ -282,6 +281,7 @@ export class AgyDelegationService {
 
 function buildRepositoryPrompt(
   request: AgyRepositoryDelegationRequest,
+  workspaceRoot: string,
   validationReceipts?: ValidationReceipt[],
 ): string {
   const validation = validationReceipts?.length
@@ -289,6 +289,8 @@ function buildRepositoryPrompt(
     : "";
   return [
     "You are operating inside a disposable, bounded repository snapshot.",
+    `Exact delegated workspace root: ${workspaceRoot}`,
+    "Do not search or access parent or sibling paths. Resolve every repository read/search path inside that exact root.",
     "Use only read/search tools. Do not write files, run commands, browse the web, call MCP tools, or access paths outside this workspace.",
     `Task: ${request.task}`,
     validation,
