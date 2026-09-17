@@ -85,9 +85,9 @@ Expected: FAIL because the three fields do not exist yet.
 Extend `agyDelegationConfigSchema`:
 
 ```ts
-model: z.string().trim().min(1).default("gemini-3.8-flash-high"),
-effort: z.string().trim().min(1).default("high"),
-compatibleVersions: z.string().trim().min(1).default(">=1.1.22 <1.2.0"),
+model: z.string().min(1).regex(/\S/).default("gemini-3.8-flash-high"),
+effort: z.string().min(1).regex(/\S/).default("high"),
+compatibleVersions: z.string().min(1).regex(/\S/).default(">=1.1.22 <1.2.0"),
 ```
 
 Thread the three stored strings through `loadConfig()` without caller-derived overrides.

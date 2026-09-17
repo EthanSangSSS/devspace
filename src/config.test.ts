@@ -68,9 +68,9 @@ try {
       agyPath: "~/bin/agy",
       cuaDriverPath: "~/bin/cua-driver",
       settingsPath: "~/agy-settings.json",
-      model: "gemini-next-qualified",
-      effort: "high",
-      compatibleVersions: ">=1.1.22 <2.0.0",
+      model: " gemini-next-qualified ",
+      effort: "\tmedium ",
+      compatibleVersions: " >=1.1.22 <2.0.0 ",
     },
     logging: {
       level: "debug",
@@ -118,9 +118,9 @@ try {
     agyPath: resolve(homedir(), "bin", "agy"),
     cuaDriverPath: resolve(homedir(), "bin", "cua-driver"),
     settingsPath: resolve(homedir(), "agy-settings.json"),
-    model: "gemini-next-qualified",
-    effort: "high",
-    compatibleVersions: ">=1.1.22 <2.0.0",
+    model: " gemini-next-qualified ",
+    effort: "\tmedium ",
+    compatibleVersions: " >=1.1.22 <2.0.0 ",
   });
   assert.equal(configured.oauth.ownerToken, "persisted-owner-token-long-enough");
   assert.equal(configured.oauth.accessTokenTtlSeconds, 120);

@@ -234,17 +234,20 @@
         "model": {
           "default": "gemini-3.8-flash-high",
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "\\S"
         },
         "effort": {
           "default": "high",
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "\\S"
         },
         "compatibleVersions": {
           "default": ">=1.1.22 <1.2.0",
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "\\S"
         }
       },
       "additionalProperties": false

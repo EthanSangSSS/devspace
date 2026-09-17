@@ -80,6 +80,8 @@ Defaults preserve the current qualified runtime:
 
 `compatibleVersions` is an owner-controlled SemVer range. It is not a replacement for capability probes; both the range and capability checks must pass.
 
+These three policy strings are owner-authored values and are not normalized by the config loader: leading/trailing whitespace is preserved exactly, while empty or whitespace-only values are rejected. Runtime qualification may later reject a preserved value as semantically invalid, but configuration loading must not silently rewrite it.
+
 ### 3.3 Agy version compatibility gate
 
 `inspectAgyRuntime` will classify the configured executable using all of the following:
