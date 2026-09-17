@@ -240,6 +240,18 @@ function workspaceIdFromToolResponse(message: Record<string, unknown>): string {
   return workspaceId;
 }
 
+function processSessionIdFromToolResponse(message: Record<string, unknown>): number {
+  const result = message.result as
+    | { structuredContent?: { sessionId?: unknown; running?: unknown } }
+    | undefined;
+  const sessionId = result?.structuredContent?.sessionId;
+  assert.equal(result?.structuredContent?.running, true);
+  if (typeof sessionId !== "number") {
+    assert.fail("exec_command did not return a numeric process sessionId");
+  }
+  return sessionId;
+}
+
 async function initializeReadySession(
   baseUrl: string,
   accessToken: string,
@@ -315,6 +327,10 @@ interface HttpFixture {
 async function startFixture(
   maxSessions: number,
   mcpInitializeCommitBarrier?: (sessionId: string) => Promise<void>,
+  sessionPolicy: {
+    idleTimeoutMs?: number;
+    cleanupIntervalMs?: number;
+  } = {},
 ): Promise<HttpFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-mcp-http-test-"));
   const project = join(root, "projects", "fixture");
@@ -343,6 +359,8 @@ async function startFixture(
     mcpInitializeCommitBarrier,
     mcpMaxSessions: maxSessions,
     runtimeSnapshotIntervalMs: 1_000,
+    mcpSessionIdleTimeoutMs: sessionPolicy.idleTimeoutMs,
+    mcpSessionCleanupIntervalMs: sessionPolicy.cleanupIntervalMs,
   });
   const httpServer = running.app.listen(port, "127.0.0.1");
   await new Promise<void>((resolve, reject) => {
@@ -389,6 +407,103 @@ test("idle session is evicted when a new initialize reaches maxSessions", async 
     (await listTools(fixture.baseUrl, fixture.accessToken, sessionB)).status,
     200,
   );
+});
+
+test("abandoned idle sessions expire without waiting for capacity pressure", async (t) => {
+  const fixture = await startFixture(4, undefined, {
+    idleTimeoutMs: 40,
+    cleanupIntervalMs: 10,
+  });
+  t.after(() => fixture.close());
+
+  const session = await initializeSession(fixture.baseUrl, fixture.accessToken);
+  await notifyInitialized(fixture.baseUrl, fixture.accessToken, session);
+  assert.equal(
+    (await listTools(fixture.baseUrl, fixture.accessToken, session)).status,
+    200,
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(
+    (await listTools(fixture.baseUrl, fixture.accessToken, session)).status,
+    404,
+  );
+});
+
+test("process sessions survive MCP transport expiry and remain writable from a fresh transport", async (t) => {
+  const fixture = await startFixture(4, undefined, {
+    idleTimeoutMs: 40,
+    cleanupIntervalMs: 10,
+  });
+  t.after(() => fixture.close());
+
+  const first = await initializeReadySession(
+    fixture.baseUrl,
+    fixture.accessToken,
+    fixture.project,
+  );
+  const execId = nextId++;
+  const started = await postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    {
+      jsonrpc: "2.0",
+      id: execId,
+      method: "tools/call",
+      params: {
+        name: "exec_command",
+        arguments: {
+          workspaceId: first.workspaceId,
+          cmd: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("setTimeout(() => { console.log('PROCESS_DONE'); }, 250)")}`,
+          yieldTimeMs: 1,
+        },
+      },
+    },
+    first.sessionId,
+  );
+  assert.equal(started.status, 200);
+  const processSessionId = processSessionIdFromToolResponse(
+    responseForId(started, execId),
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(
+    (await listTools(fixture.baseUrl, fixture.accessToken, first.sessionId)).status,
+    404,
+  );
+
+  const freshSessionId = await initializeSession(
+    fixture.baseUrl,
+    fixture.accessToken,
+  );
+  await notifyInitialized(fixture.baseUrl, fixture.accessToken, freshSessionId);
+  const writeId = nextId++;
+  const continued = await postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    {
+      jsonrpc: "2.0",
+      id: writeId,
+      method: "tools/call",
+      params: {
+        name: "write_stdin",
+        arguments: {
+          workspaceId: first.workspaceId,
+          sessionId: processSessionId,
+          yieldTimeMs: 500,
+        },
+      },
+    },
+    freshSessionId,
+  );
+  assert.equal(continued.status, 200);
+  const message = responseForId(continued, writeId);
+  assert.equal("error" in message, false);
+  const result = message.result as
+    | { structuredContent?: { result?: unknown; running?: unknown } }
+    | undefined;
+  assert.equal(result?.structuredContent?.running, false);
+  assert.match(String(result?.structuredContent?.result), /PROCESS_DONE/);
 });
 
 test("initializing session stays protected until initialize handleRequest completes", async (t) => {
