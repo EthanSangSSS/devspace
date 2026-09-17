@@ -34,6 +34,7 @@ import {
   syncDirectoryDurably,
   validateCanonicalFileIdentity,
   waitForStableState,
+  waitForRuntimeReadyState,
   waitForStoppedState,
 } from "./macos-launchd-rollout-darwin.js";
 
@@ -376,6 +377,60 @@ test("stability gate requires the same process generation, listener owner, and h
   });
   assert.equal(replaced.kind, "unproven");
   assert.match(replaced.kind === "unproven" ? replaced.reason : "", /process generation changed/);
+});
+
+test("runtime readiness gate tolerates delayed listener and health, then times out when readiness never arrives", async () => {
+  const expected = processIdentity();
+  const known = <T>(value: T) => ({ kind: "known" as const, value });
+  let attempt = 0;
+  let nowMs = 0;
+
+  const delayed = await waitForRuntimeReadyState(expected.entrypointRealpath, {
+    observeLaunchd: async () => known({
+      loaded: true,
+      pid: expected.pid,
+      runCount: 2,
+      normalizedArgv: expected.normalizedArgv,
+    }),
+    observeProcess: async () => known(expected),
+    observeListener: async () => attempt === 0
+      ? known({ state: "unowned" as const })
+      : known({ state: "owned" as const, ownerPid: expected.pid }),
+    checkHealth: async () => attempt < 2
+      ? known("unhealthy" as const)
+      : known("healthy" as const),
+  }, {
+    timeoutMs: 500,
+    pollIntervalMs: 50,
+    now: () => nowMs,
+    sleep: async (ms) => {
+      attempt += 1;
+      nowMs += ms;
+    },
+  });
+  assert.deepEqual(delayed, { kind: "known", value: expected });
+  assert.equal(attempt, 2, "readiness should retry transient startup observations");
+
+  let timeoutNow = 0;
+  const timedOut = await waitForRuntimeReadyState(expected.entrypointRealpath, {
+    observeLaunchd: async () => known({
+      loaded: true,
+      pid: expected.pid,
+      runCount: 2,
+      normalizedArgv: expected.normalizedArgv,
+    }),
+    observeProcess: async () => known(expected),
+    observeListener: async () => known({ state: "unowned" as const }),
+    checkHealth: async () => known("unhealthy" as const),
+  }, {
+    timeoutMs: 100,
+    pollIntervalMs: 50,
+    now: () => timeoutNow,
+    sleep: async (ms) => { timeoutNow += ms; },
+  });
+  assert.equal(timedOut.kind, "unproven");
+  assert.match(timedOut.kind === "unproven" ? timedOut.reason : "", /readiness.*timed out/i);
+  assert.equal(timeoutNow, 100, "readiness timeout must be bounded by the configured deadline");
 });
 
 test("file digest observation hashes exact bytes and fails closed on read errors", async (t) => {

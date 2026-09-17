@@ -398,6 +398,31 @@ async function createForwardFixture(
       }
       return known("healthy");
     },
+    async waitReady(expectedEntrypoint) {
+      calls.push(`ready:${phase}`);
+      const launchd = await adapters.observeLaunchd();
+      if (launchd.kind === "unproven" || !launchd.value.loaded || !launchd.value.pid) {
+        return unproven("runtime is not ready");
+      }
+      const processState = await adapters.observeProcess(launchd.value.pid);
+      if (processState.kind === "unproven") return processState;
+      if (processState.value.entrypointRealpath !== expectedEntrypoint) {
+        return unproven("runtime entrypoint mismatch");
+      }
+      const listener = await adapters.observeListener();
+      if (
+        listener.kind === "unproven"
+        || listener.value.state !== "owned"
+        || listener.value.ownerPid !== processState.value.pid
+      ) {
+        return unproven("runtime listener is not ready");
+      }
+      const health = await adapters.checkHealth();
+      if (health.kind === "unproven" || health.value !== "healthy") {
+        return unproven("runtime health is not ready");
+      }
+      return known(processState.value);
+    },
     async bootoutExpected(expected) {
       calls.push(expected.pid === oldProcess.pid ? "OLD_STOP_REQUESTED" : "CANDIDATE_STOP_REQUESTED");
       if (expected.pid === oldProcess.pid && phase === "old") {
@@ -523,7 +548,9 @@ rolloutTest("forward rollout verifies twice and commits only after pre-commit re
   assert.equal(result.context.lease, fixture.lease, "forward result must retain the same kernel lease for Task 6");
   assert.equal(fixture.getReleaseCalls(), 0, "forward path must not release the transaction lock");
   assert.ok(fixture.calls.indexOf("OLD_STOPPED_VERIFIED") < fixture.calls.indexOf("CANDIDATE_STARTED"));
+  assert.ok(fixture.calls.includes("ready:candidate-first"));
   assert.ok(fixture.calls.indexOf("CANDIDATE_STOPPED_VERIFIED") < fixture.calls.indexOf("CONTROLLED_RELOAD_STARTED"));
+  assert.ok(fixture.calls.includes("ready:candidate-reload"));
   assert.ok(fixture.calls.indexOf("canonical:temp-prepared") < fixture.calls.indexOf("COMMITTED"));
   const commitIndex = fixture.calls.indexOf("COMMITTED");
   assert.ok(fixture.calls.slice(0, commitIndex).includes("health:candidate-reload"));
@@ -637,6 +664,7 @@ rolloutTest("pre-commit recovery stops an owned candidate then bootstraps the un
   assert.equal(outcome.committed, false);
   assert.equal(fixture.calls.includes("CANDIDATE_STOP_REQUESTED"), true);
   assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), true);
+  assert.equal(fixture.calls.includes("ready:old-restored"), true);
   assert.equal(fixture.getReleaseCalls(), 1);
 });
 

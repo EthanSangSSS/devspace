@@ -37,6 +37,8 @@ pnpm exec tsx scripts/devspace-macos-rollout.ts rollout \
 
 There are no caller-selectable `--label`, `--port`, `--plist`, or arbitrary topology overrides.
 
+Run the production command from an independent operator context that is not a descendant of the live DevSpace process. Do not use `launchctl submit` as a one-shot wrapper for this command: macOS documents that `submit` keeps a failed program alive, so a non-zero rollout result can be retried repeatedly. If automation is required, use an explicitly disposable operator definition whose restart policy is off and whose lifecycle is separately verified.
+
 ## Mandatory qualification gate
 
 Before the first production-label rollout on a target macOS major version, `qualify` must pass on that machine. Re-qualify after a macOS major-version change.
@@ -172,6 +174,8 @@ canonical SHA-256 == twice-verified staged candidate SHA-256
 Local DevSpace qualification and public connector/tunnel qualification are separate. Keep `REBOOT_RECOVERY=UNVERIFIED` until the separately authorized restart canary described below is actually observed.
 
 `/healthz` is a bounded liveness gate. The production Darwin adapter applies a 2-second request deadline by default; timeout, connection failure, malformed response, or a non-matching health payload is treated as unhealthy. This does not qualify the end-to-end ChatGPT/MCP path.
+
+Runtime startup readiness is also bounded. After each candidate bootstrap and after an old-runtime recovery bootstrap, the production Darwin adapter waits up to 15 seconds, polling every 100 ms for the expected same-label process identity, listener ownership, and healthy `/healthz`. Transient `launchd` PID availability, listener absence, or unhealthy startup responses are retried inside that window. A same-label process with a different entrypoint or an unrelated owner of port `7676` fails closed immediately rather than being treated as startup delay. The normal stability observation still runs after readiness succeeds.
 
 ## Result codes
 

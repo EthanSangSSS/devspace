@@ -63,6 +63,8 @@ const DEFAULT_STOP_TIMEOUT_MS = 5_000;
 const DEFAULT_STOP_POLL_MS = 50;
 const DEFAULT_STABILITY_OBSERVATION_MS = 250;
 const DEFAULT_HEALTH_TIMEOUT_MS = 2_000;
+const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
+const DEFAULT_STARTUP_POLL_MS = 100;
 
 export interface CommandResult {
   stdout: string;
@@ -85,6 +87,13 @@ export interface StopBarrierProbe {
   observeListener(): Promise<ObservedState<ListenerObservation>>;
 }
 
+export interface RuntimeReadinessProbe {
+  observeLaunchd(): Promise<ObservedState<LaunchdObservation>>;
+  observeProcess(pid: number): Promise<ObservedState<ProcessIdentity>>;
+  observeListener(): Promise<ObservedState<ListenerObservation>>;
+  checkHealth(): Promise<ObservedState<"healthy" | "unhealthy">>;
+}
+
 export interface DarwinRolloutAdapterOptions {
   canonicalPath?: string;
   label?: string;
@@ -101,6 +110,8 @@ export interface DarwinRolloutAdapterOptions {
   stopPollIntervalMs?: number;
   stabilityObservationMs?: number;
   healthTimeoutMs?: number;
+  startupTimeoutMs?: number;
+  startupPollIntervalMs?: number;
 }
 
 export interface DarwinQualificationSteps {
@@ -878,6 +889,65 @@ export async function waitForStableState(
   return { kind: "known", value: "stable" };
 }
 
+export async function waitForRuntimeReadyState(
+  expectedEntrypoint: string,
+  probe: RuntimeReadinessProbe,
+  options: {
+    timeoutMs: number;
+    pollIntervalMs: number;
+    now?: () => number;
+    sleep?: (ms: number) => Promise<void>;
+  },
+): Promise<ObservedState<ProcessIdentity>> {
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? delay;
+  const deadline = now() + options.timeoutMs;
+  let lastReason = "runtime has not reported readiness";
+
+  while (true) {
+    const launchd = await probe.observeLaunchd();
+    if (launchd.kind === "known" && launchd.value.loaded && launchd.value.pid) {
+      const processState = await probe.observeProcess(launchd.value.pid);
+      if (processState.kind === "known") {
+        if (processState.value.entrypointRealpath !== expectedEntrypoint) {
+          return { kind: "unproven", reason: "incompatible same-label runtime appeared during readiness wait" };
+        }
+
+        const listener = await probe.observeListener();
+        if (listener.kind === "known") {
+          if (listener.value.state === "owned" && listener.value.ownerPid !== processState.value.pid) {
+            return { kind: "unproven", reason: "unrelated listener owner appeared during readiness wait" };
+          }
+          if (listener.value.state === "owned" && listener.value.ownerPid === processState.value.pid) {
+            const health = await probe.checkHealth();
+            if (health.kind === "known" && health.value === "healthy") {
+              return { kind: "known", value: processState.value };
+            }
+            lastReason = health.kind === "unproven" ? health.reason : "health is not ready";
+          } else {
+            lastReason = "listener is not ready";
+          }
+        } else {
+          lastReason = listener.reason;
+        }
+      } else {
+        lastReason = processState.reason;
+      }
+    } else if (launchd.kind === "unproven") {
+      lastReason = launchd.reason;
+    } else if (!launchd.value.loaded) {
+      lastReason = "launchd job is not loaded";
+    } else {
+      lastReason = "launchd job has no observable PID";
+    }
+
+    if (now() >= deadline) {
+      return { kind: "unproven", reason: `runtime readiness timed out: ${lastReason}` };
+    }
+    await sleep(options.pollIntervalMs);
+  }
+}
+
 export function createDarwinRolloutAdapters(
   options: DarwinRolloutAdapterOptions = {},
 ): MacosRolloutAdapters {
@@ -901,6 +971,8 @@ export function createDarwinRolloutAdapters(
   const stopPollIntervalMs = options.stopPollIntervalMs ?? DEFAULT_STOP_POLL_MS;
   const stabilityObservationMs = options.stabilityObservationMs ?? DEFAULT_STABILITY_OBSERVATION_MS;
   const healthTimeoutMs = options.healthTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS;
+  const startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
+  const startupPollIntervalMs = options.startupPollIntervalMs ?? DEFAULT_STARTUP_POLL_MS;
 
   const observeLaunchd = async (): Promise<ObservedState<LaunchdObservation>> => {
     const result = await runner.run("/bin/launchctl", ["print", serviceTarget]);
@@ -1096,6 +1168,20 @@ export function createDarwinRolloutAdapters(
       } catch {
         return { kind: "known", value: "unhealthy" };
       }
+    },
+
+    waitReady(expectedEntrypoint) {
+      return waitForRuntimeReadyState(expectedEntrypoint, {
+        observeLaunchd,
+        observeProcess,
+        observeListener,
+        checkHealth: adapters.checkHealth,
+      }, {
+        timeoutMs: startupTimeoutMs,
+        pollIntervalMs: startupPollIntervalMs,
+        now,
+        sleep,
+      });
     },
 
     async bootoutExpected(expected) {
