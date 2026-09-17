@@ -73,7 +73,11 @@ export interface CommandResult {
 }
 
 export interface CommandRunner {
-  run(executable: string, args: readonly string[]): Promise<CommandResult>;
+  run(
+    executable: string,
+    args: readonly string[],
+    options?: { signal?: AbortSignal },
+  ): Promise<CommandResult>;
 }
 
 export interface DurabilityPrimitives {
@@ -88,10 +92,10 @@ export interface StopBarrierProbe {
 }
 
 export interface RuntimeReadinessProbe {
-  observeLaunchd(): Promise<ObservedState<LaunchdObservation>>;
-  observeProcess(pid: number): Promise<ObservedState<ProcessIdentity>>;
-  observeListener(): Promise<ObservedState<ListenerObservation>>;
-  checkHealth(): Promise<ObservedState<"healthy" | "unhealthy">>;
+  observeLaunchd(signal?: AbortSignal): Promise<ObservedState<LaunchdObservation>>;
+  observeProcess(pid: number, signal?: AbortSignal): Promise<ObservedState<ProcessIdentity>>;
+  observeListener(signal?: AbortSignal): Promise<ObservedState<ListenerObservation>>;
+  checkHealth(signal?: AbortSignal): Promise<ObservedState<"healthy" | "unhealthy">>;
 }
 
 export interface DarwinRolloutAdapterOptions {
@@ -903,49 +907,116 @@ export async function waitForRuntimeReadyState(
   const sleep = options.sleep ?? delay;
   const deadline = now() + options.timeoutMs;
   let lastReason = "runtime has not reported readiness";
+  const controller = new AbortController();
+  const timeoutMs = Math.max(0, deadline - now());
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
 
-  while (true) {
-    const launchd = await probe.observeLaunchd();
-    if (launchd.kind === "known" && launchd.value.loaded && launchd.value.pid) {
-      const processState = await probe.observeProcess(launchd.value.pid);
-      if (processState.kind === "known") {
-        if (processState.value.entrypointRealpath !== expectedEntrypoint) {
-          return { kind: "unproven", reason: "incompatible same-label runtime appeared during readiness wait" };
-        }
+  const timedOut = (): ObservedState<ProcessIdentity> => ({
+    kind: "unproven",
+    reason: `runtime readiness timed out: ${lastReason}`,
+  });
+  const deadlineExpired = () => controller.signal.aborted || now() >= deadline;
 
-        const listener = await probe.observeListener();
-        if (listener.kind === "known") {
-          if (listener.value.state === "owned" && listener.value.ownerPid !== processState.value.pid) {
-            return { kind: "unproven", reason: "unrelated listener owner appeared during readiness wait" };
+  try {
+    while (true) {
+      const launchdStep = await awaitReadinessStep(
+        (signal) => probe.observeLaunchd(signal),
+        controller.signal,
+      );
+      if (launchdStep.timedOut || deadlineExpired()) return timedOut();
+      const launchd = launchdStep.value;
+      if (launchd.kind === "known" && launchd.value.loaded && launchd.value.pid) {
+        const processStep = await awaitReadinessStep(
+          (signal) => probe.observeProcess(launchd.value.pid!, signal),
+          controller.signal,
+        );
+        if (processStep.timedOut || deadlineExpired()) return timedOut();
+        const processState = processStep.value;
+        if (processState.kind === "known") {
+          if (processState.value.entrypointRealpath !== expectedEntrypoint) {
+            return { kind: "unproven", reason: "incompatible same-label runtime appeared during readiness wait" };
           }
-          if (listener.value.state === "owned" && listener.value.ownerPid === processState.value.pid) {
-            const health = await probe.checkHealth();
-            if (health.kind === "known" && health.value === "healthy") {
-              return { kind: "known", value: processState.value };
+
+          const listenerStep = await awaitReadinessStep(
+            (signal) => probe.observeListener(signal),
+            controller.signal,
+          );
+          if (listenerStep.timedOut || deadlineExpired()) return timedOut();
+          const listener = listenerStep.value;
+          if (listener.kind === "known") {
+            if (listener.value.state === "owned" && listener.value.ownerPid !== processState.value.pid) {
+              return { kind: "unproven", reason: "unrelated listener owner appeared during readiness wait" };
             }
-            lastReason = health.kind === "unproven" ? health.reason : "health is not ready";
+            if (listener.value.state === "owned" && listener.value.ownerPid === processState.value.pid) {
+              const healthStep = await awaitReadinessStep(
+                (signal) => probe.checkHealth(signal),
+                controller.signal,
+              );
+              if (healthStep.timedOut || deadlineExpired()) return timedOut();
+              const health = healthStep.value;
+              if (health.kind === "known" && health.value === "healthy") {
+                return { kind: "known", value: processState.value };
+              }
+              lastReason = health.kind === "unproven" ? health.reason : "health is not ready";
+            } else {
+              lastReason = "listener is not ready";
+            }
           } else {
-            lastReason = "listener is not ready";
+            lastReason = listener.reason;
           }
         } else {
-          lastReason = listener.reason;
+          lastReason = processState.reason;
         }
+      } else if (launchd.kind === "unproven") {
+        lastReason = launchd.reason;
+      } else if (!launchd.value.loaded) {
+        lastReason = "launchd job is not loaded";
       } else {
-        lastReason = processState.reason;
+        lastReason = "launchd job has no observable PID";
       }
-    } else if (launchd.kind === "unproven") {
-      lastReason = launchd.reason;
-    } else if (!launchd.value.loaded) {
-      lastReason = "launchd job is not loaded";
-    } else {
-      lastReason = "launchd job has no observable PID";
-    }
 
-    if (now() >= deadline) {
-      return { kind: "unproven", reason: `runtime readiness timed out: ${lastReason}` };
+      if (deadlineExpired()) return timedOut();
+      const remainingMs = Math.max(0, deadline - now());
+      const sleepStep = await awaitReadinessStep(
+        () => sleep(Math.min(options.pollIntervalMs, remainingMs)),
+        controller.signal,
+      );
+      if (sleepStep.timedOut || deadlineExpired()) return timedOut();
     }
-    await sleep(options.pollIntervalMs);
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+async function awaitReadinessStep<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  signal: AbortSignal,
+): Promise<{ timedOut: false; value: T } | { timedOut: true }> {
+  if (signal.aborted) return { timedOut: true };
+  return await new Promise((resolve, reject) => {
+    const onAbort = () => resolve({ timedOut: true });
+    signal.addEventListener("abort", onAbort, { once: true });
+    let pending: Promise<T>;
+    try {
+      pending = operation(signal);
+    } catch (error) {
+      signal.removeEventListener("abort", onAbort);
+      reject(error);
+      return;
+    }
+    pending.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(signal.aborted ? { timedOut: true } : { timedOut: false, value });
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        if (signal.aborted) resolve({ timedOut: true });
+        else reject(error);
+      },
+    );
+  });
 }
 
 export function createDarwinRolloutAdapters(
@@ -974,8 +1045,8 @@ export function createDarwinRolloutAdapters(
   const startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
   const startupPollIntervalMs = options.startupPollIntervalMs ?? DEFAULT_STARTUP_POLL_MS;
 
-  const observeLaunchd = async (): Promise<ObservedState<LaunchdObservation>> => {
-    const result = await runner.run("/bin/launchctl", ["print", serviceTarget]);
+  const observeLaunchd = async (signal?: AbortSignal): Promise<ObservedState<LaunchdObservation>> => {
+    const result = await runner.run("/bin/launchctl", ["print", serviceTarget], { signal });
     if (result.exitCode !== 0) {
       const combined = `${result.stdout}\n${result.stderr}`;
       if (/could not find service|service not found/i.test(combined)) {
@@ -986,27 +1057,27 @@ export function createDarwinRolloutAdapters(
     return parseLaunchctlPrint(result.stdout);
   };
 
-  const observeListener = async (): Promise<ObservedState<ListenerObservation>> => {
+  const observeListener = async (signal?: AbortSignal): Promise<ObservedState<ListenerObservation>> => {
     const result = await runner.run("/usr/sbin/lsof", [
       "-nP",
       "-a",
       `-iTCP@${host}:${port}`,
       "-sTCP:LISTEN",
       "-Fp",
-    ]);
+    ], { signal });
     return parseListenerLsof(result.stdout, result.exitCode);
   };
 
-  const observeProcess = async (pid: number): Promise<ObservedState<ProcessIdentity>> => {
-    const launchd = await observeLaunchd();
+  const observeProcess = async (pid: number, signal?: AbortSignal): Promise<ObservedState<ProcessIdentity>> => {
+    const launchd = await observeLaunchd(signal);
     if (launchd.kind === "unproven") return launchd;
     if (!launchd.value.loaded || launchd.value.pid !== pid) {
       return { kind: "unproven", reason: "launchd does not currently own the requested PID" };
     }
     const [start, command, executable] = await Promise.all([
-      runner.run("/bin/ps", ["-p", String(pid), "-o", "lstart="]),
-      runner.run("/bin/ps", ["-p", String(pid), "-o", "comm="]),
-      runner.run("/usr/sbin/lsof", ["-a", "-p", String(pid), "-d", "txt", "-Fn"]),
+      runner.run("/bin/ps", ["-p", String(pid), "-o", "lstart="], { signal }),
+      runner.run("/bin/ps", ["-p", String(pid), "-o", "comm="], { signal }),
+      runner.run("/usr/sbin/lsof", ["-a", "-p", String(pid), "-d", "txt", "-Fn"], { signal }),
     ]);
     if (start.exitCode !== 0) return { kind: "unproven", reason: `ps exited with code ${start.exitCode}` };
     if (command.exitCode !== 0) return { kind: "unproven", reason: `ps comm exited with code ${command.exitCode}` };
@@ -1020,6 +1091,25 @@ export function createDarwinRolloutAdapters(
       psCommandOutput: command.stdout,
       lsofTextOutput: executable.stdout,
     });
+  };
+
+  const checkHealth = async (signal?: AbortSignal): Promise<ObservedState<"healthy" | "unhealthy">> => {
+    try {
+      const requestSignal = signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(healthTimeoutMs)])
+        : AbortSignal.timeout(healthTimeoutMs);
+      const response = await fetch(`http://${host}:${port}${healthPath}`, {
+        signal: requestSignal,
+      });
+      if (!response.ok) return { kind: "known", value: "unhealthy" };
+      const body = await response.json() as { ok?: unknown; name?: unknown };
+      return body.ok === true && body.name === "devspace"
+        ? { kind: "known", value: "healthy" }
+        : { kind: "known", value: "unhealthy" };
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return { kind: "known", value: "unhealthy" };
+    }
   };
 
   const adapters: MacosRolloutAdapters = {
@@ -1156,18 +1246,7 @@ export function createDarwinRolloutAdapters(
     observeListener,
 
     async checkHealth() {
-      try {
-        const response = await fetch(`http://${host}:${port}${healthPath}`, {
-          signal: AbortSignal.timeout(healthTimeoutMs),
-        });
-        if (!response.ok) return { kind: "known", value: "unhealthy" };
-        const body = await response.json() as { ok?: unknown; name?: unknown };
-        return body.ok === true && body.name === "devspace"
-          ? { kind: "known", value: "healthy" }
-          : { kind: "known", value: "unhealthy" };
-      } catch {
-        return { kind: "known", value: "unhealthy" };
-      }
+      return checkHealth();
     },
 
     waitReady(expectedEntrypoint) {
@@ -1175,7 +1254,7 @@ export function createDarwinRolloutAdapters(
         observeLaunchd,
         observeProcess,
         observeListener,
-        checkHealth: adapters.checkHealth,
+        checkHealth,
       }, {
         timeoutMs: startupTimeoutMs,
         pollIntervalMs: startupPollIntervalMs,
@@ -1294,11 +1373,12 @@ const defaultDurabilityPrimitives: DurabilityPrimitives = {
 
 function createExecFileRunner(): CommandRunner {
   return {
-    async run(executable, args) {
+    async run(executable, args, options) {
       try {
         const result = await execFileAsync(executable, [...args], {
           encoding: "utf8",
           maxBuffer: 8 * 1024 * 1024,
+          signal: options?.signal,
         });
         return { stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
       } catch (error) {

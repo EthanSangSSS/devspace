@@ -13,7 +13,12 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import type { FileIdentity, ProcessIdentity } from "./macos-launchd-rollout.js";
+import type {
+  FileIdentity,
+  LaunchdObservation,
+  ObservedState,
+  ProcessIdentity,
+} from "./macos-launchd-rollout.js";
 import {
   assertDarwinPlatform,
   buildProcessIdentityFromObservations,
@@ -431,6 +436,63 @@ test("runtime readiness gate tolerates delayed listener and health, then times o
   assert.equal(timedOut.kind, "unproven");
   assert.match(timedOut.kind === "unproven" ? timedOut.reason : "", /readiness.*timed out/i);
   assert.equal(timeoutNow, 100, "readiness timeout must be bounded by the configured deadline");
+});
+
+test("runtime readiness rejects a healthy observation that completes after the deadline", async () => {
+  const expected = processIdentity();
+  const known = <T>(value: T) => ({ kind: "known" as const, value });
+  let nowMs = 0;
+
+  const result = await waitForRuntimeReadyState(expected.entrypointRealpath, {
+    observeLaunchd: async () => known({
+      loaded: true,
+      pid: expected.pid,
+      runCount: 2,
+      normalizedArgv: expected.normalizedArgv,
+    }),
+    observeProcess: async () => known(expected),
+    observeListener: async () => known({ state: "owned" as const, ownerPid: expected.pid }),
+    checkHealth: async () => {
+      nowMs = 16_000;
+      return known("healthy" as const);
+    },
+  }, {
+    timeoutMs: 15_000,
+    pollIntervalMs: 100,
+    now: () => nowMs,
+    sleep: async (ms) => { nowMs += ms; },
+  });
+
+  assert.equal(result.kind, "unproven");
+  assert.match(result.kind === "unproven" ? result.reason : "", /readiness.*timed out/i);
+});
+
+test("runtime readiness aborts a pending probe at the shared deadline", async () => {
+  let probeAborted = false;
+  const pendingProbe = (signal?: AbortSignal): Promise<ObservedState<LaunchdObservation>> => {
+    signal?.addEventListener("abort", () => { probeAborted = true; }, { once: true });
+    return new Promise(() => undefined);
+  };
+
+  const guarded = await Promise.race([
+    waitForRuntimeReadyState("/expected/node_modules/@waishnav/devspace/dist/cli.js", {
+      observeLaunchd: pendingProbe,
+      observeProcess: async () => { throw new Error("process probe must not run"); },
+      observeListener: async () => { throw new Error("listener probe must not run"); },
+      checkHealth: async () => { throw new Error("health probe must not run"); },
+    }, {
+      timeoutMs: 20,
+      pollIntervalMs: 5,
+    }),
+    new Promise<"guard">((resolve) => setTimeout(() => resolve("guard"), 200)),
+  ]);
+
+  assert.notEqual(guarded, "guard", "a pending readiness probe must not outlive the shared deadline");
+  assert.equal(probeAborted, true, "the readiness deadline must abort the in-flight probe");
+  if (guarded !== "guard") {
+    assert.equal(guarded.kind, "unproven");
+    assert.match(guarded.kind === "unproven" ? guarded.reason : "", /readiness.*timed out/i);
+  }
 });
 
 test("file digest observation hashes exact bytes and fails closed on read errors", async (t) => {
