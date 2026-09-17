@@ -1,0 +1,1476 @@
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import type { RolloutLockLease } from "./macos-launchd-rollout-lock.js";
+import {
+  resolveCandidateSlotRoot,
+  verifyCandidateSlotManifest,
+} from "./macos-launchd-rollout-manifest.js";
+
+export type RolloutResultCode =
+  | "ROLLOUT_OK"
+  | "PRECONDITION_FAILED"
+  | "PERSISTENCE_CONTRACT_INVALID"
+  | "CANDIDATE_ARTIFACT_MISMATCH"
+  | "LIVE_STATE_CAS_MISMATCH"
+  | "SPLIT_STATE_DETECTED"
+  | "LOCK_BUSY"
+  | "LOCK_AMBIGUOUS"
+  | "SELF_HOSTED_ROLLOUT_REFUSED"
+  | "SWITCH_FAILED_ROLLBACK_OK"
+  | "SWITCH_FAILED_ROLLBACK_FAILED"
+  | "ROLLBACK_REFUSED_CONCURRENT_DRIFT"
+  | "ROLLBACK_REFUSED_UNPROVEN_STATE";
+
+export interface RolloutRequest {
+  expectedLiveEntrypoint: string;
+  expectedLivePlistSha256: string;
+  candidateEntrypoint: string;
+  candidateSlotManifestSha256: string;
+}
+
+export interface LaunchdObservation {
+  loaded: boolean;
+  pid?: number;
+  runCount?: number;
+  normalizedArgv?: string[];
+}
+
+export interface ListenerObservation {
+  state: "unowned" | "owned";
+  ownerPid?: number;
+}
+
+export interface CanonicalPlistSnapshot {
+  bytes: Buffer;
+  sha256: string;
+  identity: FileIdentity;
+  parentIdentity: FileIdentity;
+  entrypointRealpath: string;
+  runAtLoad: boolean;
+  keepAlive: boolean;
+}
+
+export interface PreparedCanonicalTemp {
+  path: string;
+  sha256: string;
+  identity: FileIdentity;
+}
+
+export interface MacosRolloutAdapters {
+  acquireLock(input: {
+    transactionId: string;
+    transactionNonce: string;
+  }): Promise<RolloutLockLease>;
+  readCanonical(): Promise<ObservedState<CanonicalPlistSnapshot>>;
+  validateCandidateEntrypoint(path: string): Promise<void>;
+  createCandidatePlist(oldBytes: Buffer, candidateEntrypoint: string): Promise<Buffer>;
+  writeOldBackup(input: {
+    transactionDir: string;
+    bytes: Buffer;
+    sha256: string;
+    uid: number;
+    gid: number;
+    mode: number;
+  }): Promise<void>;
+  writeCandidateEvidence(input: {
+    transactionDir: string;
+    plistBytes: Buffer;
+    plistSha256: string;
+    manifestSha256: string;
+  }): Promise<void>;
+  prepareCanonicalTemp(input: {
+    transactionNonce: string;
+    bytes: Buffer;
+    expectedSha256: string;
+    uid: number;
+    gid: number;
+    mode: number;
+  }): Promise<PreparedCanonicalTemp>;
+  atomicReplaceCanonical(tempPath: string): Promise<void>;
+  syncCanonicalParent(): Promise<void>;
+  observeLaunchd(): Promise<ObservedState<LaunchdObservation>>;
+  observeProcess(pid: number): Promise<ObservedState<ProcessIdentity>>;
+  observeListener(): Promise<ObservedState<ListenerObservation>>;
+  checkHealth(): Promise<ObservedState<"healthy" | "unhealthy">>;
+  bootoutExpected(expected: ProcessIdentity): Promise<void>;
+  bootstrap(plistPath: string): Promise<void>;
+  observeDisabledOverride(): Promise<ObservedState<"enabled" | "disabled">>;
+  observeAncestors(pid: number): Promise<ObservedState<number[]>>;
+  waitStopped(expected: ProcessIdentity): Promise<ObservedState<"stopped">>;
+  waitStable(expected: ProcessIdentity): Promise<ObservedState<"stable">>;
+  readFileSha256(path: string): Promise<ObservedState<string>>;
+  observeFileIdentity(path: string): Promise<ObservedState<FileIdentity>>;
+  preflightDurability(): Promise<void>;
+}
+
+export interface ProcessIdentity {
+  pid: number;
+  processStartIdentity: string;
+  executableRealpath: string;
+  normalizedArgv: string[];
+  entrypointRealpath: string;
+}
+
+export interface FileIdentity {
+  path: string;
+  uid: number;
+  gid: number;
+  mode: number;
+  device: number;
+  inode: number;
+  kind: "file" | "directory";
+  symlink: boolean;
+}
+
+export type ObservedState<T> =
+  | { kind: "known"; value: T }
+  | { kind: "unproven"; reason: string };
+
+export type RollbackRefusal =
+  | "ROLLBACK_REFUSED_CONCURRENT_DRIFT"
+  | "ROLLBACK_REFUSED_UNPROVEN_STATE";
+
+export interface RollbackClassificationInput {
+  canonical: ObservedState<"expected" | "drift">;
+  runtime: ObservedState<"expected" | "absent" | "drift">;
+  listener: ObservedState<"expected" | "unowned" | "drift">;
+  lock: ObservedState<"owned" | "drift">;
+  ownerRecord: ObservedState<"ours" | "drift">;
+}
+
+export interface InitialRolloutState {
+  canonical: CanonicalPlistSnapshot;
+  launchd: LaunchdObservation;
+  process: ProcessIdentity;
+}
+
+export interface ForwardTransactionContext {
+  transactionId: string;
+  transactionNonce: string;
+  transactionDir: string;
+  candidatePlistPath: string;
+  lease: RolloutLockLease;
+  liveMutationStarted: boolean;
+  controlledReloadVerified: boolean;
+  initial?: InitialRolloutState;
+  candidatePlistBytes?: Buffer;
+  candidatePlistSha256?: string;
+  preparedCanonicalTemp?: PreparedCanonicalTemp;
+}
+
+export type ForwardRolloutFailurePhase =
+  | "precheck"
+  | "old_stop"
+  | "candidate_first_start"
+  | "candidate_first_verify"
+  | "candidate_controlled_stop"
+  | "candidate_reload"
+  | "pre_commit_revalidation"
+  | "post_commit_verification";
+
+export interface ForwardRolloutFailure {
+  ok: false;
+  phase: ForwardRolloutFailurePhase;
+  code:
+    | "PRECONDITION_FAILED"
+    | "PERSISTENCE_CONTRACT_INVALID"
+    | "CANDIDATE_ARTIFACT_MISMATCH"
+    | "LIVE_STATE_CAS_MISMATCH"
+    | "SPLIT_STATE_DETECTED"
+    | "SELF_HOSTED_ROLLOUT_REFUSED";
+  committed: boolean;
+  context: ForwardTransactionContext;
+  initial?: InitialRolloutState;
+  candidateProcess?: ProcessIdentity;
+  candidateCanonicalSha256?: string;
+  reason: string;
+}
+
+export interface ForwardRolloutSuccess {
+  ok: true;
+  committed: true;
+  context: ForwardTransactionContext;
+  candidateProcess: ProcessIdentity;
+  candidateCanonicalSha256: string;
+}
+
+export type ForwardRolloutResult = ForwardRolloutSuccess | ForwardRolloutFailure;
+
+export interface RolloutOutcome {
+  code: RolloutResultCode;
+  transactionId: string;
+  transactionNonce: string;
+  committed: boolean;
+  controlledReload: "PASS" | "FAIL" | "NOT_RUN";
+  persistenceStaticContract: "PASS" | "FAIL";
+  rebootRecovery: "UNVERIFIED";
+  evidence: Record<string, string | number | boolean | undefined>;
+}
+
+export function classifyRollbackRefusal(
+  input: RollbackClassificationInput,
+): RollbackRefusal | undefined {
+  if (
+    (input.canonical.kind === "known" && input.canonical.value === "drift")
+    || (input.runtime.kind === "known" && input.runtime.value === "drift")
+    || (input.listener.kind === "known" && input.listener.value === "drift")
+    || (input.lock.kind === "known" && input.lock.value === "drift")
+    || (input.ownerRecord.kind === "known" && input.ownerRecord.value === "drift")
+  ) {
+    return "ROLLBACK_REFUSED_CONCURRENT_DRIFT";
+  }
+  if (
+    input.canonical.kind === "unproven"
+    || input.runtime.kind === "unproven"
+    || input.listener.kind === "unproven"
+    || input.lock.kind === "unproven"
+    || input.ownerRecord.kind === "unproven"
+  ) {
+    return "ROLLBACK_REFUSED_UNPROVEN_STATE";
+  }
+  return undefined;
+}
+
+interface RolloutTransactionIdentity {
+  transactionId: string;
+  transactionNonce: string;
+}
+
+interface RecoveryObservation {
+  refusal?: RollbackRefusal;
+  runtimeRole: "old" | "candidate" | "absent" | "drift" | "unproven";
+  process?: ProcessIdentity;
+  listener: ObservedState<"expected" | "unowned" | "drift">;
+}
+
+export async function runMacosLaunchdRollout(
+  request: RolloutRequest,
+  adapters: MacosRolloutAdapters,
+): Promise<RolloutOutcome> {
+  const transaction: RolloutTransactionIdentity = {
+    transactionId: randomUUID(),
+    transactionNonce: randomBytes(16).toString("hex"),
+  };
+  let forward: ForwardRolloutResult;
+  try {
+    forward = await runMacosLaunchdForwardPath(request, adapters, transaction);
+  } catch (error) {
+    return {
+      code: rolloutErrorCode(error),
+      transactionId: transaction.transactionId,
+      transactionNonce: transaction.transactionNonce,
+      committed: false,
+      controlledReload: "NOT_RUN",
+      persistenceStaticContract: "FAIL",
+      rebootRecovery: "UNVERIFIED",
+      evidence: { reason: errorMessage(error) },
+    };
+  }
+
+  const context = forward.context;
+  try {
+    if (forward.ok) {
+      return rolloutOutcome("ROLLOUT_OK", context, true, "PASS", "PASS");
+    }
+    if (!context.liveMutationStarted) {
+      return rolloutOutcome(
+        forward.code,
+        context,
+        forward.committed,
+        context.controlledReloadVerified ? "PASS" : "NOT_RUN",
+        forward.code === "PERSISTENCE_CONTRACT_INVALID" ? "FAIL" : "PASS",
+        forward.reason,
+      );
+    }
+    return forward.committed
+      ? await compensateCommittedCandidate(request, forward, adapters)
+      : await recoverPreCommitFailure(request, forward, adapters);
+  } finally {
+    await context.lease.release();
+  }
+}
+
+export async function runMacosLaunchdForwardPath(
+  request: RolloutRequest,
+  adapters: MacosRolloutAdapters,
+  transaction: RolloutTransactionIdentity = {
+    transactionId: randomUUID(),
+    transactionNonce: randomBytes(16).toString("hex"),
+  },
+): Promise<ForwardRolloutResult> {
+  const { transactionId, transactionNonce } = transaction;
+  const transactionDir = resolveTransactionDir(transactionId);
+  const candidatePlistPath = join(transactionDir, "candidate.plist");
+  const lease = await adapters.acquireLock({ transactionId, transactionNonce });
+  const context: ForwardTransactionContext = {
+    transactionId,
+    transactionNonce,
+    transactionDir,
+    candidatePlistPath,
+    lease,
+    liveMutationStarted: false,
+    controlledReloadVerified: false,
+  };
+
+  const initialResult = await readAndValidateInitialState({ request, adapters });
+  if (!initialResult.ok) {
+    return forwardFailure(context, "precheck", initialResult.code, initialResult.reason);
+  }
+  const initial = initialResult.value;
+  context.initial = initial;
+
+  const ancestry = await adapters.observeAncestors(process.pid);
+  if (ancestry.kind === "unproven") {
+    return forwardFailure(context, "precheck", "PRECONDITION_FAILED", ancestry.reason, { initial });
+  }
+  if (ancestry.value.includes(initial.process.pid)) {
+    return forwardFailure(
+      context,
+      "precheck",
+      "SELF_HOSTED_ROLLOUT_REFUSED",
+      "live DevSpace is an ancestor of the rollout helper",
+      { initial },
+    );
+  }
+
+  try {
+    await adapters.preflightDurability();
+  } catch (error) {
+    return forwardFailure(context, "precheck", "PRECONDITION_FAILED", errorMessage(error), { initial });
+  }
+
+  try {
+    await adapters.validateCandidateEntrypoint(request.candidateEntrypoint);
+    const candidateSlotRoot = resolveCandidateSlotRoot(request.candidateEntrypoint);
+    await verifyCandidateSlotManifest(candidateSlotRoot, request.candidateSlotManifestSha256);
+  } catch (error) {
+    return forwardFailure(context, "precheck", "CANDIDATE_ARTIFACT_MISMATCH", errorMessage(error), { initial });
+  }
+
+  try {
+    await adapters.writeOldBackup({
+      transactionDir,
+      bytes: initial.canonical.bytes,
+      sha256: initial.canonical.sha256,
+      uid: initial.canonical.identity.uid,
+      gid: initial.canonical.identity.gid,
+      mode: initial.canonical.identity.mode,
+    });
+  } catch (error) {
+    return forwardFailure(context, "precheck", "PRECONDITION_FAILED", errorMessage(error), { initial });
+  }
+
+  let candidatePlistBytes: Buffer;
+  let candidatePlistSha256: string;
+  try {
+    candidatePlistBytes = await adapters.createCandidatePlist(
+      initial.canonical.bytes,
+      request.candidateEntrypoint,
+    );
+    candidatePlistSha256 = createHash("sha256").update(candidatePlistBytes).digest("hex");
+    context.candidatePlistBytes = candidatePlistBytes;
+    context.candidatePlistSha256 = candidatePlistSha256;
+    await adapters.writeCandidateEvidence({
+      transactionDir,
+      plistBytes: candidatePlistBytes,
+      plistSha256: candidatePlistSha256,
+      manifestSha256: request.candidateSlotManifestSha256,
+    });
+    const stagedHash = await adapters.readFileSha256(candidatePlistPath);
+    if (stagedHash.kind === "unproven" || stagedHash.value !== candidatePlistSha256) {
+      return forwardFailure(
+        context,
+        "precheck",
+        "CANDIDATE_ARTIFACT_MISMATCH",
+        stagedHash.kind === "unproven" ? stagedHash.reason : "staged candidate plist hash mismatch",
+        { initial },
+      );
+    }
+  } catch (error) {
+    return forwardFailure(context, "precheck", "CANDIDATE_ARTIFACT_MISMATCH", errorMessage(error), { initial });
+  }
+
+  const beforeStop = await revalidateBeforeOldStop({ initial, request, adapters });
+  if (!beforeStop.ok) {
+    return forwardFailure(context, "old_stop", beforeStop.code, beforeStop.reason, { initial });
+  }
+  context.liveMutationStarted = true;
+  try {
+    await adapters.bootoutExpected(initial.process);
+  } catch (error) {
+    return forwardFailure(context, "old_stop", "LIVE_STATE_CAS_MISMATCH", errorMessage(error), { initial });
+  }
+  let oldStopped: ObservedState<"stopped">;
+  try {
+    oldStopped = await adapters.waitStopped(initial.process);
+  } catch (error) {
+    return forwardFailure(context, "old_stop", "PRECONDITION_FAILED", errorMessage(error), { initial });
+  }
+  if (oldStopped.kind === "unproven") {
+    return forwardFailure(context, "old_stop", "LIVE_STATE_CAS_MISMATCH", oldStopped.reason, { initial });
+  }
+
+  try {
+    await adapters.bootstrap(candidatePlistPath);
+  } catch (error) {
+    return forwardFailure(context, "candidate_first_start", "PRECONDITION_FAILED", errorMessage(error), { initial });
+  }
+  const firstCandidate = await verifyCandidateRuntime({
+    candidateEntrypoint: request.candidateEntrypoint,
+    candidatePlistPath,
+    candidatePlistSha256,
+    adapters,
+  });
+  if (!firstCandidate.ok) {
+    return forwardFailure(context, "candidate_first_verify", "PRECONDITION_FAILED", firstCandidate.reason, { initial });
+  }
+
+  try {
+    await adapters.bootoutExpected(firstCandidate.process);
+  } catch (error) {
+    return forwardFailure(
+      context,
+      "candidate_controlled_stop",
+      "PRECONDITION_FAILED",
+      errorMessage(error),
+      { initial, candidateProcess: firstCandidate.process },
+    );
+  }
+  let candidateStopped: ObservedState<"stopped">;
+  try {
+    candidateStopped = await adapters.waitStopped(firstCandidate.process);
+  } catch (error) {
+    return forwardFailure(
+      context,
+      "candidate_controlled_stop",
+      "PRECONDITION_FAILED",
+      errorMessage(error),
+      { initial, candidateProcess: firstCandidate.process },
+    );
+  }
+  if (candidateStopped.kind === "unproven") {
+    return forwardFailure(
+      context,
+      "candidate_controlled_stop",
+      "PRECONDITION_FAILED",
+      candidateStopped.reason,
+      { initial, candidateProcess: firstCandidate.process },
+    );
+  }
+
+  const stagedBeforeReload = await adapters.readFileSha256(candidatePlistPath);
+  if (stagedBeforeReload.kind === "unproven" || stagedBeforeReload.value !== candidatePlistSha256) {
+    return forwardFailure(
+      context,
+      "candidate_reload",
+      "CANDIDATE_ARTIFACT_MISMATCH",
+      stagedBeforeReload.kind === "unproven" ? stagedBeforeReload.reason : "candidate plist changed before controlled reload",
+      { initial, candidateProcess: firstCandidate.process },
+    );
+  }
+  try {
+    await adapters.bootstrap(candidatePlistPath);
+  } catch (error) {
+    return forwardFailure(
+      context,
+      "candidate_reload",
+      "PRECONDITION_FAILED",
+      errorMessage(error),
+      { initial, candidateProcess: firstCandidate.process },
+    );
+  }
+  const reloadedCandidate = await verifyCandidateRuntime({
+    candidateEntrypoint: request.candidateEntrypoint,
+    candidatePlistPath,
+    candidatePlistSha256,
+    adapters,
+  });
+  if (!reloadedCandidate.ok) {
+    return forwardFailure(
+      context,
+      "candidate_reload",
+      "PRECONDITION_FAILED",
+      reloadedCandidate.reason,
+      { initial, candidateProcess: firstCandidate.process },
+    );
+  }
+  context.controlledReloadVerified = true;
+
+  const preCommit = await preCommitRevalidate({
+    request,
+    initial,
+    candidatePlistPath,
+    candidatePlistSha256,
+    lease,
+    adapters,
+  });
+  if (!preCommit.ok) {
+    return forwardFailure(
+      context,
+      "pre_commit_revalidation",
+      preCommit.code,
+      preCommit.reason,
+      { initial, candidateProcess: reloadedCandidate.process },
+    );
+  }
+  let candidateForCommit = preCommit.process;
+
+  let prepared: PreparedCanonicalTemp;
+  try {
+    prepared = await adapters.prepareCanonicalTemp({
+      transactionNonce,
+      bytes: candidatePlistBytes,
+      expectedSha256: candidatePlistSha256,
+      uid: initial.canonical.identity.uid,
+      gid: initial.canonical.identity.gid,
+      mode: initial.canonical.identity.mode,
+    });
+    context.preparedCanonicalTemp = prepared;
+  } catch (error) {
+    return forwardFailure(
+      context,
+      "pre_commit_revalidation",
+      "PRECONDITION_FAILED",
+      errorMessage(error),
+      { initial, candidateProcess: reloadedCandidate.process },
+    );
+  }
+  if (prepared.sha256 !== candidatePlistSha256) {
+    return forwardFailure(
+      context,
+      "pre_commit_revalidation",
+      "CANDIDATE_ARTIFACT_MISMATCH",
+      "prepared canonical temp does not match candidate plist hash",
+      { initial, candidateProcess: reloadedCandidate.process },
+    );
+  }
+
+  const immediatelyBeforeCommit = await preCommitRevalidate({
+    request,
+    initial,
+    candidatePlistPath,
+    candidatePlistSha256,
+    lease,
+    adapters,
+  });
+  if (!immediatelyBeforeCommit.ok) {
+    return forwardFailure(
+      context,
+      "pre_commit_revalidation",
+      immediatelyBeforeCommit.code,
+      immediatelyBeforeCommit.reason,
+      { initial, candidateProcess: reloadedCandidate.process },
+    );
+  }
+  candidateForCommit = immediatelyBeforeCommit.process;
+  try {
+    await adapters.atomicReplaceCanonical(prepared.path);
+  } catch (error) {
+    return forwardFailure(
+      context,
+      "pre_commit_revalidation",
+      "PRECONDITION_FAILED",
+      errorMessage(error),
+      { initial, candidateProcess: reloadedCandidate.process },
+    );
+  }
+
+  try {
+    await adapters.syncCanonicalParent();
+  } catch (error) {
+    return forwardFailure(
+      context,
+      "post_commit_verification",
+      "PRECONDITION_FAILED",
+      errorMessage(error),
+      {
+        initial,
+        candidateProcess: candidateForCommit,
+        candidateCanonicalSha256: candidatePlistSha256,
+        committed: true,
+      },
+    );
+  }
+  const postCommit = await postCommitVerify({
+    candidateEntrypoint: request.candidateEntrypoint,
+    candidateCanonicalSha256: candidatePlistSha256,
+    initial,
+    adapters,
+  });
+  if (!postCommit.ok) {
+    return forwardFailure(
+      context,
+      "post_commit_verification",
+      "PRECONDITION_FAILED",
+      postCommit.reason,
+      {
+        initial,
+        candidateProcess: candidateForCommit,
+        candidateCanonicalSha256: candidatePlistSha256,
+        committed: true,
+      },
+    );
+  }
+
+  return {
+    ok: true,
+    committed: true,
+    context,
+    candidateProcess: postCommit.process,
+    candidateCanonicalSha256: candidatePlistSha256,
+  };
+}
+
+async function recoverPreCommitFailure(
+  request: RolloutRequest,
+  failure: ForwardRolloutFailure,
+  adapters: MacosRolloutAdapters,
+): Promise<RolloutOutcome> {
+  const context = failure.context;
+  const initial = context.initial ?? failure.initial;
+  if (!initial) {
+    return rolloutOutcome(
+      "SWITCH_FAILED_ROLLBACK_FAILED",
+      context,
+      false,
+      controlledReloadStatus(context),
+      "FAIL",
+      "pre-commit recovery has no verified initial state",
+    );
+  }
+
+  let observed = await observeRecoveryState({
+    expectedCanonical: "old",
+    request,
+    context,
+    initial,
+    adapters,
+  });
+  if (observed.refusal) {
+    return rolloutOutcome(observed.refusal, context, false, controlledReloadStatus(context), "FAIL");
+  }
+
+  if (observed.runtimeRole === "old") {
+    const healthy = await verifyOldRuntime(request, initial, adapters, true);
+    return rolloutOutcome(
+      healthy ? "SWITCH_FAILED_ROLLBACK_OK" : "SWITCH_FAILED_ROLLBACK_FAILED",
+      context,
+      false,
+      controlledReloadStatus(context),
+      healthy ? "PASS" : "FAIL",
+    );
+  }
+
+  if (observed.runtimeRole === "candidate") {
+    const stopped = await stopRecoveryCandidate({
+      expectedCanonical: "old",
+      request,
+      context,
+      initial,
+      adapters,
+    });
+    if (stopped) return stopped;
+  } else if (observed.runtimeRole !== "absent") {
+    return rolloutOutcome(
+      observed.runtimeRole === "drift"
+        ? "ROLLBACK_REFUSED_CONCURRENT_DRIFT"
+        : "ROLLBACK_REFUSED_UNPROVEN_STATE",
+      context,
+      false,
+      controlledReloadStatus(context),
+      "FAIL",
+    );
+  }
+
+  observed = await observeRecoveryState({
+    expectedCanonical: "old",
+    request,
+    context,
+    initial,
+    adapters,
+  });
+  if (observed.refusal) {
+    return rolloutOutcome(observed.refusal, context, false, controlledReloadStatus(context), "FAIL");
+  }
+  if (observed.runtimeRole === "old") {
+    const healthy = await verifyOldRuntime(request, initial, adapters, true);
+    return rolloutOutcome(
+      healthy ? "SWITCH_FAILED_ROLLBACK_OK" : "SWITCH_FAILED_ROLLBACK_FAILED",
+      context,
+      false,
+      controlledReloadStatus(context),
+      healthy ? "PASS" : "FAIL",
+    );
+  }
+  if (observed.runtimeRole !== "absent" || !isKnownUnowned(observed.listener)) {
+    return rolloutOutcome(
+      "ROLLBACK_REFUSED_CONCURRENT_DRIFT",
+      context,
+      false,
+      controlledReloadStatus(context),
+      "FAIL",
+      "runtime was not confirmed absent before old bootstrap",
+    );
+  }
+
+  try {
+    await adapters.bootstrap(initial.canonical.identity.path);
+  } catch (error) {
+    return rolloutOutcome(
+      "SWITCH_FAILED_ROLLBACK_FAILED",
+      context,
+      false,
+      controlledReloadStatus(context),
+      "FAIL",
+      errorMessage(error),
+    );
+  }
+  const healthy = await verifyOldRuntime(request, initial, adapters, false);
+  return rolloutOutcome(
+    healthy ? "SWITCH_FAILED_ROLLBACK_OK" : "SWITCH_FAILED_ROLLBACK_FAILED",
+    context,
+    false,
+    controlledReloadStatus(context),
+    healthy ? "PASS" : "FAIL",
+  );
+}
+
+async function compensateCommittedCandidate(
+  request: RolloutRequest,
+  failure: ForwardRolloutFailure,
+  adapters: MacosRolloutAdapters,
+): Promise<RolloutOutcome> {
+  const context = failure.context;
+  const initial = context.initial ?? failure.initial;
+  if (!initial || !context.candidatePlistSha256 || !context.preparedCanonicalTemp) {
+    return rolloutOutcome(
+      "ROLLBACK_REFUSED_UNPROVEN_STATE",
+      context,
+      true,
+      controlledReloadStatus(context),
+      "FAIL",
+      "committed rollback context is incomplete",
+    );
+  }
+
+  let observed = await observeRecoveryState({
+    expectedCanonical: "candidate",
+    request,
+    context,
+    initial,
+    adapters,
+  });
+  if (observed.refusal) {
+    return rolloutOutcome(observed.refusal, context, true, controlledReloadStatus(context), "FAIL");
+  }
+  if (observed.runtimeRole === "candidate") {
+    const stopped = await stopRecoveryCandidate({
+      expectedCanonical: "candidate",
+      request,
+      context,
+      initial,
+      adapters,
+    });
+    if (stopped) return { ...stopped, committed: true };
+  } else if (observed.runtimeRole !== "absent") {
+    return rolloutOutcome(
+      observed.runtimeRole === "drift"
+        ? "ROLLBACK_REFUSED_CONCURRENT_DRIFT"
+        : "ROLLBACK_REFUSED_UNPROVEN_STATE",
+      context,
+      true,
+      controlledReloadStatus(context),
+      "FAIL",
+    );
+  }
+
+  observed = await observeRecoveryState({
+    expectedCanonical: "candidate",
+    request,
+    context,
+    initial,
+    adapters,
+  });
+  if (observed.refusal) {
+    return rolloutOutcome(observed.refusal, context, true, controlledReloadStatus(context), "FAIL");
+  }
+  if (observed.runtimeRole !== "absent" || !isKnownUnowned(observed.listener)) {
+    return rolloutOutcome(
+      "ROLLBACK_REFUSED_CONCURRENT_DRIFT",
+      context,
+      true,
+      controlledReloadStatus(context),
+      "FAIL",
+      "candidate runtime was not confirmed stopped before compensating restore",
+    );
+  }
+
+  let oldTemp: PreparedCanonicalTemp;
+  try {
+    oldTemp = await adapters.prepareCanonicalTemp({
+      transactionNonce: context.transactionNonce,
+      bytes: initial.canonical.bytes,
+      expectedSha256: initial.canonical.sha256,
+      uid: initial.canonical.identity.uid,
+      gid: initial.canonical.identity.gid,
+      mode: initial.canonical.identity.mode,
+    });
+  } catch (error) {
+    return rolloutOutcome(
+      "SWITCH_FAILED_ROLLBACK_FAILED",
+      context,
+      true,
+      controlledReloadStatus(context),
+      "FAIL",
+      errorMessage(error),
+    );
+  }
+
+  const finalGate = await revalidateBeforeCompensatingRestore({
+    request,
+    context,
+    initial,
+    oldTemp,
+    adapters,
+  });
+  if (finalGate) {
+    return rolloutOutcome(finalGate, context, true, controlledReloadStatus(context), "FAIL");
+  }
+
+  try {
+    await adapters.atomicReplaceCanonical(oldTemp.path);
+    await adapters.syncCanonicalParent();
+    await adapters.bootstrap(initial.canonical.identity.path);
+  } catch (error) {
+    return rolloutOutcome(
+      "SWITCH_FAILED_ROLLBACK_FAILED",
+      context,
+      true,
+      controlledReloadStatus(context),
+      "FAIL",
+      errorMessage(error),
+    );
+  }
+
+  const healthy = await verifyOldRuntime(request, initial, adapters, false);
+  return rolloutOutcome(
+    healthy ? "SWITCH_FAILED_ROLLBACK_OK" : "SWITCH_FAILED_ROLLBACK_FAILED",
+    context,
+    true,
+    controlledReloadStatus(context),
+    healthy ? "PASS" : "FAIL",
+  );
+}
+
+async function stopRecoveryCandidate(input: {
+  expectedCanonical: "old" | "candidate";
+  request: RolloutRequest;
+  context: ForwardTransactionContext;
+  initial: InitialRolloutState;
+  adapters: MacosRolloutAdapters;
+}): Promise<RolloutOutcome | undefined> {
+  const fresh = await observeRecoveryState(input);
+  if (fresh.refusal) {
+    return rolloutOutcome(
+      fresh.refusal,
+      input.context,
+      input.expectedCanonical === "candidate",
+      controlledReloadStatus(input.context),
+      "FAIL",
+    );
+  }
+  if (fresh.runtimeRole === "absent") return undefined;
+  if (fresh.runtimeRole !== "candidate" || !fresh.process) {
+    return rolloutOutcome(
+      "ROLLBACK_REFUSED_CONCURRENT_DRIFT",
+      input.context,
+      input.expectedCanonical === "candidate",
+      controlledReloadStatus(input.context),
+      "FAIL",
+      "candidate ownership changed before rollback bootout",
+    );
+  }
+
+  try {
+    await input.adapters.bootoutExpected(fresh.process);
+  } catch (error) {
+    const afterFailure = await observeRecoveryState(input);
+    if (afterFailure.refusal) {
+      return rolloutOutcome(
+        afterFailure.refusal,
+        input.context,
+        input.expectedCanonical === "candidate",
+        controlledReloadStatus(input.context),
+        "FAIL",
+      );
+    }
+    return rolloutOutcome(
+      "SWITCH_FAILED_ROLLBACK_FAILED",
+      input.context,
+      input.expectedCanonical === "candidate",
+      controlledReloadStatus(input.context),
+      "FAIL",
+      errorMessage(error),
+    );
+  }
+
+  const stopped = await input.adapters.waitStopped(fresh.process).catch((error) => unproven<"stopped">(errorMessage(error)));
+  if (stopped.kind === "unproven") {
+    const afterFailure = await observeRecoveryState(input);
+    if (afterFailure.refusal) {
+      return rolloutOutcome(
+        afterFailure.refusal,
+        input.context,
+        input.expectedCanonical === "candidate",
+        controlledReloadStatus(input.context),
+        "FAIL",
+      );
+    }
+    return rolloutOutcome(
+      "ROLLBACK_REFUSED_UNPROVEN_STATE",
+      input.context,
+      input.expectedCanonical === "candidate",
+      controlledReloadStatus(input.context),
+      "FAIL",
+      stopped.reason,
+    );
+  }
+  return undefined;
+}
+
+async function observeRecoveryState(input: {
+  expectedCanonical: "old" | "candidate";
+  request: RolloutRequest;
+  context: ForwardTransactionContext;
+  initial: InitialRolloutState;
+  adapters: MacosRolloutAdapters;
+}): Promise<RecoveryObservation> {
+  const canonical = await observeExpectedCanonical(input);
+  const lockObservation = await input.context.lease.assertOwned();
+  const lock: ObservedState<"owned" | "drift"> = lockObservation;
+  const ownerRecord: ObservedState<"ours" | "drift"> = lockObservation.kind === "unproven"
+    ? { kind: "unproven", reason: lockObservation.reason }
+    : { kind: "known", value: lockObservation.value === "owned" ? "ours" : "drift" };
+
+  const launchd = await input.adapters.observeLaunchd();
+  const listenerRaw = await input.adapters.observeListener();
+  let runtime: ObservedState<"expected" | "absent" | "drift">;
+  let listener: ObservedState<"expected" | "unowned" | "drift">;
+  let runtimeRole: RecoveryObservation["runtimeRole"] = "unproven";
+  let processValue: ProcessIdentity | undefined;
+  let observedRuntimePid: number | undefined;
+
+  if (launchd.kind === "unproven") {
+    runtime = { kind: "unproven", reason: launchd.reason };
+  } else if (!launchd.value.loaded) {
+    runtimeRole = "absent";
+    runtime = { kind: "known", value: "absent" };
+  } else if (!launchd.value.pid) {
+    runtime = { kind: "unproven", reason: "loaded launchd job has no observable PID" };
+  } else {
+    observedRuntimePid = launchd.value.pid;
+    const processState = await input.adapters.observeProcess(launchd.value.pid);
+    if (processState.kind === "unproven") {
+      runtime = { kind: "unproven", reason: processState.reason };
+    } else {
+      processValue = processState.value;
+      if (sameProcessIdentity(processState.value, input.initial.process)) {
+        runtimeRole = input.expectedCanonical === "old" ? "old" : "drift";
+      } else if (processState.value.entrypointRealpath === input.request.candidateEntrypoint) {
+        runtimeRole = "candidate";
+      } else {
+        runtimeRole = "drift";
+      }
+      runtime = {
+        kind: "known",
+        value: runtimeRole === "drift" ? "drift" : "expected",
+      };
+    }
+  }
+
+  if (listenerRaw.kind === "unproven") {
+    listener = { kind: "unproven", reason: listenerRaw.reason };
+  } else if (listenerRaw.value.state === "unowned") {
+    listener = { kind: "known", value: "unowned" };
+  } else if (observedRuntimePid !== undefined && listenerRaw.value.ownerPid === observedRuntimePid) {
+    listener = { kind: "known", value: "expected" };
+  } else {
+    listener = { kind: "known", value: "drift" };
+  }
+
+  if (runtimeRole === "absent" && listener.kind === "known" && listener.value === "expected") {
+    listener = { kind: "known", value: "drift" };
+  }
+
+  const refusal = classifyRollbackRefusal({
+    canonical,
+    runtime,
+    listener,
+    lock,
+    ownerRecord,
+  });
+  return {
+    ...(refusal ? { refusal } : {}),
+    runtimeRole,
+    ...(processValue ? { process: processValue } : {}),
+    listener,
+  };
+}
+
+async function observeExpectedCanonical(input: {
+  expectedCanonical: "old" | "candidate";
+  request: RolloutRequest;
+  context: ForwardTransactionContext;
+  initial: InitialRolloutState;
+  adapters: MacosRolloutAdapters;
+}): Promise<ObservedState<"expected" | "drift">> {
+  const expectedSha = input.expectedCanonical === "old"
+    ? input.initial.canonical.sha256
+    : input.context.candidatePlistSha256;
+  if (!expectedSha) return { kind: "unproven", reason: "expected canonical hash is unavailable" };
+
+  const canonicalPath = input.initial.canonical.identity.path;
+  const parentPath = input.initial.canonical.parentIdentity.path;
+  const [hash, identity, parentIdentity, semantic] = await Promise.all([
+    input.adapters.readFileSha256(canonicalPath),
+    input.adapters.observeFileIdentity(canonicalPath),
+    input.adapters.observeFileIdentity(parentPath),
+    input.adapters.readCanonical(),
+  ]);
+
+  const identityDrift = identity.kind === "known" && (
+    input.expectedCanonical === "old"
+      ? !sameFileIdentity(identity.value, input.initial.canonical.identity)
+      : !input.context.preparedCanonicalTemp
+        || !samePublishedIdentity(identity.value, input.context.preparedCanonicalTemp.identity, canonicalPath)
+  );
+  const parentDrift = parentIdentity.kind === "known"
+    && !sameFileIdentity(parentIdentity.value, input.initial.canonical.parentIdentity);
+  const semanticDrift = semantic.kind === "known" && (
+    semantic.value.sha256 !== expectedSha
+    || semantic.value.entrypointRealpath !== (
+      input.expectedCanonical === "old"
+        ? input.request.expectedLiveEntrypoint
+        : input.request.candidateEntrypoint
+    )
+    || !semantic.value.runAtLoad
+    || !semantic.value.keepAlive
+  );
+  if (
+    (hash.kind === "known" && hash.value !== expectedSha)
+    || identityDrift
+    || parentDrift
+    || semanticDrift
+  ) {
+    return { kind: "known", value: "drift" };
+  }
+  const unprovenObservation = [hash, identity, parentIdentity, semantic].find((value) => value.kind === "unproven");
+  if (unprovenObservation?.kind === "unproven") {
+    return { kind: "unproven", reason: unprovenObservation.reason };
+  }
+  return { kind: "known", value: "expected" };
+}
+
+async function revalidateBeforeCompensatingRestore(input: {
+  request: RolloutRequest;
+  context: ForwardTransactionContext;
+  initial: InitialRolloutState;
+  oldTemp: PreparedCanonicalTemp;
+  adapters: MacosRolloutAdapters;
+}): Promise<RollbackRefusal | undefined> {
+  const observed = await observeRecoveryState({
+    expectedCanonical: "candidate",
+    request: input.request,
+    context: input.context,
+    initial: input.initial,
+    adapters: input.adapters,
+  });
+  if (observed.refusal) return observed.refusal;
+  if (observed.runtimeRole !== "absent" || !isKnownUnowned(observed.listener)) {
+    return "ROLLBACK_REFUSED_CONCURRENT_DRIFT";
+  }
+
+  const [hash, identity] = await Promise.all([
+    input.adapters.readFileSha256(input.oldTemp.path),
+    input.adapters.observeFileIdentity(input.oldTemp.path),
+  ]);
+  if (hash.kind === "known" && hash.value !== input.initial.canonical.sha256) {
+    return "ROLLBACK_REFUSED_CONCURRENT_DRIFT";
+  }
+  if (identity.kind === "known" && (
+    !sameFileIdentity(identity.value, input.oldTemp.identity)
+    || identity.value.uid !== input.initial.canonical.identity.uid
+    || identity.value.gid !== input.initial.canonical.identity.gid
+    || identity.value.mode !== input.initial.canonical.identity.mode
+    || identity.value.kind !== "file"
+    || identity.value.symlink
+  )) {
+    return "ROLLBACK_REFUSED_CONCURRENT_DRIFT";
+  }
+  if (hash.kind === "unproven" || identity.kind === "unproven") {
+    return "ROLLBACK_REFUSED_UNPROVEN_STATE";
+  }
+  return undefined;
+}
+
+async function verifyOldRuntime(
+  request: RolloutRequest,
+  initial: InitialRolloutState,
+  adapters: MacosRolloutAdapters,
+  requireExactInitialGeneration: boolean,
+): Promise<boolean> {
+  const [canonicalHash, canonicalIdentity, parentIdentity, semantic, launchd, listener, disabled] = await Promise.all([
+    adapters.readFileSha256(initial.canonical.identity.path),
+    adapters.observeFileIdentity(initial.canonical.identity.path),
+    adapters.observeFileIdentity(initial.canonical.parentIdentity.path),
+    adapters.readCanonical(),
+    adapters.observeLaunchd(),
+    adapters.observeListener(),
+    adapters.observeDisabledOverride(),
+  ]);
+  if (
+    canonicalHash.kind !== "known"
+    || canonicalHash.value !== initial.canonical.sha256
+    || canonicalIdentity.kind !== "known"
+    || !sameOldDefinitionIdentity(canonicalIdentity.value, initial.canonical.identity)
+    || parentIdentity.kind !== "known"
+    || !sameFileIdentity(parentIdentity.value, initial.canonical.parentIdentity)
+    || semantic.kind !== "known"
+    || semantic.value.sha256 !== initial.canonical.sha256
+    || semantic.value.entrypointRealpath !== request.expectedLiveEntrypoint
+    || !semantic.value.runAtLoad
+    || !semantic.value.keepAlive
+    || launchd.kind !== "known"
+    || !launchd.value.loaded
+    || !launchd.value.pid
+    || listener.kind !== "known"
+    || disabled.kind !== "known"
+    || disabled.value !== "enabled"
+  ) return false;
+
+  const processState = await adapters.observeProcess(launchd.value.pid);
+  if (
+    processState.kind !== "known"
+    || processState.value.entrypointRealpath !== request.expectedLiveEntrypoint
+    || (requireExactInitialGeneration && !sameProcessIdentity(processState.value, initial.process))
+    || listener.value.state !== "owned"
+    || listener.value.ownerPid !== processState.value.pid
+  ) return false;
+  const health = await adapters.checkHealth();
+  return health.kind === "known" && health.value === "healthy";
+}
+
+function rolloutOutcome(
+  code: RolloutResultCode,
+  context: ForwardTransactionContext,
+  committed: boolean,
+  controlledReload: "PASS" | "FAIL" | "NOT_RUN",
+  persistenceStaticContract: "PASS" | "FAIL",
+  reason?: string,
+): RolloutOutcome {
+  return {
+    code,
+    transactionId: context.transactionId,
+    transactionNonce: context.transactionNonce,
+    committed,
+    controlledReload,
+    persistenceStaticContract,
+    rebootRecovery: "UNVERIFIED",
+    evidence: { ...(reason ? { reason } : {}) },
+  };
+}
+
+function controlledReloadStatus(
+  context: ForwardTransactionContext,
+): "PASS" | "FAIL" | "NOT_RUN" {
+  if (context.controlledReloadVerified) return "PASS";
+  return context.liveMutationStarted ? "FAIL" : "NOT_RUN";
+}
+
+function rolloutErrorCode(error: unknown): RolloutResultCode {
+  if (error && typeof error === "object" && "code" in error) {
+    const code = (error as { code?: unknown }).code;
+    if (code === "LOCK_BUSY" || code === "LOCK_AMBIGUOUS") return code;
+  }
+  return "PRECONDITION_FAILED";
+}
+
+function sameFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  return left.path === right.path
+    && left.uid === right.uid
+    && left.gid === right.gid
+    && left.mode === right.mode
+    && left.device === right.device
+    && left.inode === right.inode
+    && left.kind === right.kind
+    && left.symlink === right.symlink;
+}
+
+function samePublishedIdentity(
+  canonical: FileIdentity,
+  prepared: FileIdentity,
+  canonicalPath: string,
+): boolean {
+  return canonical.path === canonicalPath
+    && canonical.uid === prepared.uid
+    && canonical.gid === prepared.gid
+    && canonical.mode === prepared.mode
+    && canonical.device === prepared.device
+    && canonical.inode === prepared.inode
+    && canonical.kind === "file"
+    && !canonical.symlink;
+}
+
+function sameOldDefinitionIdentity(actual: FileIdentity, old: FileIdentity): boolean {
+  return actual.path === old.path
+    && actual.uid === old.uid
+    && actual.gid === old.gid
+    && actual.mode === old.mode
+    && actual.kind === "file"
+    && !actual.symlink;
+}
+
+function isKnownUnowned(
+  listener: ObservedState<"expected" | "unowned" | "drift">,
+): boolean {
+  return listener.kind === "known" && listener.value === "unowned";
+}
+
+function unproven<T>(reason: string): ObservedState<T> {
+  return { kind: "unproven", reason };
+}
+
+function resolveTransactionDir(transactionId: string): string {
+  return join(homedir(), ".devspace", "rollout", "transactions", transactionId);
+}
+
+async function readAndValidateInitialState(input: {
+  request: RolloutRequest;
+  adapters: MacosRolloutAdapters;
+}): Promise<
+  | { ok: true; value: InitialRolloutState }
+  | { ok: false; code: ForwardRolloutFailure["code"]; reason: string }
+> {
+  const canonical = await input.adapters.readCanonical();
+  if (canonical.kind === "unproven") {
+    return { ok: false, code: "PRECONDITION_FAILED", reason: canonical.reason };
+  }
+  if (canonical.value.sha256 !== input.request.expectedLivePlistSha256) {
+    return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: "canonical plist hash differs from expected live hash" };
+  }
+  if (canonical.value.entrypointRealpath !== input.request.expectedLiveEntrypoint) {
+    return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: "canonical entrypoint differs from expected live entrypoint" };
+  }
+  if (!canonical.value.runAtLoad || !canonical.value.keepAlive) {
+    return { ok: false, code: "PERSISTENCE_CONTRACT_INVALID", reason: "canonical persistence flags are not enabled" };
+  }
+
+  const disabled = await input.adapters.observeDisabledOverride();
+  if (disabled.kind === "unproven") {
+    return { ok: false, code: "PRECONDITION_FAILED", reason: disabled.reason };
+  }
+  if (disabled.value === "disabled") {
+    return { ok: false, code: "PERSISTENCE_CONTRACT_INVALID", reason: "launchd service has a persistent disabled override" };
+  }
+
+  const launchd = await input.adapters.observeLaunchd();
+  if (launchd.kind === "unproven") return { ok: false, code: "PRECONDITION_FAILED", reason: launchd.reason };
+  if (!launchd.value.loaded || !launchd.value.pid) {
+    return { ok: false, code: "SPLIT_STATE_DETECTED", reason: "canonical old definition exists but launchd service is not loaded" };
+  }
+  const processState = await input.adapters.observeProcess(launchd.value.pid);
+  if (processState.kind === "unproven") return { ok: false, code: "PRECONDITION_FAILED", reason: processState.reason };
+  if (processState.value.entrypointRealpath !== input.request.expectedLiveEntrypoint) {
+    return { ok: false, code: "SPLIT_STATE_DETECTED", reason: "loaded runtime entrypoint differs from canonical expected entrypoint" };
+  }
+  const listener = await input.adapters.observeListener();
+  if (listener.kind === "unproven") return { ok: false, code: "PRECONDITION_FAILED", reason: listener.reason };
+  if (listener.value.state !== "owned" || listener.value.ownerPid !== processState.value.pid) {
+    return { ok: false, code: "SPLIT_STATE_DETECTED", reason: "live listener is not owned by the expected old runtime" };
+  }
+  const health = await input.adapters.checkHealth();
+  if (health.kind === "unproven") return { ok: false, code: "PRECONDITION_FAILED", reason: health.reason };
+  if (health.value !== "healthy") return { ok: false, code: "PRECONDITION_FAILED", reason: "old live runtime is unhealthy" };
+  return {
+    ok: true,
+    value: {
+      canonical: canonical.value,
+      launchd: launchd.value,
+      process: processState.value,
+    },
+  };
+}
+
+async function revalidateBeforeOldStop(input: {
+  initial: InitialRolloutState;
+  request: RolloutRequest;
+  adapters: MacosRolloutAdapters;
+}): Promise<{ ok: true } | { ok: false; code: "LIVE_STATE_CAS_MISMATCH"; reason: string }> {
+  const canonical = await input.adapters.readCanonical();
+  if (canonical.kind === "unproven") return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: canonical.reason };
+  if (
+    canonical.value.sha256 !== input.request.expectedLivePlistSha256
+    || canonical.value.sha256 !== input.initial.canonical.sha256
+    || canonical.value.entrypointRealpath !== input.initial.canonical.entrypointRealpath
+  ) {
+    return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: "canonical state changed before old-service stop" };
+  }
+  const launchd = await input.adapters.observeLaunchd();
+  if (launchd.kind === "unproven" || !launchd.value.loaded || launchd.value.pid !== input.initial.process.pid) {
+    return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: launchd.kind === "unproven" ? launchd.reason : "launchd generation changed before old-service stop" };
+  }
+  const processState = await input.adapters.observeProcess(input.initial.process.pid);
+  if (processState.kind === "unproven" || !sameProcessIdentity(processState.value, input.initial.process)) {
+    return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: processState.kind === "unproven" ? processState.reason : "process generation changed before old-service stop" };
+  }
+  const listener = await input.adapters.observeListener();
+  if (listener.kind === "unproven" || listener.value.state !== "owned" || listener.value.ownerPid !== input.initial.process.pid) {
+    return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: listener.kind === "unproven" ? listener.reason : "listener ownership changed before old-service stop" };
+  }
+  return { ok: true };
+}
+
+async function verifyCandidateRuntime(input: {
+  candidateEntrypoint: string;
+  candidatePlistPath: string;
+  candidatePlistSha256: string;
+  adapters: MacosRolloutAdapters;
+}): Promise<{ ok: true; process: ProcessIdentity } | { ok: false; reason: string }> {
+  const stagedHash = await input.adapters.readFileSha256(input.candidatePlistPath);
+  if (stagedHash.kind === "unproven") return { ok: false, reason: stagedHash.reason };
+  if (stagedHash.value !== input.candidatePlistSha256) return { ok: false, reason: "staged candidate plist hash changed" };
+  const qualified = await observeHealthyCandidateRuntime(input.candidateEntrypoint, input.adapters);
+  if (!qualified.ok) return qualified;
+  const hashAfterStability = await input.adapters.readFileSha256(input.candidatePlistPath);
+  if (hashAfterStability.kind === "unproven") return { ok: false, reason: hashAfterStability.reason };
+  if (hashAfterStability.value !== input.candidatePlistSha256) {
+    return { ok: false, reason: "candidate plist changed during stability observation" };
+  }
+  return qualified;
+}
+
+async function preCommitRevalidate(input: {
+  request: RolloutRequest;
+  initial: InitialRolloutState;
+  candidatePlistPath: string;
+  candidatePlistSha256: string;
+  lease: RolloutLockLease;
+  adapters: MacosRolloutAdapters;
+}): Promise<
+  | { ok: true; process: ProcessIdentity }
+  | { ok: false; code: "LIVE_STATE_CAS_MISMATCH" | "CANDIDATE_ARTIFACT_MISMATCH" | "PRECONDITION_FAILED"; reason: string }
+> {
+  const lock = await input.lease.assertOwned();
+  if (lock.kind === "unproven") {
+    return { ok: false, code: "PRECONDITION_FAILED", reason: lock.reason };
+  }
+  if (lock.value !== "owned") {
+    return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: "rollout kernel lock ownership changed before commit" };
+  }
+  const canonical = await input.adapters.readCanonical();
+  if (canonical.kind === "unproven") return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: canonical.reason };
+  if (
+    canonical.value.sha256 !== input.request.expectedLivePlistSha256
+    || canonical.value.sha256 !== input.initial.canonical.sha256
+    || canonical.value.entrypointRealpath !== input.initial.canonical.entrypointRealpath
+  ) {
+    return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: "old canonical changed before commit" };
+  }
+  const stagedHash = await input.adapters.readFileSha256(input.candidatePlistPath);
+  if (stagedHash.kind === "unproven") return { ok: false, code: "CANDIDATE_ARTIFACT_MISMATCH", reason: stagedHash.reason };
+  if (stagedHash.value !== input.candidatePlistSha256) return { ok: false, code: "CANDIDATE_ARTIFACT_MISMATCH", reason: "staged candidate plist changed before commit" };
+  const qualified = await observeHealthyCandidateRuntime(input.request.candidateEntrypoint, input.adapters);
+  if (!qualified.ok) {
+    return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: qualified.reason };
+  }
+  return { ok: true, process: qualified.process };
+}
+
+async function postCommitVerify(input: {
+  candidateEntrypoint: string;
+  candidateCanonicalSha256: string;
+  initial: InitialRolloutState;
+  adapters: MacosRolloutAdapters;
+}): Promise<{ ok: true; process: ProcessIdentity } | { ok: false; reason: string }> {
+  const canonical = await input.adapters.readCanonical();
+  if (canonical.kind === "unproven") return { ok: false, reason: canonical.reason };
+  if (
+    canonical.value.sha256 !== input.candidateCanonicalSha256
+    || canonical.value.entrypointRealpath !== input.candidateEntrypoint
+    || !canonical.value.runAtLoad
+    || !canonical.value.keepAlive
+    || canonical.value.identity.uid !== input.initial.canonical.identity.uid
+    || canonical.value.identity.gid !== input.initial.canonical.identity.gid
+    || canonical.value.identity.mode !== input.initial.canonical.identity.mode
+  ) {
+    return { ok: false, reason: "committed canonical definition does not match the verified candidate contract" };
+  }
+  const disabled = await input.adapters.observeDisabledOverride();
+  if (disabled.kind === "unproven") return { ok: false, reason: disabled.reason };
+  if (disabled.value === "disabled") return { ok: false, reason: "committed service became persistently disabled" };
+  return observeHealthyCandidateRuntime(input.candidateEntrypoint, input.adapters);
+}
+
+async function observeHealthyCandidateRuntime(
+  candidateEntrypoint: string,
+  adapters: MacosRolloutAdapters,
+): Promise<{ ok: true; process: ProcessIdentity } | { ok: false; reason: string }> {
+  const launchd = await adapters.observeLaunchd();
+  if (launchd.kind === "unproven") return { ok: false, reason: launchd.reason };
+  if (!launchd.value.loaded || !launchd.value.pid) return { ok: false, reason: "candidate launchd job is not loaded" };
+  const processState = await adapters.observeProcess(launchd.value.pid);
+  if (processState.kind === "unproven") return { ok: false, reason: processState.reason };
+  if (processState.value.entrypointRealpath !== candidateEntrypoint) {
+    return { ok: false, reason: "candidate process entrypoint does not match requested candidate" };
+  }
+  const listener = await adapters.observeListener();
+  if (listener.kind === "unproven") return { ok: false, reason: listener.reason };
+  if (listener.value.state !== "owned" || listener.value.ownerPid !== processState.value.pid) {
+    return { ok: false, reason: "candidate listener is not owned by the candidate PID" };
+  }
+  const health = await adapters.checkHealth();
+  if (health.kind === "unproven") return { ok: false, reason: health.reason };
+  if (health.value !== "healthy") return { ok: false, reason: "candidate health check failed" };
+  const stable = await adapters.waitStable(processState.value);
+  if (stable.kind === "unproven") return { ok: false, reason: stable.reason };
+  return { ok: true, process: processState.value };
+}
+
+function forwardFailure(
+  context: ForwardTransactionContext,
+  phase: ForwardRolloutFailurePhase,
+  code: ForwardRolloutFailure["code"],
+  reason: string,
+  extra: {
+    initial?: InitialRolloutState;
+    candidateProcess?: ProcessIdentity;
+    candidateCanonicalSha256?: string;
+    committed?: boolean;
+  } = {},
+): ForwardRolloutFailure {
+  return {
+    ok: false,
+    phase,
+    code,
+    committed: extra.committed ?? false,
+    context,
+    ...(extra.initial ? { initial: extra.initial } : {}),
+    ...(extra.candidateProcess ? { candidateProcess: extra.candidateProcess } : {}),
+    ...(extra.candidateCanonicalSha256 ? { candidateCanonicalSha256: extra.candidateCanonicalSha256 } : {}),
+    reason,
+  };
+}
+
+function sameProcessIdentity(left: ProcessIdentity, right: ProcessIdentity): boolean {
+  return left.pid === right.pid
+    && left.processStartIdentity === right.processStartIdentity
+    && left.executableRealpath === right.executableRealpath
+    && left.entrypointRealpath === right.entrypointRealpath
+    && left.normalizedArgv.length === right.normalizedArgv.length
+    && left.normalizedArgv.every((value, index) => value === right.normalizedArgv[index]);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
