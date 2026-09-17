@@ -163,25 +163,48 @@ Configure it in `config.jsonc`:
     "enabled": true,
     "agyPath": "~/.local/bin/agy",
     "cuaDriverPath": "~/.local/bin/cua-driver",
-    "settingsPath": "~/.gemini/antigravity-cli/settings.json"
+    "settingsPath": "~/.gemini/antigravity-cli/settings.json",
+    "model": "gemini-3.8-flash-high",
+    "effort": "high",
+    "compatibleVersions": ">=1.1.22 <1.2.0"
   }
 }
 ```
 
 The section defaults to disabled. The three path fields default to the values
 shown above and are normalized using the same home-path rules as other stored
-DevSpace paths.
+DevSpace paths. `model`, `effort`, and `compatibleVersions` are server-owned
+policy strings. They are not trimmed or selected by the MCP caller; empty or
+whitespace-only values are rejected.
 
-V1 fixes every real delegated run to:
+The default policy remains:
 
 ```text
-model  = gemini-3.8-flash-high
-effort = high
+model              = gemini-3.8-flash-high
+effort             = high
+compatibleVersions = >=1.1.22 <1.2.0
 ```
 
-The public tool input repeats those values as exact literals; they are not
-general model-selection controls. Agy runs use `--output-format stream-json`
-and fail closed if the runtime does not report the exact model identity.
+`delegate_to_agy` does not expose model or effort selectors. Real runs use the
+configured values for `--model` and `--effort`, use `--output-format
+stream-json`, and fail closed unless `init.model` exactly matches the configured
+model. Runtime inspection also requires the configured Agy version to satisfy
+`compatibleVersions`; malformed or out-of-range versions are rejected even if
+the executable otherwise starts.
+
+`compatibleVersions` is a qualification boundary, not an updater. DevSpace
+continues to disable Agy auto-update during delegated runs and also checks that
+the required CLI flags still exist. A routine compatible patch upgrade can be
+used after local runtime/canary qualification without a DevSpace code change.
+An out-of-range release requires explicit qualification before widening the
+configured range or changing the adapter.
+
+After the one-time Workspace action schema refresh that removes the legacy
+model/effort input literals, changing `model`, `effort`, or an already-qualified
+Agy patch version does not require another action republish as long as the MCP
+field contract itself remains unchanged. During that migration, legacy extra
+`requested_model` / `requested_effort` payload fields are ignored as control
+inputs and cannot override server policy.
 
 Real runs require telemetry to already be disabled in the configured Agy
 settings. DevSpace does not change the user's persistent Agy settings to make a
