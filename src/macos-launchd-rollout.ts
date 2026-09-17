@@ -284,8 +284,8 @@ export async function runMacosLaunchdRollout(
       );
     }
     return forward.committed
-      ? compensateCommittedCandidate(request, forward, adapters)
-      : recoverPreCommitFailure(request, forward, adapters);
+      ? await compensateCommittedCandidate(request, forward, adapters)
+      : await recoverPreCommitFailure(request, forward, adapters);
   } finally {
     await context.lease.release();
   }

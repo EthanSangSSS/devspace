@@ -97,6 +97,8 @@ interface ForwardFixtureOptions {
   rollbackFinalCanonicalDrift?: boolean;
   rollbackOldTempDrift?: boolean;
   rollbackBootstrapFails?: boolean;
+  recoveryBarrier?: () => Promise<void>;
+  leaseOwnershipTracksRelease?: boolean;
 }
 
 interface ForwardFixture {
@@ -153,6 +155,8 @@ async function createForwardFixture(
   let canonicalCommitted = false;
   let oldProcessReads = 0;
   let releaseCalls = 0;
+  let leaseReleased = false;
+  let recoveryBarrierUsed = false;
   let replacementActive = false;
   let forwardFailed = false;
   let rollbackTempPrepared = false;
@@ -207,6 +211,9 @@ async function createForwardFixture(
     },
     async assertOwned() {
       calls.push("lock.assertOwned");
+      if (options.leaseOwnershipTracksRelease && leaseReleased) {
+        return unproven("rollout lock was already released");
+      }
       if (forwardFailed && canonicalCommitted && options.postCommitLockUnproven) {
         return unproven("rollout lock state cannot be proven");
       }
@@ -217,6 +224,7 @@ async function createForwardFixture(
     },
     async release() {
       releaseCalls += 1;
+      leaseReleased = true;
       calls.push("lock.release");
     },
   };
@@ -294,6 +302,10 @@ async function createForwardFixture(
       return lease;
     },
     async readCanonical() {
+      if (forwardFailed && options.recoveryBarrier && !recoveryBarrierUsed) {
+        recoveryBarrierUsed = true;
+        await options.recoveryBarrier();
+      }
       calls.push(canonicalCommitted ? "canonical:candidate" : "canonical:old");
       if (forwardFailed && !canonicalCommitted) {
         if (options.recoveryCanonicalDrift === "unproven") {
@@ -628,6 +640,33 @@ rolloutTest("pre-commit recovery stops an owned candidate then bootstraps the un
   assert.equal(fixture.getReleaseCalls(), 1);
 });
 
+rolloutTest("pre-commit recovery retains the kernel lease until recovery completes", async (t) => {
+  let enterRecovery!: () => void;
+  let resumeRecovery!: () => void;
+  const entered = new Promise<void>((resolve) => { enterRecovery = resolve; });
+  const resume = new Promise<void>((resolve) => { resumeRecovery = resolve; });
+  const fixture = await createForwardFixture(t, {
+    firstCandidateHealthy: false,
+    leaseOwnershipTracksRelease: true,
+    recoveryBarrier: async () => {
+      enterRecovery();
+      await resume;
+    },
+  });
+
+  const outcomePromise = runMacosLaunchdRollout(fixture.request, fixture.adapters);
+  await entered;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const releaseCallsWhileRecoveryBlocked = fixture.getReleaseCalls();
+  resumeRecovery();
+  const outcome = await outcomePromise;
+
+  assert.equal(releaseCallsWhileRecoveryBlocked, 0, "lease must remain held while pre-commit recovery is blocked");
+  assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
+  assert.equal(fixture.getReleaseCalls(), 1);
+  assert.ok(fixture.calls.indexOf("ROLLBACK_BOOTSTRAP_OLD") < fixture.calls.indexOf("lock.release"));
+});
+
 rolloutTest("pre-commit recovery skips bootout for confirmed candidate absence", async (t) => {
   const fixture = await createForwardFixture(t, { oldStopBarrierThrows: true });
   const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
@@ -696,6 +735,34 @@ rolloutTest("post-commit qualification failure performs runtime-aware compensati
   assert.equal(fixture.calls.includes("ROLLBACK_RESTORED_CANONICAL"), true);
   assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), true);
   assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+rolloutTest("post-commit compensation retains the kernel lease until rollback completes", async (t) => {
+  let enterRecovery!: () => void;
+  let resumeRecovery!: () => void;
+  const entered = new Promise<void>((resolve) => { enterRecovery = resolve; });
+  const resume = new Promise<void>((resolve) => { resumeRecovery = resolve; });
+  const fixture = await createForwardFixture(t, {
+    postCommitHealthFailure: true,
+    leaseOwnershipTracksRelease: true,
+    recoveryBarrier: async () => {
+      enterRecovery();
+      await resume;
+    },
+  });
+
+  const outcomePromise = runMacosLaunchdRollout(fixture.request, fixture.adapters);
+  await entered;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const releaseCallsWhileRecoveryBlocked = fixture.getReleaseCalls();
+  resumeRecovery();
+  const outcome = await outcomePromise;
+
+  assert.equal(releaseCallsWhileRecoveryBlocked, 0, "lease must remain held while post-commit compensation is blocked");
+  assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
+  assert.equal(fixture.calls.includes("ROLLBACK_RESTORED_CANONICAL"), true);
+  assert.equal(fixture.getReleaseCalls(), 1);
+  assert.ok(fixture.calls.indexOf("ROLLBACK_BOOTSTRAP_OLD") < fixture.calls.indexOf("lock.release"));
 });
 
 rolloutTest("post-commit rollback accepts confirmed candidate absence without bootout", async (t) => {
