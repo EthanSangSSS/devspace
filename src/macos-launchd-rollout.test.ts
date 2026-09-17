@@ -1,10 +1,23 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   classifyRollbackRefusal,
+  runMacosLaunchdForwardPath,
+  type CanonicalPlistSnapshot,
+  type LaunchdObservation,
+  type ListenerObservation,
+  type MacosRolloutAdapters,
   type ObservedState,
+  type ProcessIdentity,
+  type RolloutRequest,
   type RollbackClassificationInput,
 } from "./macos-launchd-rollout.js";
+import { buildCandidateSlotManifest } from "./macos-launchd-rollout-manifest.js";
+import type { RolloutLockLease } from "./macos-launchd-rollout-lock.js";
 
 const known = <T>(value: T): ObservedState<T> => ({ kind: "known", value });
 const unproven = <T>(reason: string): ObservedState<T> => ({ kind: "unproven", reason });
@@ -57,4 +70,382 @@ test("rollback refusal taxonomy is deterministic and drift-first", async () => {
   for (const entry of cases) {
     assert.equal(classifyRollbackRefusal(entry.input), entry.expected, entry.name);
   }
+});
+
+interface ForwardFixtureOptions {
+  disabled?: boolean;
+  selfHosted?: boolean;
+  oldRuntimeDriftsBeforeStop?: boolean;
+  firstCandidateListenerPid?: number;
+  firstCandidateHealthy?: boolean;
+  reloadCandidateHealthy?: boolean;
+  preCommitCanonicalDrift?: boolean;
+  keepAliveReplacementBeforeCommit?: boolean;
+  oldStopBarrierThrows?: boolean;
+}
+
+interface ForwardFixture {
+  request: RolloutRequest;
+  adapters: MacosRolloutAdapters;
+  calls: string[];
+  lease: RolloutLockLease;
+  getReleaseCalls(): number;
+}
+
+async function createForwardFixture(
+  t: test.TestContext,
+  options: ForwardFixtureOptions = {},
+): Promise<ForwardFixture> {
+  const root = await mkdtemp(join(tmpdir(), "devspace-rollout-forward-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const candidateSlot = join(root, "candidate-slot");
+  const candidateEntrypoint = join(
+    candidateSlot,
+    "node_modules",
+    "@waishnav",
+    "devspace",
+    "dist",
+    "cli.js",
+  );
+  await mkdir(join(candidateSlot, "node_modules", "@waishnav", "devspace", "dist"), { recursive: true });
+  await writeFile(candidateEntrypoint, "export {};\n", { mode: 0o644 });
+  const candidateManifest = await buildCandidateSlotManifest(candidateSlot);
+
+  const oldEntrypoint = "/Users/ethan/.local/opt/devspace-old/node_modules/@waishnav/devspace/dist/cli.js";
+  const oldBytes = Buffer.from("old-canonical-plist\n");
+  const oldSha = createHash("sha256").update(oldBytes).digest("hex");
+  const candidateBytes = Buffer.from(`candidate:${candidateEntrypoint}\n`);
+  const candidateSha = createHash("sha256").update(candidateBytes).digest("hex");
+  const oldProcess = forwardProcess(101, oldEntrypoint, "old-generation");
+  const candidateFirst = forwardProcess(201, candidateEntrypoint, "candidate-generation-1");
+  const candidateReload = forwardProcess(202, candidateEntrypoint, "candidate-generation-2");
+  const candidateReplacement = forwardProcess(203, candidateEntrypoint, "candidate-generation-3");
+  const calls: string[] = [];
+  let phase: "old" | "stopped" | "candidate-first" | "candidate-first-stopped" | "candidate-reload" = "old";
+  let canonicalCommitted = false;
+  let oldProcessReads = 0;
+  let releaseCalls = 0;
+  let replacementActive = false;
+
+  const canonicalIdentity = {
+    path: "/Users/ethan/Library/LaunchAgents/com.ethan.devspace.plist",
+    uid: 501,
+    gid: 20,
+    mode: 0o644,
+    device: 1,
+    inode: 10,
+    kind: "file" as const,
+    symlink: false,
+  };
+  const parentIdentity = {
+    ...canonicalIdentity,
+    path: "/Users/ethan/Library/LaunchAgents",
+    inode: 9,
+    mode: 0o700,
+    kind: "directory" as const,
+  };
+  const oldCanonical: CanonicalPlistSnapshot = {
+    bytes: oldBytes,
+    sha256: oldSha,
+    identity: canonicalIdentity,
+    parentIdentity,
+    entrypointRealpath: oldEntrypoint,
+    runAtLoad: true,
+    keepAlive: true,
+  };
+  const candidateCanonical: CanonicalPlistSnapshot = {
+    bytes: candidateBytes,
+    sha256: candidateSha,
+    identity: { ...canonicalIdentity, inode: 11 },
+    parentIdentity,
+    entrypointRealpath: candidateEntrypoint,
+    runAtLoad: true,
+    keepAlive: true,
+  };
+
+  const lease: RolloutLockLease = {
+    fd: 99,
+    owner: {
+      schema_version: 1,
+      pid: process.pid,
+      process_start_identity: "helper-generation",
+      transaction_nonce: "fake-nonce",
+      transaction_id: "fake-transaction",
+      created_at: "2026-09-17T00:00:00.000Z",
+    },
+    async assertOwned() {
+      calls.push("lock.assertOwned");
+      return known("owned");
+    },
+    async release() {
+      releaseCalls += 1;
+      calls.push("lock.release");
+    },
+  };
+
+  const currentLaunchd = (): LaunchdObservation => {
+    switch (phase) {
+      case "old":
+        return { loaded: true, pid: oldProcess.pid, runCount: 1, normalizedArgv: oldProcess.normalizedArgv };
+      case "candidate-first":
+        return { loaded: true, pid: candidateFirst.pid, runCount: 1, normalizedArgv: candidateFirst.normalizedArgv };
+      case "candidate-reload":
+        return replacementActive
+          ? { loaded: true, pid: candidateReplacement.pid, runCount: 3, normalizedArgv: candidateReplacement.normalizedArgv }
+          : { loaded: true, pid: candidateReload.pid, runCount: 2, normalizedArgv: candidateReload.normalizedArgv };
+      case "stopped":
+      case "candidate-first-stopped":
+        return { loaded: false };
+    }
+  };
+
+  const currentProcess = (pid: number): ProcessIdentity | undefined => {
+    if (phase === "old" && pid === oldProcess.pid) {
+      oldProcessReads += 1;
+      if (options.oldRuntimeDriftsBeforeStop && oldProcessReads >= 2) {
+        return { ...oldProcess, processStartIdentity: "old-generation-drift" };
+      }
+      return oldProcess;
+    }
+    if (phase === "candidate-first" && pid === candidateFirst.pid) return candidateFirst;
+    if (phase === "candidate-reload" && !replacementActive && pid === candidateReload.pid) return candidateReload;
+    if (phase === "candidate-reload" && replacementActive && pid === candidateReplacement.pid) return candidateReplacement;
+    return undefined;
+  };
+
+  const currentListener = (): ListenerObservation => {
+    switch (phase) {
+      case "old": return { state: "owned", ownerPid: oldProcess.pid };
+      case "candidate-first": return {
+        state: "owned",
+        ownerPid: options.firstCandidateListenerPid ?? candidateFirst.pid,
+      };
+      case "candidate-reload": return {
+        state: "owned",
+        ownerPid: replacementActive ? candidateReplacement.pid : candidateReload.pid,
+      };
+      case "stopped":
+      case "candidate-first-stopped": return { state: "unowned" };
+    }
+  };
+
+  const adapters: MacosRolloutAdapters = {
+    async acquireLock() {
+      calls.push("LOCKED");
+      return lease;
+    },
+    async readCanonical() {
+      calls.push(canonicalCommitted ? "canonical:candidate" : "canonical:old");
+      if (options.preCommitCanonicalDrift && phase === "candidate-reload" && !canonicalCommitted) {
+        return known({ ...oldCanonical, sha256: "f".repeat(64) });
+      }
+      if (options.keepAliveReplacementBeforeCommit && phase === "candidate-reload" && !canonicalCommitted) {
+        replacementActive = true;
+      }
+      return known(canonicalCommitted ? candidateCanonical : oldCanonical);
+    },
+    async validateCandidateEntrypoint() { calls.push("candidate:entrypoint-valid"); },
+    async createCandidatePlist() {
+      calls.push("candidate:plist-created");
+      return candidateBytes;
+    },
+    async writeOldBackup() { calls.push("BACKED_UP"); },
+    async writeCandidateEvidence() { calls.push("CANDIDATE_STAGED"); },
+    async prepareCanonicalTemp() {
+      calls.push("canonical:temp-prepared");
+      return { path: "/tmp/candidate.tmp", sha256: candidateSha, identity: canonicalIdentity };
+    },
+    async atomicReplaceCanonical() {
+      calls.push("COMMITTED");
+      canonicalCommitted = true;
+    },
+    async syncCanonicalParent() { calls.push("canonical:parent-synced"); },
+    async observeLaunchd() {
+      calls.push(`launchd:${phase}`);
+      return known(currentLaunchd());
+    },
+    async observeProcess(pid) {
+      calls.push(`process:${pid}`);
+      const processValue = currentProcess(pid);
+      return processValue ? known(processValue) : unproven(`PID ${pid} is not current`);
+    },
+    async observeListener() {
+      calls.push(`listener:${phase}`);
+      return known(currentListener());
+    },
+    async checkHealth() {
+      calls.push(`health:${phase}`);
+      if (phase === "candidate-first" && options.firstCandidateHealthy === false) return known("unhealthy");
+      if (phase === "candidate-reload" && options.reloadCandidateHealthy === false) return known("unhealthy");
+      return known("healthy");
+    },
+    async bootoutExpected(expected) {
+      calls.push(expected.pid === oldProcess.pid ? "OLD_STOP_REQUESTED" : "CANDIDATE_STOP_REQUESTED");
+      if (expected.pid === oldProcess.pid && phase === "old") phase = "stopped";
+      else if (expected.pid === candidateFirst.pid && phase === "candidate-first") phase = "candidate-first-stopped";
+      else throw new Error("unexpected bootout target");
+    },
+    async bootstrap() {
+      if (phase === "stopped") {
+        phase = "candidate-first";
+        calls.push("CANDIDATE_STARTED");
+      } else if (phase === "candidate-first-stopped") {
+        phase = "candidate-reload";
+        calls.push("CONTROLLED_RELOAD_STARTED");
+      } else {
+        throw new Error(`unexpected bootstrap phase ${phase}`);
+      }
+    },
+    async observeDisabledOverride() {
+      calls.push("persistence:disabled-override");
+      return known(options.disabled ? "disabled" : "enabled");
+    },
+    async observeAncestors() {
+      calls.push("ancestors");
+      return known(options.selfHosted ? [oldProcess.pid, 1] : [1]);
+    },
+    async waitStopped(expected) {
+      calls.push(expected.pid === oldProcess.pid ? "OLD_STOPPED_VERIFIED" : "CANDIDATE_STOPPED_VERIFIED");
+      if (expected.pid === oldProcess.pid && options.oldStopBarrierThrows) {
+        throw new Error("stop barrier observation failed");
+      }
+      return known("stopped");
+    },
+    async waitStable(expected) {
+      calls.push(`stable:${expected.pid}`);
+      return known("stable");
+    },
+    async readFileSha256() {
+      calls.push("staged:hash");
+      return known(candidateSha);
+    },
+    async preflightDurability() { calls.push("durability:preflight"); },
+  };
+
+  return {
+    request: {
+      expectedLiveEntrypoint: oldEntrypoint,
+      expectedLivePlistSha256: oldSha,
+      candidateEntrypoint,
+      candidateSlotManifestSha256: candidateManifest.sha256,
+    },
+    adapters,
+    calls,
+    lease,
+    getReleaseCalls: () => releaseCalls,
+  };
+}
+
+function forwardProcess(pid: number, entrypoint: string, generation: string): ProcessIdentity {
+  return {
+    pid,
+    processStartIdentity: generation,
+    executableRealpath: "/opt/homebrew/bin/node",
+    normalizedArgv: ["/opt/homebrew/bin/node", entrypoint, "serve"],
+    entrypointRealpath: entrypoint,
+  };
+}
+
+test("forward rollout verifies twice and commits only after pre-commit revalidation", async (t) => {
+  const fixture = await createForwardFixture(t);
+  const result = await runMacosLaunchdForwardPath(fixture.request, fixture.adapters);
+  assert.equal(result.ok, true);
+  assert.equal(result.committed, true);
+  assert.equal(result.context.lease, fixture.lease, "forward result must retain the same kernel lease for Task 6");
+  assert.equal(fixture.getReleaseCalls(), 0, "forward path must not release the transaction lock");
+  assert.ok(fixture.calls.indexOf("OLD_STOPPED_VERIFIED") < fixture.calls.indexOf("CANDIDATE_STARTED"));
+  assert.ok(fixture.calls.indexOf("CANDIDATE_STOPPED_VERIFIED") < fixture.calls.indexOf("CONTROLLED_RELOAD_STARTED"));
+  assert.ok(fixture.calls.indexOf("canonical:temp-prepared") < fixture.calls.indexOf("COMMITTED"));
+  const commitIndex = fixture.calls.indexOf("COMMITTED");
+  assert.ok(fixture.calls.slice(0, commitIndex).includes("health:candidate-reload"));
+  assert.ok(fixture.calls.slice(0, commitIndex).includes("lock.assertOwned"));
+  assert.ok(fixture.calls.includes("canonical:parent-synced"));
+});
+
+test("forward rollout pre-commit failures never publish canonical and retain the lease", async (t) => {
+  const cases: Array<{
+    name: string;
+    fixture: ForwardFixture;
+    mutate?: (request: RolloutRequest) => RolloutRequest;
+    expectedCode: string;
+  }> = [];
+
+  cases.push({
+    name: "whole-plist mismatch",
+    fixture: await createForwardFixture(t),
+    mutate: (request) => ({ ...request, expectedLivePlistSha256: "0".repeat(64) }),
+    expectedCode: "LIVE_STATE_CAS_MISMATCH",
+  });
+  cases.push({
+    name: "disabled override",
+    fixture: await createForwardFixture(t, { disabled: true }),
+    expectedCode: "PERSISTENCE_CONTRACT_INVALID",
+  });
+  cases.push({
+    name: "self hosted",
+    fixture: await createForwardFixture(t, { selfHosted: true }),
+    expectedCode: "SELF_HOSTED_ROLLOUT_REFUSED",
+  });
+  cases.push({
+    name: "manifest mismatch",
+    fixture: await createForwardFixture(t),
+    mutate: (request) => ({ ...request, candidateSlotManifestSha256: "0".repeat(64) }),
+    expectedCode: "CANDIDATE_ARTIFACT_MISMATCH",
+  });
+  cases.push({
+    name: "old runtime generation drift",
+    fixture: await createForwardFixture(t, { oldRuntimeDriftsBeforeStop: true }),
+    expectedCode: "LIVE_STATE_CAS_MISMATCH",
+  });
+  cases.push({
+    name: "wrong first candidate listener",
+    fixture: await createForwardFixture(t, { firstCandidateListenerPid: 999 }),
+    expectedCode: "PRECONDITION_FAILED",
+  });
+  cases.push({
+    name: "first candidate health failure",
+    fixture: await createForwardFixture(t, { firstCandidateHealthy: false }),
+    expectedCode: "PRECONDITION_FAILED",
+  });
+  cases.push({
+    name: "controlled reload health failure",
+    fixture: await createForwardFixture(t, { reloadCandidateHealthy: false }),
+    expectedCode: "PRECONDITION_FAILED",
+  });
+  cases.push({
+    name: "pre-commit canonical drift",
+    fixture: await createForwardFixture(t, { preCommitCanonicalDrift: true }),
+    expectedCode: "LIVE_STATE_CAS_MISMATCH",
+  });
+
+  for (const entry of cases) {
+    const request = entry.mutate ? entry.mutate(entry.fixture.request) : entry.fixture.request;
+    const result = await runMacosLaunchdForwardPath(request, entry.fixture.adapters);
+    assert.equal(result.ok, false, entry.name);
+    assert.equal(result.code, entry.expectedCode, entry.name);
+    assert.equal(result.committed, false, entry.name);
+    assert.equal(entry.fixture.calls.includes("COMMITTED"), false, entry.name);
+    assert.equal(result.context.lease, entry.fixture.lease, entry.name);
+    assert.equal(entry.fixture.getReleaseCalls(), 0, `${entry.name}: forward path must retain the lock`);
+  }
+});
+
+test("forward rollout re-qualifies a same-slot KeepAlive replacement before commit", async (t) => {
+  const fixture = await createForwardFixture(t, { keepAliveReplacementBeforeCommit: true });
+  const result = await runMacosLaunchdForwardPath(fixture.request, fixture.adapters);
+  assert.equal(result.ok, true);
+  assert.equal(result.committed, true);
+  assert.equal(result.candidateProcess?.pid, 203);
+  assert.equal(fixture.calls.includes("COMMITTED"), true);
+});
+
+test("forward rollout preserves the lease when an adapter throws after old bootout", async (t) => {
+  const fixture = await createForwardFixture(t, { oldStopBarrierThrows: true });
+  const result = await runMacosLaunchdForwardPath(fixture.request, fixture.adapters);
+  assert.equal(result.ok, false);
+  assert.equal(result.phase, "old_stop");
+  assert.equal(result.code, "PRECONDITION_FAILED");
+  assert.equal(result.committed, false);
+  assert.equal(result.context.lease, fixture.lease);
+  assert.equal(fixture.getReleaseCalls(), 0);
 });

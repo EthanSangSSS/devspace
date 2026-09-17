@@ -578,9 +578,13 @@ export interface MacosRolloutAdapters {
   observeDisabledOverride(): Promise<ObservedState<"enabled" | "disabled">>;
   observeAncestors(pid: number): Promise<ObservedState<number[]>>;
   waitStopped(expected: ProcessIdentity): Promise<ObservedState<"stopped">>;
+  waitStable(expected: ProcessIdentity): Promise<ObservedState<"stable">>;
+  readFileSha256(path: string): Promise<ObservedState<string>>;
   preflightDurability(): Promise<void>;
 }
 ```
+
+`waitStable()` is the injected bounded observation-window gate used after each candidate start; `readFileSha256()` re-verifies the exact staged candidate plist before/after candidate qualification and immediately before commit. These are adapter methods rather than direct `fs`/timer calls in the state machine so ordinary tests remain deterministic.
 
 - [ ] **Step 1: Write failing parser/adapter unit tests**
 
@@ -705,6 +709,7 @@ export interface ForwardRolloutFailure {
     | "SPLIT_STATE_DETECTED"
     | "SELF_HOSTED_ROLLOUT_REFUSED";
   committed: boolean;
+  context: ForwardTransactionContext;
   initial?: InitialRolloutState;
   candidateProcess?: ProcessIdentity;
   candidateCanonicalSha256?: string;
@@ -714,11 +719,23 @@ export interface ForwardRolloutFailure {
 export interface ForwardRolloutSuccess {
   ok: true;
   committed: true;
+  context: ForwardTransactionContext;
   candidateProcess: ProcessIdentity;
   candidateCanonicalSha256: string;
 }
 
 export type ForwardRolloutResult = ForwardRolloutSuccess | ForwardRolloutFailure;
+
+export interface ForwardTransactionContext {
+  transactionId: string;
+  transactionNonce: string;
+  transactionDir: string;
+  candidatePlistPath: string;
+  lease: RolloutLockLease;
+  initial?: InitialRolloutState;
+  candidatePlistBytes?: Buffer;
+  candidatePlistSha256?: string;
+}
 
 export async function runMacosLaunchdForwardPath(
   request: RolloutRequest,
@@ -817,6 +834,8 @@ if (stopped.kind === "unproven") {
 No candidate bootstrap may run before `OLD_STOPPED_VERIFIED`.
 
 Task 5 deliberately returns a typed `ForwardRolloutFailure` instead of attempting rollback. Task 6 is the only task that turns a forward failure into pre-commit recovery or post-commit compensating rollback and then produces the public `RolloutOutcome`. This keeps forward ordering independently testable without temporary raw exceptions or duplicate recovery logic.
+
+The forward result retains the exact kernel `RolloutLockLease`; Task 5 must **not** release it. Task 6 owns the terminal `finally` release after recovery/compensating rollback/public outcome classification. This is required so the single-writer guarantee spans the entire forward + recovery transaction rather than ending at the Task 5 function boundary.
 
 - [ ] **Step 4: Implement double candidate boot + verification**
 

@@ -22,9 +22,11 @@ import {
   parsePrintDisabled,
   parseTxtLsof,
   prepareCanonicalTempFile,
+  readFileSha256,
   rewriteCandidatePlistBytes,
   syncDirectoryDurably,
   validateCanonicalFileIdentity,
+  waitForStableState,
   waitForStoppedState,
 } from "./macos-launchd-rollout-darwin.js";
 
@@ -272,6 +274,45 @@ test("stop barrier accepts only a fully stopped service and rejects incompatible
   }, { timeoutMs: 0, pollIntervalMs: 0 });
   assert.equal(incompatibleService.kind, "unproven");
   assert.match(incompatibleService.kind === "unproven" ? incompatibleService.reason : "", /incompatible same-label runtime/);
+});
+
+test("stability gate requires the same process generation, listener owner, and health after the observation window", async () => {
+  const expected = processIdentity();
+  const known = <T>(value: T) => ({ kind: "known" as const, value });
+  let slept = false;
+  const stable = await waitForStableState(expected, {
+    observeProcess: async () => known(expected),
+    observeListener: async () => known({ state: "owned" as const, ownerPid: expected.pid }),
+    checkHealth: async () => known("healthy" as const),
+  }, {
+    observationMs: 25,
+    sleep: async (ms) => { slept = ms === 25; },
+  });
+  assert.equal(slept, true);
+  assert.deepEqual(stable, { kind: "known", value: "stable" });
+
+  const replaced = await waitForStableState(expected, {
+    observeProcess: async () => known({ ...expected, processStartIdentity: "replacement" }),
+    observeListener: async () => known({ state: "owned" as const, ownerPid: expected.pid }),
+    checkHealth: async () => known("healthy" as const),
+  }, {
+    observationMs: 0,
+    sleep: async () => undefined,
+  });
+  assert.equal(replaced.kind, "unproven");
+  assert.match(replaced.kind === "unproven" ? replaced.reason : "", /process generation changed/);
+});
+
+test("file digest observation hashes exact bytes and fails closed on read errors", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-rollout-file-hash-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "candidate.plist");
+  await writeFile(path, "candidate\n");
+  assert.deepEqual(await readFileSha256(path), {
+    kind: "known",
+    value: createHash("sha256").update("candidate\n").digest("hex"),
+  });
+  assert.equal((await readFileSha256(join(root, "missing.plist"))).kind, "unproven");
 });
 
 const darwinTest = process.platform === "darwin" ? test : test.skip;

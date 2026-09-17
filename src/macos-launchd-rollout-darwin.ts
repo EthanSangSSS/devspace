@@ -60,6 +60,7 @@ const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_HEALTH_PATH = "/healthz";
 const DEFAULT_STOP_TIMEOUT_MS = 5_000;
 const DEFAULT_STOP_POLL_MS = 50;
+const DEFAULT_STABILITY_OBSERVATION_MS = 250;
 
 export interface CommandResult {
   stdout: string;
@@ -96,6 +97,7 @@ export interface DarwinRolloutAdapterOptions {
   sleep?: (ms: number) => Promise<void>;
   stopTimeoutMs?: number;
   stopPollIntervalMs?: number;
+  stabilityObservationMs?: number;
 }
 
 export function parseLaunchctlPrint(output: string): ObservedState<LaunchdObservation> {
@@ -329,6 +331,17 @@ export async function syncDirectoryDurably(
   }
 }
 
+export async function readFileSha256(path: string): Promise<ObservedState<string>> {
+  try {
+    return {
+      kind: "known",
+      value: createHash("sha256").update(await readFile(path)).digest("hex"),
+    };
+  } catch (error) {
+    return { kind: "unproven", reason: `unable to read file digest: ${errorMessage(error)}` };
+  }
+}
+
 export async function rewriteCandidatePlistBytes(
   oldBytes: Buffer,
   candidateEntrypoint: string,
@@ -402,6 +415,40 @@ export async function waitForStoppedState(
   }
 }
 
+export async function waitForStableState(
+  expected: ProcessIdentity,
+  probe: {
+    observeProcess(pid: number): Promise<ObservedState<ProcessIdentity>>;
+    observeListener(): Promise<ObservedState<ListenerObservation>>;
+    checkHealth(): Promise<ObservedState<"healthy" | "unhealthy">>;
+  },
+  options: {
+    observationMs: number;
+    sleep?: (ms: number) => Promise<void>;
+  },
+): Promise<ObservedState<"stable">> {
+  const sleep = options.sleep ?? delay;
+  await sleep(options.observationMs);
+  const [processState, listener, health] = await Promise.all([
+    probe.observeProcess(expected.pid),
+    probe.observeListener(),
+    probe.checkHealth(),
+  ]);
+  if (processState.kind === "unproven") return processState;
+  if (listener.kind === "unproven") return listener;
+  if (health.kind === "unproven") return health;
+  if (!sameProcessIdentity(processState.value, expected)) {
+    return { kind: "unproven", reason: "process generation changed during stability observation" };
+  }
+  if (listener.value.state !== "owned" || listener.value.ownerPid !== expected.pid) {
+    return { kind: "unproven", reason: "listener ownership changed during stability observation" };
+  }
+  if (health.value !== "healthy") {
+    return { kind: "unproven", reason: "health became unhealthy during stability observation" };
+  }
+  return { kind: "known", value: "stable" };
+}
+
 export function createDarwinRolloutAdapters(
   options: DarwinRolloutAdapterOptions = {},
 ): MacosRolloutAdapters {
@@ -422,6 +469,7 @@ export function createDarwinRolloutAdapters(
   const sleep = options.sleep ?? delay;
   const stopTimeoutMs = options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
   const stopPollIntervalMs = options.stopPollIntervalMs ?? DEFAULT_STOP_POLL_MS;
+  const stabilityObservationMs = options.stabilityObservationMs ?? DEFAULT_STABILITY_OBSERVATION_MS;
 
   const observeLaunchd = async (): Promise<ObservedState<LaunchdObservation>> => {
     const result = await runner.run("/bin/launchctl", ["print", serviceTarget]);
@@ -676,6 +724,19 @@ export function createDarwinRolloutAdapters(
         sleep,
       });
     },
+
+    waitStable(expected) {
+      return waitForStableState(expected, {
+        observeProcess,
+        observeListener,
+        checkHealth: adapters.checkHealth,
+      }, {
+        observationMs: stabilityObservationMs,
+        sleep,
+      });
+    },
+
+    readFileSha256,
 
     async preflightDurability() {
       const nonce = randomBytes(8).toString("hex");
