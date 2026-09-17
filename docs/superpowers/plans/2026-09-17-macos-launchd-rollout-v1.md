@@ -580,11 +580,12 @@ export interface MacosRolloutAdapters {
   waitStopped(expected: ProcessIdentity): Promise<ObservedState<"stopped">>;
   waitStable(expected: ProcessIdentity): Promise<ObservedState<"stable">>;
   readFileSha256(path: string): Promise<ObservedState<string>>;
+  observeFileIdentity(path: string): Promise<ObservedState<FileIdentity>>;
   preflightDurability(): Promise<void>;
 }
 ```
 
-`waitStable()` is the injected bounded observation-window gate used after each candidate start; `readFileSha256()` re-verifies the exact staged candidate plist before/after candidate qualification and immediately before commit. These are adapter methods rather than direct `fs`/timer calls in the state machine so ordinary tests remain deterministic.
+`waitStable()` is the injected bounded observation-window gate used after each candidate start; `readFileSha256()` re-verifies exact file bytes; `observeFileIdentity()` performs the fresh uid/gid/mode/device/inode/type/symlink observation required immediately before compensating restore. These are adapter methods rather than direct `fs`/timer calls in the state machine so ordinary tests remain deterministic.
 
 - [ ] **Step 1: Write failing parser/adapter unit tests**
 

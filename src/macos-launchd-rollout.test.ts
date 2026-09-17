@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   classifyRollbackRefusal,
+  runMacosLaunchdRollout,
   runMacosLaunchdForwardPath,
   type CanonicalPlistSnapshot,
   type LaunchdObservation,
@@ -82,6 +83,18 @@ interface ForwardFixtureOptions {
   preCommitCanonicalDrift?: boolean;
   keepAliveReplacementBeforeCommit?: boolean;
   oldStopBarrierThrows?: boolean;
+  oldBootoutLeavesRuntime?: boolean;
+  recoveryCanonicalDrift?: "hash" | "identity" | "unproven";
+  recoveryRuntimeUnproven?: boolean;
+  postCommitHealthFailure?: boolean;
+  postCommitRuntimeDrift?: boolean;
+  postCommitRuntimeAbsent?: boolean;
+  postCommitUnrelatedListener?: boolean;
+  postCommitLockDrift?: boolean;
+  postCommitLockUnproven?: boolean;
+  rollbackFinalCanonicalDrift?: boolean;
+  rollbackOldTempDrift?: boolean;
+  rollbackBootstrapFails?: boolean;
 }
 
 interface ForwardFixture {
@@ -120,12 +133,29 @@ async function createForwardFixture(
   const candidateFirst = forwardProcess(201, candidateEntrypoint, "candidate-generation-1");
   const candidateReload = forwardProcess(202, candidateEntrypoint, "candidate-generation-2");
   const candidateReplacement = forwardProcess(203, candidateEntrypoint, "candidate-generation-3");
+  const oldRestored = forwardProcess(102, oldEntrypoint, "old-generation-restored");
+  const foreignRuntime = forwardProcess(
+    909,
+    "/Users/ethan/.local/opt/foreign/node_modules/@waishnav/devspace/dist/cli.js",
+    "foreign-generation",
+  );
   const calls: string[] = [];
-  let phase: "old" | "stopped" | "candidate-first" | "candidate-first-stopped" | "candidate-reload" = "old";
+  let phase:
+    | "old"
+    | "stopped"
+    | "candidate-first"
+    | "candidate-first-stopped"
+    | "candidate-reload"
+    | "rollback-candidate-stopped"
+    | "old-restored" = "old";
   let canonicalCommitted = false;
   let oldProcessReads = 0;
   let releaseCalls = 0;
   let replacementActive = false;
+  let forwardFailed = false;
+  let rollbackTempPrepared = false;
+  let preparedTempKind: "candidate" | "old" | undefined;
+  let preparedTempPath = "/tmp/candidate.tmp";
 
   const canonicalIdentity = {
     path: "/Users/ethan/Library/LaunchAgents/com.ethan.devspace.plist",
@@ -156,7 +186,7 @@ async function createForwardFixture(
   const candidateCanonical: CanonicalPlistSnapshot = {
     bytes: candidateBytes,
     sha256: candidateSha,
-    identity: { ...canonicalIdentity, inode: 11 },
+    identity: { ...canonicalIdentity, inode: 20 },
     parentIdentity,
     entrypointRealpath: candidateEntrypoint,
     runAtLoad: true,
@@ -175,6 +205,12 @@ async function createForwardFixture(
     },
     async assertOwned() {
       calls.push("lock.assertOwned");
+      if (forwardFailed && canonicalCommitted && options.postCommitLockUnproven) {
+        return unproven("rollout lock state cannot be proven");
+      }
+      if (forwardFailed && canonicalCommitted && options.postCommitLockDrift) {
+        return known("drift");
+      }
       return known("owned");
     },
     async release() {
@@ -190,12 +226,18 @@ async function createForwardFixture(
       case "candidate-first":
         return { loaded: true, pid: candidateFirst.pid, runCount: 1, normalizedArgv: candidateFirst.normalizedArgv };
       case "candidate-reload":
+        if (forwardFailed && options.postCommitRuntimeDrift) {
+          return { loaded: true, pid: foreignRuntime.pid, runCount: 4, normalizedArgv: foreignRuntime.normalizedArgv };
+        }
         return replacementActive
           ? { loaded: true, pid: candidateReplacement.pid, runCount: 3, normalizedArgv: candidateReplacement.normalizedArgv }
           : { loaded: true, pid: candidateReload.pid, runCount: 2, normalizedArgv: candidateReload.normalizedArgv };
       case "stopped":
       case "candidate-first-stopped":
+      case "rollback-candidate-stopped":
         return { loaded: false };
+      case "old-restored":
+        return { loaded: true, pid: oldRestored.pid, runCount: 2, normalizedArgv: oldRestored.normalizedArgv };
     }
   };
 
@@ -210,6 +252,10 @@ async function createForwardFixture(
     if (phase === "candidate-first" && pid === candidateFirst.pid) return candidateFirst;
     if (phase === "candidate-reload" && !replacementActive && pid === candidateReload.pid) return candidateReload;
     if (phase === "candidate-reload" && replacementActive && pid === candidateReplacement.pid) return candidateReplacement;
+    if (phase === "candidate-reload" && forwardFailed && options.postCommitRuntimeDrift && pid === foreignRuntime.pid) {
+      return foreignRuntime;
+    }
+    if (phase === "old-restored" && pid === oldRestored.pid) return oldRestored;
     return undefined;
   };
 
@@ -218,14 +264,25 @@ async function createForwardFixture(
       case "old": return { state: "owned", ownerPid: oldProcess.pid };
       case "candidate-first": return {
         state: "owned",
-        ownerPid: options.firstCandidateListenerPid ?? candidateFirst.pid,
+        ownerPid: (() => {
+          if (options.firstCandidateListenerPid !== undefined && options.firstCandidateListenerPid !== candidateFirst.pid) {
+            forwardFailed = true;
+          }
+          return options.firstCandidateListenerPid ?? candidateFirst.pid;
+        })(),
       };
       case "candidate-reload": return {
         state: "owned",
-        ownerPid: replacementActive ? candidateReplacement.pid : candidateReload.pid,
+        ownerPid: forwardFailed && options.postCommitUnrelatedListener
+          ? 999
+          : forwardFailed && options.postCommitRuntimeDrift
+            ? foreignRuntime.pid
+            : replacementActive ? candidateReplacement.pid : candidateReload.pid,
       };
       case "stopped":
-      case "candidate-first-stopped": return { state: "unowned" };
+      case "candidate-first-stopped":
+      case "rollback-candidate-stopped": return { state: "unowned" };
+      case "old-restored": return { state: "owned", ownerPid: oldRestored.pid };
     }
   };
 
@@ -236,6 +293,23 @@ async function createForwardFixture(
     },
     async readCanonical() {
       calls.push(canonicalCommitted ? "canonical:candidate" : "canonical:old");
+      if (forwardFailed && !canonicalCommitted) {
+        if (options.recoveryCanonicalDrift === "unproven") {
+          return unproven("canonical recovery observation failed");
+        }
+        if (options.recoveryCanonicalDrift === "hash") {
+          return known({ ...oldCanonical, sha256: "e".repeat(64) });
+        }
+        if (options.recoveryCanonicalDrift === "identity") {
+          return known({
+            ...oldCanonical,
+            identity: { ...oldCanonical.identity, mode: 0o600 },
+          });
+        }
+      }
+      if (canonicalCommitted && rollbackTempPrepared && options.rollbackFinalCanonicalDrift) {
+        return known({ ...candidateCanonical, sha256: "d".repeat(64) });
+      }
       if (options.preCommitCanonicalDrift && phase === "candidate-reload" && !canonicalCommitted) {
         return known({ ...oldCanonical, sha256: "f".repeat(64) });
       }
@@ -252,10 +326,27 @@ async function createForwardFixture(
     async writeOldBackup() { calls.push("BACKED_UP"); },
     async writeCandidateEvidence() { calls.push("CANDIDATE_STAGED"); },
     async prepareCanonicalTemp() {
-      calls.push("canonical:temp-prepared");
-      return { path: "/tmp/candidate.tmp", sha256: candidateSha, identity: canonicalIdentity };
+      const isOld = arguments[0]?.expectedSha256 === oldSha;
+      preparedTempKind = isOld ? "old" : "candidate";
+      preparedTempPath = isOld ? "/tmp/old-restore.tmp" : "/tmp/candidate.tmp";
+      if (isOld) rollbackTempPrepared = true;
+      calls.push(isOld ? "rollback:old-temp-prepared" : "canonical:temp-prepared");
+      return {
+        path: preparedTempPath,
+        sha256: isOld ? oldSha : candidateSha,
+        identity: {
+          ...canonicalIdentity,
+          path: preparedTempPath,
+          inode: isOld ? 30 : 20,
+        },
+      };
     },
-    async atomicReplaceCanonical() {
+    async atomicReplaceCanonical(tempPath) {
+      if (preparedTempKind === "old" && tempPath === preparedTempPath) {
+        calls.push("ROLLBACK_RESTORED_CANONICAL");
+        canonicalCommitted = false;
+        return;
+      }
       calls.push("COMMITTED");
       canonicalCommitted = true;
     },
@@ -266,6 +357,9 @@ async function createForwardFixture(
     },
     async observeProcess(pid) {
       calls.push(`process:${pid}`);
+      if (forwardFailed && options.recoveryRuntimeUnproven) {
+        return unproven("runtime recovery observation failed");
+      }
       const processValue = currentProcess(pid);
       return processValue ? known(processValue) : unproven(`PID ${pid} is not current`);
     },
@@ -275,17 +369,42 @@ async function createForwardFixture(
     },
     async checkHealth() {
       calls.push(`health:${phase}`);
-      if (phase === "candidate-first" && options.firstCandidateHealthy === false) return known("unhealthy");
-      if (phase === "candidate-reload" && options.reloadCandidateHealthy === false) return known("unhealthy");
+      if (phase === "candidate-first" && options.firstCandidateHealthy === false) {
+        forwardFailed = true;
+        return known("unhealthy");
+      }
+      if (phase === "candidate-reload" && options.reloadCandidateHealthy === false) {
+        forwardFailed = true;
+        return known("unhealthy");
+      }
+      if (phase === "candidate-reload" && canonicalCommitted && options.postCommitHealthFailure && !forwardFailed) {
+        forwardFailed = true;
+        if (options.postCommitRuntimeAbsent) phase = "rollback-candidate-stopped";
+        return known("unhealthy");
+      }
       return known("healthy");
     },
     async bootoutExpected(expected) {
       calls.push(expected.pid === oldProcess.pid ? "OLD_STOP_REQUESTED" : "CANDIDATE_STOP_REQUESTED");
-      if (expected.pid === oldProcess.pid && phase === "old") phase = "stopped";
+      if (expected.pid === oldProcess.pid && phase === "old") {
+        if (!options.oldBootoutLeavesRuntime) phase = "stopped";
+      }
       else if (expected.pid === candidateFirst.pid && phase === "candidate-first") phase = "candidate-first-stopped";
+      else if (
+        phase === "candidate-reload"
+        && (expected.pid === candidateReload.pid || expected.pid === candidateReplacement.pid)
+      ) {
+        phase = "rollback-candidate-stopped";
+      }
       else throw new Error("unexpected bootout target");
     },
-    async bootstrap() {
+    async bootstrap(plistPath) {
+      if (forwardFailed && plistPath === canonicalIdentity.path) {
+        calls.push("ROLLBACK_BOOTSTRAP_OLD");
+        if (options.rollbackBootstrapFails) throw new Error("old bootstrap failed");
+        phase = "old-restored";
+        return;
+      }
       if (phase === "stopped") {
         phase = "candidate-first";
         calls.push("CANDIDATE_STARTED");
@@ -307,7 +426,12 @@ async function createForwardFixture(
     async waitStopped(expected) {
       calls.push(expected.pid === oldProcess.pid ? "OLD_STOPPED_VERIFIED" : "CANDIDATE_STOPPED_VERIFIED");
       if (expected.pid === oldProcess.pid && options.oldStopBarrierThrows) {
+        forwardFailed = true;
         throw new Error("stop barrier observation failed");
+      }
+      if (expected.pid === oldProcess.pid && options.oldBootoutLeavesRuntime) {
+        forwardFailed = true;
+        return unproven("old runtime remained active after bootout request");
       }
       return known("stopped");
     },
@@ -315,9 +439,40 @@ async function createForwardFixture(
       calls.push(`stable:${expected.pid}`);
       return known("stable");
     },
-    async readFileSha256() {
-      calls.push("staged:hash");
+    async readFileSha256(path) {
+      calls.push(`file-hash:${path}`);
+      if (path === canonicalIdentity.path) {
+        if (forwardFailed && !canonicalCommitted && options.recoveryCanonicalDrift === "hash") {
+          return known("e".repeat(64));
+        }
+        if (canonicalCommitted && rollbackTempPrepared && options.rollbackFinalCanonicalDrift) {
+          return known("d".repeat(64));
+        }
+        return known(canonicalCommitted ? candidateSha : oldSha);
+      }
+      if (path === preparedTempPath && preparedTempKind === "old") {
+        return known(options.rollbackOldTempDrift ? "c".repeat(64) : oldSha);
+      }
       return known(candidateSha);
+    },
+    async observeFileIdentity(path) {
+      calls.push(`file-identity:${path}`);
+      if (path === canonicalIdentity.path) {
+        if (forwardFailed && !canonicalCommitted && options.recoveryCanonicalDrift === "identity") {
+          return known({ ...canonicalIdentity, mode: 0o600 });
+        }
+        return known(canonicalCommitted ? candidateCanonical.identity : canonicalIdentity);
+      }
+      if (path === parentIdentity.path) return known(parentIdentity);
+      if (path === preparedTempPath && preparedTempKind === "old") {
+        return known({
+          ...canonicalIdentity,
+          path,
+          inode: 30,
+          ...(options.rollbackOldTempDrift ? { mode: 0o600 } : {}),
+        });
+      }
+      return known(canonicalIdentity);
     },
     async preflightDurability() { calls.push("durability:preflight"); },
   };
@@ -448,4 +603,199 @@ test("forward rollout preserves the lease when an adapter throws after old booto
   assert.equal(result.committed, false);
   assert.equal(result.context.lease, fixture.lease);
   assert.equal(fixture.getReleaseCalls(), 0);
+});
+
+test("pre-commit recovery reuses an exact old runtime that survived the stop request", async (t) => {
+  const fixture = await createForwardFixture(t, { oldBootoutLeavesRuntime: true });
+  const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+
+  assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
+  assert.equal(outcome.committed, false);
+  assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), false);
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+test("pre-commit recovery stops an owned candidate then bootstraps the unchanged old canonical", async (t) => {
+  const fixture = await createForwardFixture(t, { firstCandidateHealthy: false });
+  const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+
+  assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
+  assert.equal(outcome.committed, false);
+  assert.equal(fixture.calls.includes("CANDIDATE_STOP_REQUESTED"), true);
+  assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), true);
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+test("pre-commit recovery skips bootout for confirmed candidate absence", async (t) => {
+  const fixture = await createForwardFixture(t, { oldStopBarrierThrows: true });
+  const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+
+  assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
+  assert.equal(fixture.calls.includes("CANDIDATE_STOP_REQUESTED"), false);
+  assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), true);
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+test("pre-commit recovery classifies concrete canonical/runtime drift separately from unproven state", async (t) => {
+  const cases = [
+    {
+      name: "canonical hash drift",
+      fixture: await createForwardFixture(t, {
+        firstCandidateHealthy: false,
+        recoveryCanonicalDrift: "hash",
+      }),
+      code: "ROLLBACK_REFUSED_CONCURRENT_DRIFT",
+    },
+    {
+      name: "canonical file identity drift",
+      fixture: await createForwardFixture(t, {
+        firstCandidateHealthy: false,
+        recoveryCanonicalDrift: "identity",
+      }),
+      code: "ROLLBACK_REFUSED_CONCURRENT_DRIFT",
+    },
+    {
+      name: "canonical state unproven",
+      fixture: await createForwardFixture(t, {
+        firstCandidateHealthy: false,
+        recoveryCanonicalDrift: "unproven",
+      }),
+      code: "ROLLBACK_REFUSED_UNPROVEN_STATE",
+    },
+    {
+      name: "runtime state unproven",
+      fixture: await createForwardFixture(t, {
+        firstCandidateHealthy: false,
+        recoveryRuntimeUnproven: true,
+      }),
+      code: "ROLLBACK_REFUSED_UNPROVEN_STATE",
+    },
+    {
+      name: "unrelated listener owner",
+      fixture: await createForwardFixture(t, { firstCandidateListenerPid: 999 }),
+      code: "ROLLBACK_REFUSED_CONCURRENT_DRIFT",
+    },
+  ] as const;
+
+  for (const entry of cases) {
+    const outcome = await runMacosLaunchdRollout(entry.fixture.request, entry.fixture.adapters);
+    assert.equal(outcome.code, entry.code, entry.name);
+    assert.equal(entry.fixture.calls.includes("ROLLBACK_RESTORED_CANONICAL"), false, entry.name);
+    assert.equal(entry.fixture.getReleaseCalls(), 1, entry.name);
+  }
+});
+
+test("post-commit qualification failure performs runtime-aware compensating rollback", async (t) => {
+  const fixture = await createForwardFixture(t, { postCommitHealthFailure: true });
+  const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+
+  assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
+  assert.equal(outcome.committed, true, "candidate commit occurred before compensation");
+  assert.equal(fixture.calls.includes("ROLLBACK_RESTORED_CANONICAL"), true);
+  assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), true);
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+test("post-commit rollback accepts confirmed candidate absence without bootout", async (t) => {
+  const fixture = await createForwardFixture(t, {
+    postCommitHealthFailure: true,
+    postCommitRuntimeAbsent: true,
+  });
+  const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+
+  assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
+  const candidateStops = fixture.calls.filter((call) => call === "CANDIDATE_STOP_REQUESTED");
+  assert.equal(candidateStops.length, 1, "only the controlled-reload stop should occur");
+  assert.equal(fixture.calls.includes("ROLLBACK_RESTORED_CANONICAL"), true);
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+test("post-commit rollback refuses concrete drift and distinguishes unproven lock state", async (t) => {
+  const cases = [
+    {
+      name: "unexpected same-label runtime",
+      fixture: await createForwardFixture(t, { postCommitHealthFailure: true, postCommitRuntimeDrift: true }),
+      code: "ROLLBACK_REFUSED_CONCURRENT_DRIFT",
+    },
+    {
+      name: "unrelated listener",
+      fixture: await createForwardFixture(t, { postCommitHealthFailure: true, postCommitUnrelatedListener: true }),
+      code: "ROLLBACK_REFUSED_CONCURRENT_DRIFT",
+    },
+    {
+      name: "lock or owner nonce drift",
+      fixture: await createForwardFixture(t, { postCommitHealthFailure: true, postCommitLockDrift: true }),
+      code: "ROLLBACK_REFUSED_CONCURRENT_DRIFT",
+    },
+    {
+      name: "lock state unproven",
+      fixture: await createForwardFixture(t, { postCommitHealthFailure: true, postCommitLockUnproven: true }),
+      code: "ROLLBACK_REFUSED_UNPROVEN_STATE",
+    },
+  ] as const;
+
+  for (const entry of cases) {
+    const outcome = await runMacosLaunchdRollout(entry.fixture.request, entry.fixture.adapters);
+    assert.equal(outcome.code, entry.code, entry.name);
+    assert.equal(entry.fixture.calls.includes("ROLLBACK_RESTORED_CANONICAL"), false, entry.name);
+    assert.equal(entry.fixture.getReleaseCalls(), 1, entry.name);
+  }
+});
+
+test("rollback final revalidation refuses drift after initial eligibility and before restore rename", async (t) => {
+  const canonicalDrift = await createForwardFixture(t, {
+    postCommitHealthFailure: true,
+    rollbackFinalCanonicalDrift: true,
+  });
+  const canonicalOutcome = await runMacosLaunchdRollout(canonicalDrift.request, canonicalDrift.adapters);
+  assert.equal(canonicalOutcome.code, "ROLLBACK_REFUSED_CONCURRENT_DRIFT");
+  assert.equal(canonicalDrift.calls.includes("rollback:old-temp-prepared"), true);
+  assert.equal(canonicalDrift.calls.includes("ROLLBACK_RESTORED_CANONICAL"), false);
+  assert.equal(canonicalDrift.getReleaseCalls(), 1);
+
+  const tempDrift = await createForwardFixture(t, {
+    postCommitHealthFailure: true,
+    rollbackOldTempDrift: true,
+  });
+  const tempOutcome = await runMacosLaunchdRollout(tempDrift.request, tempDrift.adapters);
+  assert.equal(tempOutcome.code, "ROLLBACK_REFUSED_CONCURRENT_DRIFT");
+  assert.equal(tempDrift.calls.includes("rollback:old-temp-prepared"), true);
+  assert.equal(tempDrift.calls.includes("ROLLBACK_RESTORED_CANONICAL"), false);
+  assert.equal(tempDrift.getReleaseCalls(), 1);
+});
+
+test("rollback reports failure when old canonical cannot be bootstrapped after an eligible recovery", async (t) => {
+  const fixture = await createForwardFixture(t, {
+    firstCandidateHealthy: false,
+    rollbackBootstrapFails: true,
+  });
+  const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+
+  assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_FAILED");
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+test("public rollout acknowledges a verified candidate and releases the kernel lease", async (t) => {
+  const fixture = await createForwardFixture(t);
+  const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+  assert.equal(outcome.code, "ROLLOUT_OK");
+  assert.equal(outcome.committed, true);
+  assert.equal(outcome.controlledReload, "PASS");
+  assert.equal(outcome.persistenceStaticContract, "PASS");
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+test("public rollout preserves typed lock acquisition failures", async (t) => {
+  for (const code of ["LOCK_BUSY", "LOCK_AMBIGUOUS"] as const) {
+    const fixture = await createForwardFixture(t);
+    fixture.adapters.acquireLock = async () => {
+      const error = new Error(code) as Error & { code: typeof code };
+      error.code = code;
+      throw error;
+    };
+    const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+    assert.equal(outcome.code, code);
+    assert.equal(outcome.committed, false);
+    assert.equal(fixture.getReleaseCalls(), 0);
+  }
 });

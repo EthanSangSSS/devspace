@@ -342,6 +342,14 @@ export async function readFileSha256(path: string): Promise<ObservedState<string
   }
 }
 
+export async function observeFileIdentity(path: string): Promise<ObservedState<FileIdentity>> {
+  try {
+    return { kind: "known", value: await fileIdentity(path) };
+  } catch (error) {
+    return { kind: "unproven", reason: `unable to observe file identity: ${errorMessage(error)}` };
+  }
+}
+
 export async function rewriteCandidatePlistBytes(
   oldBytes: Buffer,
   candidateEntrypoint: string,
@@ -737,6 +745,7 @@ export function createDarwinRolloutAdapters(
     },
 
     readFileSha256,
+    observeFileIdentity,
 
     async preflightDurability() {
       const nonce = randomBytes(8).toString("hex");

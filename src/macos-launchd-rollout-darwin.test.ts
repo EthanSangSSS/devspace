@@ -21,6 +21,7 @@ import {
   parseParentPid,
   parsePrintDisabled,
   parseTxtLsof,
+  observeFileIdentity,
   prepareCanonicalTempFile,
   readFileSha256,
   rewriteCandidatePlistBytes,
@@ -313,6 +314,24 @@ test("file digest observation hashes exact bytes and fails closed on read errors
     value: createHash("sha256").update("candidate\n").digest("hex"),
   });
   assert.equal((await readFileSha256(join(root, "missing.plist"))).kind, "unproven");
+});
+
+test("file identity observation fresh-reads uid/gid/mode and fails closed on missing paths", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-rollout-file-identity-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "old-restore.tmp");
+  await writeFile(path, "old", { mode: 0o640 });
+
+  const observed = await observeFileIdentity(path);
+  assert.equal(observed.kind, "known");
+  if (observed.kind === "known") {
+    assert.equal(observed.value.path, path);
+    assert.equal(observed.value.kind, "file");
+    assert.equal(observed.value.symlink, false);
+    assert.equal(observed.value.mode, 0o640);
+  }
+
+  assert.equal((await observeFileIdentity(join(root, "missing.tmp"))).kind, "unproven");
 });
 
 const darwinTest = process.platform === "darwin" ? test : test.skip;
