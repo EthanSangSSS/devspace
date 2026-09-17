@@ -498,11 +498,18 @@ darwinTest("health check uses a bounded timeout signal and classifies timeout as
     observedSignal = init?.signal ?? undefined;
     assert.ok(observedSignal, "health fetch must receive an AbortSignal");
     return await new Promise<Response>((_resolve, reject) => {
+      const guard = setTimeout(() => {
+        reject(new Error("health timeout signal did not abort before the guard deadline"));
+      }, 250);
       if (observedSignal!.aborted) {
+        clearTimeout(guard);
         reject(observedSignal!.reason);
         return;
       }
-      observedSignal!.addEventListener("abort", () => reject(observedSignal!.reason), { once: true });
+      observedSignal!.addEventListener("abort", () => {
+        clearTimeout(guard);
+        reject(observedSignal!.reason);
+      }, { once: true });
     });
   }) as typeof fetch;
   try {
