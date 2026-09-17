@@ -625,16 +625,18 @@ Required command surfaces:
 /usr/bin/plutil -extract RunAtLoad raw -o - <plist-path>
 /usr/bin/plutil -extract KeepAlive raw -o - <plist-path>
 /usr/bin/plutil -extract ProgramArguments json -o - <plist-path>
-/usr/bin/plutil -replace ProgramArguments.1 -string <candidate-entrypoint> <staged-plist-path>
+/usr/bin/plutil -remove ProgramArguments.1 <staged-plist-path>
+/usr/bin/plutil -insert ProgramArguments.1 -string <candidate-entrypoint> <staged-plist-path>
 /usr/bin/plutil -lint <staged-plist-path>
 /bin/ps -p <pid> -o lstart=
+/bin/ps -p <pid> -o comm=
 /usr/sbin/lsof -a -p <pid> -d txt -Fn
 /usr/sbin/lsof -nP -a -iTCP@127.0.0.1:<port> -sTCP:LISTEN -Fp
 ```
 
 If actual binary paths differ on the target host, qualification fails closed; do not PATH-search a different tool silently.
 
-The qualified `launchctl print` parser must extract `pid`, `runs`, and the loaded job `arguments` array. Build `ProcessIdentity.processStartIdentity` from the observed PID generation evidence (`runs` plus the exact `ps lstart` text), use the loaded launchd arguments as `normalizedArgv`, and use `lsof -d txt` to resolve the executable realpath. Extract and realpath the DevSpace entrypoint from that normalized argument array. The disposable qualification must prove that the parser preserves an argument containing a space; do not fall back to splitting a `ps command` string on whitespace.
+The qualified `launchctl print` parser must extract `pid`, `runs`, and the loaded job `arguments` array. Build `ProcessIdentity.processStartIdentity` from the observed PID generation evidence (`runs` plus the exact `ps lstart` text) and use the loaded launchd arguments as `normalizedArgv`. On the target macOS 27.0 host, `lsof -d txt` was observed to return the executable plus many dylib/text mappings, so implementation must not assume that exactly one `txt` path exists or that the first path is a stable API. Use `ps -o comm=` as the single executable-path candidate, realpath it, require it to match the realpath of launchd `argv[0]`, and independently corroborate that realpath against the complete `lsof -d txt` path set. Extract and realpath the DevSpace entrypoint from the normalized launchd argument array. The disposable qualification must prove that the parser preserves an argument containing a space; do not split `ps command` or launchd argument strings on whitespace.
 
 - [ ] **Step 4: Implement canonical file/durability primitives**
 

@@ -16,15 +16,18 @@ import { promisify } from "node:util";
 import type { FileIdentity, ProcessIdentity } from "./macos-launchd-rollout.js";
 import {
   buildProcessIdentityFromObservations,
+  buildQualificationFixture,
   parseLaunchctlPrint,
   parseListenerLsof,
   parseParentPid,
+  parsePsCommand,
   parsePrintDisabled,
   parseTxtLsof,
   observeFileIdentity,
   prepareCanonicalTempFile,
   readFileSha256,
   rewriteCandidatePlistBytes,
+  runDarwinQualificationSequence,
   syncDirectoryDurably,
   validateCanonicalFileIdentity,
   waitForStableState,
@@ -117,10 +120,33 @@ test("disabled-service parser is exact and fails closed on unknown output", asyn
 });
 
 test("process and listener parsers preserve exact identity without whitespace splitting", async () => {
-  assert.deepEqual(parseTxtLsof("p32479\nftxt\nn/opt/homebrew/bin/node\n"), {
+  const txt = [
+    "p32479",
+    "ftxt",
+    "n/opt/homebrew/Cellar/node@24/24.19.0/bin/node",
+    "ftxt",
+    "n/opt/homebrew/Cellar/libuv/1.52.1/lib/libuv.1.0.0.dylib",
+    "ftxt",
+    "n/usr/lib/dyld",
+    "",
+  ].join("\n");
+  assert.deepEqual(parseTxtLsof(txt), {
     kind: "known",
-    value: "/opt/homebrew/bin/node",
+    value: [
+      "/opt/homebrew/Cellar/node@24/24.19.0/bin/node",
+      "/opt/homebrew/Cellar/libuv/1.52.1/lib/libuv.1.0.0.dylib",
+      "/usr/lib/dyld",
+    ],
   });
+  assert.deepEqual(parsePsCommand("/opt/homebrew/opt/node@24/bin/node\n"), {
+    kind: "known",
+    value: "/opt/homebrew/opt/node@24/bin/node",
+  });
+  assert.deepEqual(parsePsCommand("/Applications/Node With Space/node\n"), {
+    kind: "known",
+    value: "/Applications/Node With Space/node",
+  });
+  assert.equal(parsePsCommand("/one\n/two\n").kind, "unproven");
   assert.deepEqual(parseListenerLsof("p32479\n", 0), {
     kind: "known",
     value: { state: "owned", ownerPid: 32479 },
@@ -140,15 +166,18 @@ test("process and listener parsers preserve exact identity without whitespace sp
     pid: 32479,
     launchd: launchd.value,
     psStartOutput: "Thu Sep 17 10:00:00 2026\n",
-    executablePath: "/opt/homebrew/bin/node",
-    realpath: async (path: string) => path,
+    psCommandOutput: "/opt/homebrew/opt/node@24/bin/node\n",
+    lsofTextOutput: txt,
+    realpath: async (path: string) => path === "/opt/homebrew/opt/node@24/bin/node"
+      ? "/opt/homebrew/Cellar/node@24/24.19.0/bin/node"
+      : path,
   });
   assert.deepEqual(observed, {
     kind: "known",
     value: {
       pid: 32479,
       processStartIdentity: "2:Thu Sep 17 10:00:00 2026",
-      executableRealpath: "/opt/homebrew/bin/node",
+      executableRealpath: "/opt/homebrew/Cellar/node@24/24.19.0/bin/node",
       normalizedArgv: [
         "/opt/homebrew/opt/node@24/bin/node",
         "/Users/ethan/Slot With Space/node_modules/@waishnav/devspace/dist/cli.js",
@@ -158,6 +187,20 @@ test("process and listener parsers preserve exact identity without whitespace sp
         "/Users/ethan/Slot With Space/node_modules/@waishnav/devspace/dist/cli.js",
     },
   });
+
+  const notCorroborated = await buildProcessIdentityFromObservations({
+    pid: 32479,
+    launchd: launchd.value,
+    psStartOutput: "Thu Sep 17 10:00:00 2026\n",
+    psCommandOutput: "/opt/homebrew/opt/node@24/bin/node\n",
+    lsofTextOutput: "p32479\nftxt\nn/usr/lib/dyld\n",
+    realpath: async (path: string) => path,
+  });
+  assert.equal(notCorroborated.kind, "unproven");
+  assert.match(
+    notCorroborated.kind === "unproven" ? notCorroborated.reason : "",
+    /not corroborated/i,
+  );
 });
 
 test("canonical file identity validation rejects symlink, unsafe mode, owner, and parent drift", async () => {
@@ -332,6 +375,87 @@ test("file identity observation fresh-reads uid/gid/mode and fails closed on mis
   }
 
   assert.equal((await observeFileIdentity(join(root, "missing.tmp"))).kind, "unproven");
+});
+
+test("qualification orchestration is ordered, bounded, and always cleans up", async () => {
+  const calls: string[] = [];
+  const result = await runDarwinQualificationSequence({
+    async macosVersion() { calls.push("version"); return "27.0"; },
+    async qualifyLock() { calls.push("lock"); },
+    async qualifyDurability() { calls.push("durability"); },
+    async bootstrap() { calls.push("bootstrap"); },
+    async verifyLaunchd() { calls.push("launchd"); },
+    async verifyPrintDisabled() { calls.push("print-disabled"); },
+    async verifyProcess() { calls.push("process"); },
+    async verifyListener() { calls.push("listener"); },
+    async verifyHealth() { calls.push("health"); },
+    async verifyStopBarrier() { calls.push("stop-barrier"); },
+    async cleanup() { calls.push("cleanup"); },
+    label: "com.ethan.devspace.rollout-qualification.test",
+    port: 49123,
+  });
+  assert.deepEqual(calls, [
+    "version",
+    "lock",
+    "durability",
+    "bootstrap",
+    "launchd",
+    "print-disabled",
+    "process",
+    "listener",
+    "health",
+    "stop-barrier",
+    "cleanup",
+  ]);
+  assert.equal(result.ok, true);
+  assert.equal(result.macosVersion, "27.0");
+  assert.equal(result.cleanup, "PASS");
+
+  const failedCalls: string[] = [];
+  await assert.rejects(() => runDarwinQualificationSequence({
+    async macosVersion() { failedCalls.push("version"); return "27.0"; },
+    async qualifyLock() { failedCalls.push("lock"); },
+    async qualifyDurability() { failedCalls.push("durability"); throw new Error("fsync unavailable"); },
+    async bootstrap() { failedCalls.push("bootstrap"); },
+    async verifyLaunchd() { failedCalls.push("launchd"); },
+    async verifyPrintDisabled() { failedCalls.push("print-disabled"); },
+    async verifyProcess() { failedCalls.push("process"); },
+    async verifyListener() { failedCalls.push("listener"); },
+    async verifyHealth() { failedCalls.push("health"); },
+    async verifyStopBarrier() { failedCalls.push("stop-barrier"); },
+    async cleanup() { failedCalls.push("cleanup"); },
+    label: "com.ethan.devspace.rollout-qualification.test",
+    port: 49123,
+  }), /fsync unavailable/);
+  assert.deepEqual(failedCalls, ["version", "lock", "durability", "cleanup"]);
+});
+
+test("qualification fixture is disposable, non-production, and exercises an argv path with spaces", () => {
+  const fixture = buildQualificationFixture({
+    nonce: "abc123",
+    port: 49123,
+    homeDir: "/Users/test",
+    tempRoot: "/tmp",
+    nodeExecutable: "/opt/homebrew/bin/node",
+  });
+  assert.equal(fixture.label, "com.ethan.devspace.rollout-qualification.abc123");
+  assert.notEqual(fixture.label, "com.ethan.devspace");
+  assert.equal(fixture.port, 49123);
+  assert.equal(
+    fixture.plistPath,
+    "/Users/test/Library/LaunchAgents/com.ethan.devspace.rollout-qualification.abc123.plist",
+  );
+  assert.match(fixture.entrypointPath, /Qualification Slot With Space/);
+  assert.match(fixture.entrypointPath, /node_modules\/@waishnav\/devspace\/dist\/cli\.js$/);
+  assert.match(fixture.plistBytes.toString("utf8"), /DEVSPACE_QUALIFICATION_PORT/);
+  assert.match(fixture.plistBytes.toString("utf8"), /49123/);
+  assert.throws(() => buildQualificationFixture({
+    nonce: "bad",
+    port: 7676,
+    homeDir: "/Users/test",
+    tempRoot: "/tmp",
+    nodeExecutable: "/opt/homebrew/bin/node",
+  }), /production port/i);
 });
 
 const darwinTest = process.platform === "darwin" ? test : test.skip;

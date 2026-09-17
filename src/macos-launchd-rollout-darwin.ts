@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { createServer as createNetServer } from "node:net";
 import {
   closeSync,
   constants as fsConstants,
@@ -100,6 +101,380 @@ export interface DarwinRolloutAdapterOptions {
   stabilityObservationMs?: number;
 }
 
+export interface DarwinQualificationSteps {
+  label: string;
+  port: number;
+  macosVersion(): Promise<string>;
+  qualifyLock(): Promise<void>;
+  qualifyDurability(): Promise<void>;
+  bootstrap(): Promise<void>;
+  verifyLaunchd(): Promise<void>;
+  verifyPrintDisabled(): Promise<void>;
+  verifyProcess(): Promise<void>;
+  verifyListener(): Promise<void>;
+  verifyHealth(): Promise<void>;
+  verifyStopBarrier(): Promise<void>;
+  cleanup(): Promise<void>;
+}
+
+export interface DarwinQualificationResult {
+  ok: true;
+  macosVersion: string;
+  label: string;
+  port: number;
+  lockf: "PASS";
+  durability: "PASS";
+  launchd: "PASS";
+  printDisabled: "PASS";
+  processIdentity: "PASS";
+  listener: "PASS";
+  health: "PASS";
+  stopBarrier: "PASS";
+  cleanup: "PASS";
+}
+
+export interface DarwinQualificationFixture {
+  label: string;
+  port: number;
+  root: string;
+  slotRoot: string;
+  entrypointPath: string;
+  plistPath: string;
+  stdoutPath: string;
+  stderrPath: string;
+  plistBytes: Buffer;
+  serverSource: string;
+}
+
+export function buildQualificationFixture(input: {
+  nonce: string;
+  port: number;
+  homeDir: string;
+  tempRoot: string;
+  nodeExecutable: string;
+}): DarwinQualificationFixture {
+  if (!/^[A-Za-z0-9._-]+$/.test(input.nonce)) {
+    throw new Error("qualification nonce contains unsupported characters");
+  }
+  if (!Number.isInteger(input.port) || input.port <= 0 || input.port > 65535) {
+    throw new Error("qualification port is invalid");
+  }
+  if (input.port === DEFAULT_PORT) throw new Error("qualification must not use the production port");
+  if (!isAbsolute(input.nodeExecutable)) throw new Error("qualification Node executable must be absolute");
+
+  const label = `com.ethan.devspace.rollout-qualification.${input.nonce}`;
+  const root = join(input.tempRoot, `DevSpace Rollout Qualification ${input.nonce}`);
+  const slotRoot = join(root, "Qualification Slot With Space");
+  const entrypointPath = join(slotRoot, DEVSPACE_ENTRYPOINT_SUFFIX);
+  const plistPath = join(input.homeDir, "Library", "LaunchAgents", `${label}.plist`);
+  const stdoutPath = join(root, "stdout.log");
+  const stderrPath = join(root, "stderr.log");
+  const serverSource = [
+    'const http = require("node:http");',
+    'const port = Number(process.env.DEVSPACE_QUALIFICATION_PORT);',
+    'if (!Number.isInteger(port) || port <= 0) throw new Error("invalid qualification port");',
+    'const server = http.createServer((req, res) => {',
+    '  if (req.url === "/healthz") {',
+    '    res.writeHead(200, { "content-type": "application/json" });',
+    '    res.end(JSON.stringify({ ok: true, name: "devspace" }));',
+    '    return;',
+    '  }',
+    '  res.writeHead(404);',
+    '  res.end();',
+    '});',
+    'server.listen(port, "127.0.0.1");',
+    '',
+  ].join("\n");
+  const plistBytes = Buffer.from([
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+    '<plist version="1.0"><dict>',
+    `<key>Label</key><string>${escapeXml(label)}</string>`,
+    '<key>ProgramArguments</key><array>',
+    `<string>${escapeXml(input.nodeExecutable)}</string>`,
+    `<string>${escapeXml(entrypointPath)}</string>`,
+    '<string>serve</string>',
+    '</array>',
+    '<key>RunAtLoad</key><true/>',
+    '<key>KeepAlive</key><true/>',
+    `<key>WorkingDirectory</key><string>${escapeXml(root)}</string>`,
+    `<key>StandardOutPath</key><string>${escapeXml(stdoutPath)}</string>`,
+    `<key>StandardErrorPath</key><string>${escapeXml(stderrPath)}</string>`,
+    '<key>EnvironmentVariables</key><dict>',
+    `<key>DEVSPACE_QUALIFICATION_PORT</key><string>${input.port}</string>`,
+    '</dict>',
+    '</dict></plist>',
+    '',
+  ].join("\n"), "utf8");
+
+  return {
+    label,
+    port: input.port,
+    root,
+    slotRoot,
+    entrypointPath,
+    plistPath,
+    stdoutPath,
+    stderrPath,
+    plistBytes,
+    serverSource,
+  };
+}
+
+export async function runDarwinQualificationSequence(
+  steps: DarwinQualificationSteps,
+): Promise<DarwinQualificationResult> {
+  if (
+    !steps.label.startsWith("com.ethan.devspace.rollout-qualification.")
+    || steps.label === DEFAULT_LABEL
+    || !Number.isInteger(steps.port)
+    || steps.port <= 0
+    || steps.port > 65535
+    || steps.port === DEFAULT_PORT
+  ) {
+    throw new Error("qualification must use a disposable label and non-production port");
+  }
+
+  let macosVersion = "";
+  let primaryError: unknown;
+  try {
+    macosVersion = await steps.macosVersion();
+    if (!macosVersion.trim()) throw new Error("macOS version observation is empty");
+    await steps.qualifyLock();
+    await steps.qualifyDurability();
+    await steps.bootstrap();
+    await steps.verifyLaunchd();
+    await steps.verifyPrintDisabled();
+    await steps.verifyProcess();
+    await steps.verifyListener();
+    await steps.verifyHealth();
+    await steps.verifyStopBarrier();
+  } catch (error) {
+    primaryError = error;
+  }
+
+  let cleanupError: unknown;
+  try {
+    await steps.cleanup();
+  } catch (error) {
+    cleanupError = error;
+  }
+  if (primaryError) throw primaryError;
+  if (cleanupError) throw cleanupError;
+
+  return {
+    ok: true,
+    macosVersion,
+    label: steps.label,
+    port: steps.port,
+    lockf: "PASS",
+    durability: "PASS",
+    launchd: "PASS",
+    printDisabled: "PASS",
+    processIdentity: "PASS",
+    listener: "PASS",
+    health: "PASS",
+    stopBarrier: "PASS",
+    cleanup: "PASS",
+  };
+}
+
+export async function qualifyDarwinRolloutEnvironment(): Promise<DarwinQualificationResult> {
+  if (process.platform !== "darwin") throw new Error("macOS rollout qualification requires Darwin");
+  const uid = requireEffectiveUid();
+  const nonce = randomBytes(8).toString("hex");
+  const port = await findFreeLoopbackPort();
+  if (port === DEFAULT_PORT) throw new Error("qualification allocator returned the production port");
+  const fixture = buildQualificationFixture({
+    nonce,
+    port,
+    homeDir: homedir(),
+    tempRoot: tmpdir(),
+    nodeExecutable: process.execPath,
+  });
+  const domain = `gui/${uid}`;
+  const serviceTarget = `${domain}/${fixture.label}`;
+  const runner = createExecFileRunner();
+  const rolloutRoot = join(fixture.root, "rollout");
+  const adapters = createDarwinRolloutAdapters({
+    canonicalPath: fixture.plistPath,
+    label: fixture.label,
+    uid,
+    host: DEFAULT_HOST,
+    port: fixture.port,
+    healthPath: DEFAULT_HEALTH_PATH,
+    rolloutRoot,
+    stopTimeoutMs: 5_000,
+    stopPollIntervalMs: 50,
+    stabilityObservationMs: 100,
+  });
+  let qualifiedProcess: ProcessIdentity | undefined;
+  let stopVerified = false;
+
+  await mkdir(dirname(fixture.entrypointPath), { recursive: true, mode: 0o700 });
+  await mkdir(dirname(fixture.plistPath), { recursive: true, mode: 0o700 });
+  await writeFile(fixture.entrypointPath, fixture.serverSource, { mode: 0o600 });
+  await writeFile(fixture.plistPath, fixture.plistBytes, { mode: 0o644 });
+  const lint = await runner.run("/usr/bin/plutil", ["-lint", fixture.plistPath]);
+  if (lint.exitCode !== 0) {
+    await cleanupQualificationFiles(fixture).catch(() => undefined);
+    throw new Error(`qualification plist failed plutil lint: ${lint.stderr || lint.stdout}`);
+  }
+
+  return runDarwinQualificationSequence({
+    label: fixture.label,
+    port: fixture.port,
+    async macosVersion() {
+      const result = await runner.run("/usr/bin/sw_vers", ["-productVersion"]);
+      if (result.exitCode !== 0 || !result.stdout.trim()) {
+        throw new Error("unable to read target macOS version");
+      }
+      return result.stdout.trim();
+    },
+    async qualifyLock() {
+      const lockPath = join(rolloutRoot, "qualification.lock");
+      const first = await acquireDarwinRolloutLock({
+        lockPath,
+        owner: qualificationLockOwner("first", nonce),
+      });
+      try {
+        let busy = false;
+        try {
+          await acquireDarwinRolloutLock({
+            lockPath,
+            owner: qualificationLockOwner("second", `${nonce}-second`),
+          });
+        } catch (error) {
+          busy = Boolean(
+            error
+            && typeof error === "object"
+            && "code" in error
+            && (error as { code?: unknown }).code === "LOCK_BUSY",
+          );
+        }
+        if (!busy) throw new Error("descriptor lock contention was not observed");
+      } finally {
+        await first.release();
+      }
+      const reacquired = await acquireDarwinRolloutLock({
+        lockPath,
+        owner: qualificationLockOwner("third", `${nonce}-third`),
+      });
+      await reacquired.release();
+    },
+    async qualifyDurability() {
+      await adapters.preflightDurability();
+    },
+    async bootstrap() {
+      await adapters.bootstrap(fixture.plistPath);
+    },
+    async verifyLaunchd() {
+      const launchd = await pollQualification(
+        () => adapters.observeLaunchd(),
+        (value) => value.kind === "known" && value.value.loaded && Boolean(value.value.pid),
+        "launchd job did not become observable",
+      );
+      if (launchd.kind !== "known" || !launchd.value.pid) {
+        throw new Error("launchd qualification result is incomplete");
+      }
+      const canonical = await adapters.readCanonical();
+      if (
+        canonical.kind !== "known"
+        || canonical.value.entrypointRealpath !== await realpath(fixture.entrypointPath)
+      ) {
+        throw new Error("qualification canonical plist did not satisfy the V1 semantic contract");
+      }
+    },
+    async verifyPrintDisabled() {
+      const result = await runner.run("/bin/launchctl", ["print-disabled", domain]);
+      if (result.exitCode !== 0) throw new Error("launchctl print-disabled qualification failed");
+      const entry = /^\s*"([^"]+)"\s*=>\s*(enabled|disabled)\s*$/m.exec(result.stdout);
+      if (!entry?.[1]) throw new Error("print-disabled output has no qualified entry to parse");
+      const parsed = parsePrintDisabled(result.stdout, entry[1]);
+      if (parsed.kind !== "known") throw new Error("print-disabled parser failed on target-host output");
+    },
+    async verifyProcess() {
+      const launchd = await adapters.observeLaunchd();
+      if (launchd.kind !== "known" || !launchd.value.loaded || !launchd.value.pid) {
+        throw new Error("qualification service PID is unavailable");
+      }
+      const processState = await pollQualification(
+        () => adapters.observeProcess(launchd.value.pid!),
+        (value) => value.kind === "known",
+        "strong process identity did not become observable",
+      );
+      if (
+        processState.kind !== "known"
+        || processState.value.entrypointRealpath !== await realpath(fixture.entrypointPath)
+        || !processState.value.normalizedArgv.some((argument) => argument.includes("Qualification Slot With Space"))
+      ) {
+        throw new Error("qualification process identity or argv preservation failed");
+      }
+      qualifiedProcess = processState.value;
+    },
+    async verifyListener() {
+      if (!qualifiedProcess) throw new Error("qualification process identity is unavailable");
+      const listener = await pollQualification(
+        () => adapters.observeListener(),
+        (value) => value.kind === "known"
+          && value.value.state === "owned"
+          && value.value.ownerPid === qualifiedProcess!.pid,
+        "qualification listener owner did not become observable",
+      );
+      if (listener.kind !== "known") throw new Error("qualification listener state is unproven");
+    },
+    async verifyHealth() {
+      const health = await pollQualification(
+        () => adapters.checkHealth(),
+        (value) => value.kind === "known" && value.value === "healthy",
+        "qualification health endpoint did not become healthy",
+      );
+      if (health.kind !== "known" || health.value !== "healthy") {
+        throw new Error("qualification health endpoint failed");
+      }
+    },
+    async verifyStopBarrier() {
+      if (!qualifiedProcess) throw new Error("qualification process identity is unavailable");
+      await adapters.bootoutExpected(qualifiedProcess);
+      const stopped = await adapters.waitStopped(qualifiedProcess);
+      if (stopped.kind !== "known" || stopped.value !== "stopped") {
+        throw new Error(stopped.kind === "unproven" ? stopped.reason : "qualification stop barrier failed");
+      }
+      stopVerified = true;
+    },
+    async cleanup() {
+      if (!stopVerified) {
+        const bootout = await runner.run("/bin/launchctl", ["bootout", serviceTarget]);
+        const combined = `${bootout.stdout}\n${bootout.stderr}`;
+        if (bootout.exitCode !== 0 && !/could not find service|service not found/i.test(combined)) {
+          throw new Error(`qualification cleanup bootout failed with code ${bootout.exitCode}`);
+        }
+      }
+      const [launchd, listener] = await Promise.all([
+        pollQualification(
+          () => adapters.observeLaunchd(),
+          (value) => value.kind === "known" && !value.value.loaded,
+          "qualification label remained loaded during cleanup",
+        ),
+        pollQualification(
+          () => adapters.observeListener(),
+          (value) => value.kind === "known" && value.value.state === "unowned",
+          "qualification listener remained owned during cleanup",
+        ),
+      ]);
+      if (
+        launchd.kind !== "known"
+        || launchd.value.loaded
+        || listener.kind !== "known"
+        || listener.value.state !== "unowned"
+      ) {
+        throw new Error("qualification cleanup could not prove service/listener absence");
+      }
+      await cleanupQualificationFiles(fixture);
+    },
+  });
+}
+
 export function parseLaunchctlPrint(output: string): ObservedState<LaunchdObservation> {
   const lines = output.split(/\r?\n/);
   const argumentsStart = lines.findIndex((line) => line.trim() === "arguments = {");
@@ -147,15 +522,26 @@ export function parsePrintDisabled(
   return { kind: "known", value: matches[0]![1] as "enabled" | "disabled" };
 }
 
-export function parseTxtLsof(output: string): ObservedState<string> {
+export function parseTxtLsof(output: string): ObservedState<string[]> {
   const paths = Array.from(new Set(
     output.split(/\r?\n/)
       .filter((line) => line.startsWith("n") && line.length > 1)
       .map((line) => line.slice(1)),
   ));
-  return paths.length === 1
-    ? { kind: "known", value: paths[0]! }
-    : { kind: "unproven", reason: "executable lsof output is missing or ambiguous" };
+  return paths.length > 0
+    ? { kind: "known", value: paths }
+    : { kind: "unproven", reason: "program-text lsof output has no path records" };
+}
+
+export function parsePsCommand(output: string): ObservedState<string> {
+  const lines = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length !== 1 || !isAbsolute(lines[0]!)) {
+    return { kind: "unproven", reason: "ps comm output is missing, non-absolute, or ambiguous" };
+  }
+  return { kind: "known", value: lines[0]! };
 }
 
 export function parseListenerLsof(
@@ -196,7 +582,8 @@ export async function buildProcessIdentityFromObservations(input: {
   pid: number;
   launchd: LaunchdObservation;
   psStartOutput: string;
-  executablePath: string;
+  psCommandOutput: string;
+  lsofTextOutput: string;
   realpath?: (path: string) => Promise<string>;
 }): Promise<ObservedState<ProcessIdentity>> {
   if (
@@ -216,12 +603,34 @@ export async function buildProcessIdentityFromObservations(input: {
   }
   const psStart = input.psStartOutput.trim();
   if (!psStart) return { kind: "unproven", reason: "process start identity is missing" };
+  const psCommand = parsePsCommand(input.psCommandOutput);
+  if (psCommand.kind === "unproven") return psCommand;
+  const textPaths = parseTxtLsof(input.lsofTextOutput);
+  if (textPaths.kind === "unproven") return textPaths;
   const resolveRealpath = input.realpath ?? realpath;
   try {
-    const [executableRealpath, entrypointRealpath] = await Promise.all([
-      resolveRealpath(input.executablePath),
+    const [executableRealpath, launchdExecutableRealpath, entrypointRealpath] = await Promise.all([
+      resolveRealpath(psCommand.value),
+      resolveRealpath(argv[0]!),
       resolveRealpath(argv[1]!),
     ]);
+    if (executableRealpath !== launchdExecutableRealpath) {
+      return { kind: "unproven", reason: "ps executable does not match launchd argv[0]" };
+    }
+    let corroborated = false;
+    for (const path of textPaths.value) {
+      try {
+        if (await resolveRealpath(path) === executableRealpath) {
+          corroborated = true;
+          break;
+        }
+      } catch {
+        // Unrelated dylib/text mappings may disappear while being inspected.
+      }
+    }
+    if (!corroborated) {
+      return { kind: "unproven", reason: "ps executable was not corroborated by lsof program-text mappings" };
+    }
     return {
       kind: "known",
       value: {
@@ -508,20 +917,22 @@ export function createDarwinRolloutAdapters(
     if (!launchd.value.loaded || launchd.value.pid !== pid) {
       return { kind: "unproven", reason: "launchd does not currently own the requested PID" };
     }
-    const [start, executable] = await Promise.all([
+    const [start, command, executable] = await Promise.all([
       runner.run("/bin/ps", ["-p", String(pid), "-o", "lstart="]),
+      runner.run("/bin/ps", ["-p", String(pid), "-o", "comm="]),
       runner.run("/usr/sbin/lsof", ["-a", "-p", String(pid), "-d", "txt", "-Fn"]),
     ]);
     if (start.exitCode !== 0) return { kind: "unproven", reason: `ps exited with code ${start.exitCode}` };
-    const executablePath = parseTxtLsof(executable.stdout);
-    if (executable.exitCode !== 0 || executablePath.kind === "unproven") {
-      return { kind: "unproven", reason: executablePath.kind === "unproven" ? executablePath.reason : `lsof exited with code ${executable.exitCode}` };
+    if (command.exitCode !== 0) return { kind: "unproven", reason: `ps comm exited with code ${command.exitCode}` };
+    if (executable.exitCode !== 0) {
+      return { kind: "unproven", reason: `lsof exited with code ${executable.exitCode}` };
     }
     return buildProcessIdentityFromObservations({
       pid,
       launchd: launchd.value,
       psStartOutput: start.stdout,
-      executablePath: executablePath.value,
+      psCommandOutput: command.stdout,
+      lsofTextOutput: executable.stdout,
     });
   };
 
@@ -891,8 +1302,76 @@ function requireEffectiveUid(): number {
   return uid;
 }
 
+function qualificationLockOwner(
+  suffix: string,
+  nonce: string,
+): RolloutLockOwnerRecord {
+  return {
+    schema_version: 1,
+    pid: process.pid,
+    process_start_identity: `qualification-${process.pid}`,
+    transaction_nonce: nonce,
+    transaction_id: `qualification-${suffix}`,
+    created_at: new Date().toISOString(),
+  };
+}
+
+async function findFreeLoopbackPort(): Promise<number> {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const port = await new Promise<number>((resolvePort, rejectPort) => {
+      const server = createNetServer();
+      server.once("error", rejectPort);
+      server.listen(0, DEFAULT_HOST, () => {
+        const address = server.address();
+        if (!address || typeof address === "string") {
+          server.close(() => rejectPort(new Error("unable to allocate qualification loopback port")));
+          return;
+        }
+        server.close((error) => error ? rejectPort(error) : resolvePort(address.port));
+      });
+    });
+    if (port !== DEFAULT_PORT) return port;
+  }
+  throw new Error("unable to allocate a non-production qualification port");
+}
+
+async function pollQualification<T>(
+  observe: () => Promise<T>,
+  accept: (value: T) => boolean,
+  failureMessage: string,
+  timeoutMs = 5_000,
+  pollMs = 50,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  let last: T | undefined;
+  while (true) {
+    last = await observe();
+    if (accept(last)) return last;
+    if (Date.now() >= deadline) throw new Error(failureMessage);
+    await delay(pollMs);
+  }
+}
+
+async function cleanupQualificationFiles(
+  fixture: DarwinQualificationFixture,
+): Promise<void> {
+  await Promise.all([
+    rm(fixture.plistPath, { force: true }),
+    rm(fixture.root, { recursive: true, force: true }),
+  ]);
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 function errorMessage(error: unknown): string {
