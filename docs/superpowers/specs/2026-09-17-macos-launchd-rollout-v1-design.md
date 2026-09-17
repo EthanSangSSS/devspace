@@ -660,20 +660,31 @@ Failure after `COMMITTED` is a post-commit qualification failure and may trigger
 
 Before `COMMITTED`, the canonical plist still contains the exact old known-good definition.
 
-If failure occurs after `OLD_STOP_REQUESTED`, recovery first applies the consequential-stop ownership invariant to any runtime it intends to stop.
+If failure occurs after `OLD_STOP_REQUESTED`, recovery first classifies the fresh runtime/service/listener state before deciding whether any `bootout` is allowed:
 
 ```text
-fresh-read loaded runtime
-  -> if candidate cleanup is needed, prove it is this transaction's candidate generation or a same-slot verified replacement
-  -> request candidate stop
-  -> verify candidate stopped with the bounded stop barrier
-  -> verify canonical plist still equals expected old hash
-  -> bootstrap the unchanged canonical old plist
-  -> resolve old PID/process generation
-  -> verify old process identity
-  -> verify listener owner PID
-  -> verify /healthz
+A. exact expected old runtime is still present and matches the unchanged old canonical definition
+   -> do not bootout it merely to perform rollback
+   -> verify old process identity + listener ownership + /healthz
+
+B. this transaction's candidate generation, or a same-candidate-slot verified replacement, is present
+   -> prove consequential-stop ownership
+   -> request candidate stop
+   -> verify candidate stopped with the bounded stop barrier
+   -> bootstrap the unchanged canonical old plist
+
+C. confirmed candidate absence: no active same-label service generation and no owner of 127.0.0.1:7676
+   -> no bootout is issued
+   -> bootstrap the unchanged canonical old plist
+
+D. concrete incompatible same-label runtime or unrelated listener is present
+   -> ROLLBACK_REFUSED_CONCURRENT_DRIFT
+
+E. runtime/service/listener state cannot be observed reliably enough to classify A-D
+   -> ROLLBACK_REFUSED_UNPROVEN_STATE
 ```
+
+For B or C, before bootstrapping the old definition the helper must still verify that the canonical plist equals `expected_live_plist_sha256` and that its file/parent identity remains valid. For A, that same persistent-state verification is required before accepting the already-running old runtime as recovered.
 
 Success returns:
 
@@ -681,9 +692,7 @@ Success returns:
 SWITCH_FAILED_ROLLBACK_OK
 ```
 
-The helper does not rewrite the canonical plist in this path because it never changed it.
-
-If runtime ownership cannot be proven, return `ROLLBACK_REFUSED_CONCURRENT_DRIFT` and do not stop the unknown runtime.
+The helper does not rewrite the canonical plist in this path because it never changed it. Concrete incompatible state and unproven state are distinct terminal classifications; inability to prove ownership is not, by itself, evidence of concurrent drift.
 
 ### 14.2 Failure after `COMMITTED`: compensating rollback
 
@@ -714,7 +723,6 @@ If a concrete incompatible same-label runtime appears, canonical bytes change, a
 
 ```text
 ROLLBACK_REFUSED_CONCURRENT_DRIFT
-ROLLBACK_REFUSED_UNPROVEN_STATE
 ```
 
 and do not `bootout` the unknown runtime or overwrite the new canonical state with the old backup.
@@ -969,6 +977,8 @@ Required tests include at least:
 40. true canonical/runtime disagreement -> `SPLIT_STATE_DETECTED`;
 41. successful rollout leaves canonical bytes equal to the twice-verified staged definition, preserves persistence flags/file identity, and records `CONTROLLED_RELOAD=PASS`;
 42. result classification distinguishes `ROLLOUT_OK`, pre-commit failure with successful old-runtime recovery, post-commit failure with successful compensating rollback, `ROLLBACK_REFUSED_CONCURRENT_DRIFT`, `ROLLBACK_REFUSED_UNPROVEN_STATE`, and rollback failure.
+43. pre-`COMMITTED` recovery with confirmed candidate absence issues no candidate `bootout`, verifies the unchanged old canonical state, bootstraps/verifies the old runtime, and can return `SWITCH_FAILED_ROLLBACK_OK`;
+44. pre-`COMMITTED` recovery with ambiguous/unobservable runtime/service/listener state returns `ROLLBACK_REFUSED_UNPROVEN_STATE`, does not stop an unknown runtime, and does not mutate canonical bytes.
 
 Before the first production-label live use, the macOS launchd/process/listener/filesystem adapter **must** pass a target-host qualification using a disposable launchd label and disposable port/path; mock tests alone are insufficient. The initial target host is currently observed as macOS `27.0`, and the qualification must record the exact target version and adapter evidence without touching `com.ethan.devspace`. A later macOS major-version change requires requalification before another live rollout.
 
