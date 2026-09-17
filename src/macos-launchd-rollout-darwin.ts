@@ -62,6 +62,7 @@ const DEFAULT_HEALTH_PATH = "/healthz";
 const DEFAULT_STOP_TIMEOUT_MS = 5_000;
 const DEFAULT_STOP_POLL_MS = 50;
 const DEFAULT_STABILITY_OBSERVATION_MS = 250;
+const DEFAULT_HEALTH_TIMEOUT_MS = 2_000;
 
 export interface CommandResult {
   stdout: string;
@@ -99,6 +100,7 @@ export interface DarwinRolloutAdapterOptions {
   stopTimeoutMs?: number;
   stopPollIntervalMs?: number;
   stabilityObservationMs?: number;
+  healthTimeoutMs?: number;
 }
 
 export interface DarwinQualificationSteps {
@@ -392,10 +394,10 @@ export async function qualifyDarwinRolloutEnvironment(): Promise<DarwinQualifica
     async verifyPrintDisabled() {
       const result = await runner.run("/bin/launchctl", ["print-disabled", domain]);
       if (result.exitCode !== 0) throw new Error("launchctl print-disabled qualification failed");
-      const entry = /^\s*"([^"]+)"\s*=>\s*(enabled|disabled)\s*$/m.exec(result.stdout);
-      if (!entry?.[1]) throw new Error("print-disabled output has no qualified entry to parse");
-      const parsed = parsePrintDisabled(result.stdout, entry[1]);
-      if (parsed.kind !== "known") throw new Error("print-disabled parser failed on target-host output");
+      const parsed = parseQualificationProductionDisabledState(result.stdout);
+      if (parsed.kind !== "known") {
+        throw new Error("production disabled-state observation is unavailable on target host");
+      }
     },
     async verifyProcess() {
       const launchd = await adapters.observeLaunchd();
@@ -524,6 +526,12 @@ export function parsePrintDisabled(
     return { kind: "unproven", reason: `disabled override for ${label} is missing or ambiguous` };
   }
   return { kind: "known", value: matches[0]![1] as "enabled" | "disabled" };
+}
+
+export function parseQualificationProductionDisabledState(
+  output: string,
+): ObservedState<"enabled" | "disabled"> {
+  return parsePrintDisabled(output, DEFAULT_LABEL);
 }
 
 export function parseTxtLsof(output: string): ObservedState<string[]> {
@@ -892,6 +900,7 @@ export function createDarwinRolloutAdapters(
   const stopTimeoutMs = options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
   const stopPollIntervalMs = options.stopPollIntervalMs ?? DEFAULT_STOP_POLL_MS;
   const stabilityObservationMs = options.stabilityObservationMs ?? DEFAULT_STABILITY_OBSERVATION_MS;
+  const healthTimeoutMs = options.healthTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS;
 
   const observeLaunchd = async (): Promise<ObservedState<LaunchdObservation>> => {
     const result = await runner.run("/bin/launchctl", ["print", serviceTarget]);
@@ -1076,7 +1085,9 @@ export function createDarwinRolloutAdapters(
 
     async checkHealth() {
       try {
-        const response = await fetch(`http://${host}:${port}${healthPath}`);
+        const response = await fetch(`http://${host}:${port}${healthPath}`, {
+          signal: AbortSignal.timeout(healthTimeoutMs),
+        });
         if (!response.ok) return { kind: "known", value: "unhealthy" };
         const body = await response.json() as { ok?: unknown; name?: unknown };
         return body.ok === true && body.name === "devspace"

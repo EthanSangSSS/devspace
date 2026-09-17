@@ -18,11 +18,13 @@ import {
   assertDarwinPlatform,
   buildProcessIdentityFromObservations,
   buildQualificationFixture,
+  createDarwinRolloutAdapters,
   parseLaunchctlPrint,
   parseListenerLsof,
   parseParentPid,
   parsePsCommand,
   parsePrintDisabled,
+  parseQualificationProductionDisabledState,
   parseTxtLsof,
   observeFileIdentity,
   prepareCanonicalTempFile,
@@ -120,6 +122,26 @@ test("disabled-service parser is exact and fails closed on unknown output", asyn
     value: "disabled",
   });
   assert.equal(parsePrintDisabled(enabled, "missing.label").kind, "unproven");
+});
+
+test("qualification disabled-state observation is anchored to the production label", () => {
+  const output = [
+    "\tdisabled services = {",
+    '\t\t"io.example.first" => enabled',
+    '\t\t"com.ethan.devspace" => disabled',
+    "\t}",
+    "",
+  ].join("\n");
+  assert.deepEqual(parseQualificationProductionDisabledState(output), {
+    kind: "known",
+    value: "disabled",
+  });
+  assert.equal(
+    parseQualificationProductionDisabledState(
+      '\tdisabled services = {\n\t\t"io.example.first" => enabled\n\t}\n',
+    ).kind,
+    "unproven",
+  );
 });
 
 posixFsTest("process and listener parsers preserve exact identity without whitespace splitting", async () => {
@@ -468,6 +490,31 @@ posixFsTest("qualification fixture is disposable, non-production, and exercises 
 });
 
 const darwinTest = process.platform === "darwin" ? test : test.skip;
+
+darwinTest("health check uses a bounded timeout signal and classifies timeout as unhealthy", async () => {
+  const originalFetch = globalThis.fetch;
+  let observedSignal: AbortSignal | undefined;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    observedSignal = init?.signal ?? undefined;
+    assert.ok(observedSignal, "health fetch must receive an AbortSignal");
+    return await new Promise<Response>((_resolve, reject) => {
+      if (observedSignal!.aborted) {
+        reject(observedSignal!.reason);
+        return;
+      }
+      observedSignal!.addEventListener("abort", () => reject(observedSignal!.reason), { once: true });
+    });
+  }) as typeof fetch;
+  try {
+    const options = { port: 49123, healthTimeoutMs: 20 };
+    const adapters = createDarwinRolloutAdapters(options);
+    const result = await adapters.checkHealth();
+    assert.deepEqual(result, { kind: "known", value: "unhealthy" });
+    assert.equal(observedSignal?.aborted, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 darwinTest("candidate plist rewrite changes only ProgramArguments[1] semantically", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-rollout-plist-test-"));

@@ -65,6 +65,8 @@ cleanup
 
 The qualification fixture deliberately uses a DevSpace-style entrypoint path containing spaces so argv parsing is exercised without whitespace splitting.
 
+The `printDisabled` qualification is read-only and is anchored to the fixed production label `com.ethan.devspace`. It proves that the target host can observe the disabled-state contract used by production rollout preflight; it does not create a persistent enable/disable override for the disposable qualification label.
+
 On the currently qualified macOS 27.0 target, executable identity combines independent observations:
 
 1. `launchctl print` provides loaded argv and the launchd run generation;
@@ -168,6 +170,8 @@ canonical SHA-256 == twice-verified staged candidate SHA-256
 ```
 
 Local DevSpace qualification and public connector/tunnel qualification are separate. Keep `REBOOT_RECOVERY=UNVERIFIED` until the separately authorized restart canary described below is actually observed.
+
+`/healthz` is a bounded liveness gate. The production Darwin adapter applies a 2-second request deadline by default; timeout, connection failure, malformed response, or a non-matching health payload is treated as unhealthy. This does not qualify the end-to-end ChatGPT/MCP path.
 
 ## Result codes
 
