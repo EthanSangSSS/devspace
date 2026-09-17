@@ -85,6 +85,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       model: stored.agyDelegation.model,
       effort: stored.agyDelegation.effort,
       compatibleVersions: stored.agyDelegation.compatibleVersions,
+      guiForegroundPolicy: stored.agyDelegation.guiForegroundPolicy,
     },
     agentDir: normalizePath(stored.skills.agentDir),
     logging: {

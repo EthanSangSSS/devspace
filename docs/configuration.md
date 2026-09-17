@@ -166,7 +166,8 @@ Configure it in `config.jsonc`:
     "settingsPath": "~/.gemini/antigravity-cli/settings.json",
     "model": "gemini-3.8-flash-high",
     "effort": "high",
-    "compatibleVersions": ">=1.1.22 <1.2.0"
+    "compatibleVersions": ">=1.1.22 <1.2.0",
+    "guiForegroundPolicy": "deny"
   }
 }
 ```
@@ -175,7 +176,8 @@ The section defaults to disabled. The three path fields default to the values
 shown above and are normalized using the same home-path rules as other stored
 DevSpace paths. `model`, `effort`, and `compatibleVersions` are server-owned
 policy strings. They are not trimmed or selected by the MCP caller; empty or
-whitespace-only values are rejected.
+whitespace-only values are rejected. `guiForegroundPolicy` is also server-owned
+and defaults to `deny`; it is never exposed as an Agy or MCP action selector.
 
 The default policy remains:
 
@@ -183,6 +185,7 @@ The default policy remains:
 model              = gemini-3.8-flash-high
 effort             = high
 compatibleVersions = >=1.1.22 <1.2.0
+guiForegroundPolicy = deny
 ```
 
 `delegate_to_agy` does not expose model or effort selectors. Real runs use the
@@ -223,6 +226,26 @@ The V1 profiles are:
 - `gui-inspect` — exact-window AX inspection through the CuaDriver broker; no
   generic CuaDriver executable, raw pixel action surface, screenshot feed, or
   text-entry capability is exposed to Agy.
+
+`gui-inspect` always sends brokered actions with CuaDriver
+`delivery_mode="background"`. Before each GUI mutation DevSpace records the
+current frontmost app and exact top-level window from CuaDriver's WindowServer
+`z_index` data, then checks the same state again after the action.
+
+With the default `guiForegroundPolicy="deny"`, DevSpace refuses to mutate a
+target that belongs to the user's current frontmost app. If a background action
+nevertheless changes the frontmost app or window, the delegation fails closed
+and stops further GUI actions; DevSpace deliberately does not steal focus back.
+
+`guiForegroundPolicy="allow-restore"` is an explicit local opt-in for workflows
+where a brief restore is acceptable. Actions still start in background mode,
+but if the foreground changes DevSpace asks CuaDriver to restore the exact
+previous PID/window and verifies that restoration. This mode can conflict with
+a human who changes windows concurrently, so keep `deny` for normal interactive
+use.
+
+`get_agy_runtime` reports the active policy as `gui_foreground_policy` so the
+effective server-side setting can be verified without starting a worker.
 
 `delegate_to_agy` has no internal Codex or alternate-model fallback. Any later
 fallback is a separate host/controller decision.

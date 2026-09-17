@@ -13,11 +13,13 @@ const currentAgyPolicy = {
   model: "gemini-3.8-flash-high",
   effort: "high",
   compatibleVersions: ">=1.1.22 <1.2.0",
+  guiForegroundPolicy: "deny" as const,
 };
 const customAgyPolicy = {
   model: "gemini-qualified-model",
   effort: "medium",
   compatibleVersions: ">=1.1.22 <1.2.0",
+  guiForegroundPolicy: "deny" as const,
 };
 
 macTest("repo-read returns verified claims and leaves source unchanged", async (t) => {
@@ -167,7 +169,7 @@ macTest("gui-inspect redacts sensitive AX content and brokers one semantic actio
   const cuaPath = join(root, "cua-driver");
   await writeFile(cuaPath, [
     "#!/bin/sh",
-    "if [ \"$1\" = \"list_windows\" ]; then printf '%s\\n' '{\"windows\":[{\"window_id\":100,\"pid\":42,\"app_name\":\"ChatGPT\",\"title\":\"ChatGPT\"}]}'; exit 0; fi",
+    "if [ \"$1\" = \"list_windows\" ]; then printf '%s\\n' '{\"windows\":[{\"window_id\":100,\"pid\":42,\"app_name\":\"ChatGPT\",\"title\":\"ChatGPT\",\"z_index\":4,\"is_on_screen\":true,\"layer\":0},{\"window_id\":701,\"pid\":777,\"app_name\":\"Editor\",\"title\":\"Editor\",\"z_index\":9,\"is_on_screen\":true,\"layer\":0}]}'; exit 0; fi",
     "if [ \"$1\" = \"get_window_state\" ]; then printf '%s\\n' '{\"snapshot_id\":\"s12345678\",\"elements\":[{\"element_index\":1,\"role\":\"AXStaticText\",\"label\":\"SECRET_BODY\",\"value\":\"SECRET_VALUE\"},{\"element_index\":11,\"role\":\"AXTab\",\"label\":\"Pinned\"}]}'; exit 0; fi",
     `if [ \"$1\" = \"click\" ]; then printf '%s\\n' \"$2\" >> ${JSON.stringify(actionPath)}; printf '%s\\n' '{}'; exit 0; fi`,
     "exit 2",
@@ -226,6 +228,7 @@ async function delegationFixture(
     model: string;
     effort: string;
     compatibleVersions: string;
+    guiForegroundPolicy: "deny" | "allow-restore";
   };
   gitleaksPath: string;
   invocations: () => Promise<number>;

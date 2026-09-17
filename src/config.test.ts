@@ -31,6 +31,7 @@ try {
     model: "gemini-3.8-flash-high",
     effort: "high",
     compatibleVersions: ">=1.1.22 <1.2.0",
+    guiForegroundPolicy: "deny",
   });
   assert.deepEqual(defaults.logging, {
     level: "info",
@@ -71,6 +72,7 @@ try {
       model: " gemini-next-qualified ",
       effort: "\tmedium ",
       compatibleVersions: " >=1.1.22 <2.0.0 ",
+      guiForegroundPolicy: "allow-restore",
     },
     logging: {
       level: "debug",
@@ -121,6 +123,7 @@ try {
     model: " gemini-next-qualified ",
     effort: "\tmedium ",
     compatibleVersions: " >=1.1.22 <2.0.0 ",
+    guiForegroundPolicy: "allow-restore",
   });
   assert.equal(configured.oauth.ownerToken, "persisted-owner-token-long-enough");
   assert.equal(configured.oauth.accessTokenTtlSeconds, 120);

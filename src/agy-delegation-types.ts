@@ -2,6 +2,7 @@ export const AGY_REQUIRED_MODEL = "gemini-3.8-flash-high" as const;
 export const AGY_REQUIRED_EFFORT = "high" as const;
 
 export type AgyProfile = "repo-read" | "repo-validate" | "gui-inspect";
+export type GuiForegroundPolicy = "deny" | "allow-restore";
 
 export type AgyFailureClass =
   | "POLICY_DENIED"
@@ -21,6 +22,9 @@ export type AgyFailureClass =
   | "NETWORK_POLICY_DENIED"
   | "GUI_ACTION_UNCLASSIFIED"
   | "GUI_CAPABILITY_DENIED"
+  | "GUI_FOREGROUND_POLICY_DENIED"
+  | "GUI_FOREGROUND_CHANGED"
+  | "GUI_FOREGROUND_RESTORE_FAILED"
   | "GUI_SENSITIVE_VIEW_DENIED"
   | "EVIDENCE_INCOMPLETE";
 
@@ -32,6 +36,7 @@ export interface AgyDelegationConfig {
   model: string;
   effort: string;
   compatibleVersions: string;
+  guiForegroundPolicy: GuiForegroundPolicy;
 }
 
 export interface AgyPlatformStages {

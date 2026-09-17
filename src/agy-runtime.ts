@@ -34,6 +34,7 @@ export interface AgyRuntimeInspection {
   requiredModel: string;
   requiredEffort: string;
   compatibleVersions: string;
+  guiForegroundPolicy: AgyDelegationConfig["guiForegroundPolicy"];
   requiredFlagsSupported: boolean;
   resolvedModelTelemetry: "available";
   trustedCliAuthMode: "cached-auth-required";
@@ -81,6 +82,7 @@ export async function inspectAgyRuntime(
     requiredModel: config.model,
     requiredEffort: config.effort,
     compatibleVersions: config.compatibleVersions,
+    guiForegroundPolicy: config.guiForegroundPolicy,
     requiredFlagsSupported,
     resolvedModelTelemetry: "available",
     trustedCliAuthMode: "cached-auth-required",

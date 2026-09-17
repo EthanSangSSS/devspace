@@ -238,7 +238,10 @@ export class AgyDelegationService {
       envelope.runtimeTelemetryEnabled = runtimePolicy.telemetryEnabled;
       envelope.runtimeSessionState = runtimePolicy.sessionState;
 
-      const broker = new AgyGuiBroker(new CuaDriverClient(this.options.config.cuaDriverPath));
+      const broker = new AgyGuiBroker(
+        new CuaDriverClient(this.options.config.cuaDriverPath),
+        { foregroundPolicy: this.options.config.guiForegroundPolicy },
+      );
       let snapshot = await broker.observe(request.target);
       envelope.policyPreflightPassed = true;
       if (request.dryRun) return { ok: true, envelope };

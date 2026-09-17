@@ -1,6 +1,9 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { AgyDelegationError } from "./agy-delegation-types.js";
+import {
+  AgyDelegationError,
+  type GuiForegroundPolicy,
+} from "./agy-delegation-types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -15,6 +18,14 @@ export interface GuiWindow {
   pid: number;
   appName: string;
   title: string;
+  zIndex?: number;
+  isOnScreen?: boolean;
+  layer?: number;
+}
+
+export interface GuiForegroundState {
+  pid: number;
+  windowId: number;
 }
 
 export interface RawGuiElement {
@@ -58,6 +69,8 @@ export type GuiIntent =
 export interface GuiBackend {
   listWindows(pid: number): Promise<GuiWindow[]>;
   getWindowState(pid: number, windowId: number): Promise<RawGuiSnapshot>;
+  getForegroundState(): Promise<GuiForegroundState>;
+  restoreForeground(state: GuiForegroundState): Promise<void>;
   click(input: Record<string, unknown>): Promise<void>;
   pressKey(input: Record<string, unknown>): Promise<void>;
   scroll(input: Record<string, unknown>): Promise<void>;
@@ -67,7 +80,32 @@ export class CuaDriverClient implements GuiBackend {
   constructor(private readonly executable: string) {}
 
   async listWindows(pid: number): Promise<GuiWindow[]> {
-    const raw = await this.call("list_windows", { pid });
+    return this.queryWindows({ pid });
+  }
+
+  async getForegroundState(): Promise<GuiForegroundState> {
+    const windows = await this.queryWindows({ on_screen_only: true });
+    const foreground = windows
+      .filter((window) => window.layer === 0 && window.isOnScreen === true && window.zIndex !== undefined)
+      .sort((left, right) => (right.zIndex ?? Number.NEGATIVE_INFINITY) - (left.zIndex ?? Number.NEGATIVE_INFINITY))[0];
+    if (!foreground) {
+      throw new AgyDelegationError(
+        "GUI_CAPABILITY_DENIED",
+        "CuaDriver could not determine the exact frontmost window.",
+      );
+    }
+    return { pid: foreground.pid, windowId: foreground.windowId };
+  }
+
+  async restoreForeground(state: GuiForegroundState): Promise<void> {
+    await this.call("bring_to_front", {
+      pid: state.pid,
+      window_id: state.windowId,
+    });
+  }
+
+  private async queryWindows(input: Record<string, unknown>): Promise<GuiWindow[]> {
+    const raw = await this.call("list_windows", input);
     const windows = Array.isArray(raw.windows) ? raw.windows : [];
     return windows.flatMap((entry) => {
       const record = asRecord(entry);
@@ -81,6 +119,9 @@ export class CuaDriverClient implements GuiBackend {
         pid: ownerPid,
         appName,
         title: stringField(record, "title") ?? "",
+        zIndex: numberField(record, "z_index"),
+        isOnScreen: booleanField(record, "is_on_screen"),
+        layer: numberField(record, "layer"),
       }];
     });
   }
@@ -150,7 +191,10 @@ export class CuaDriverClient implements GuiBackend {
 }
 
 export class AgyGuiBroker {
-  constructor(private readonly backend: GuiBackend) {}
+  constructor(
+    private readonly backend: GuiBackend,
+    private readonly options: { foregroundPolicy: GuiForegroundPolicy } = { foregroundPolicy: "deny" },
+  ) {}
 
   async observe(target: GuiTarget): Promise<SanitizedGuiSnapshot> {
     const window = await this.verifyTarget(target);
@@ -162,6 +206,13 @@ export class AgyGuiBroker {
     const window = await this.verifyTarget(target);
     const before = await this.backend.getWindowState(target.pid, target.windowId);
     sanitizeGuiSnapshot(before, { windowTitle: window.title });
+    const foregroundBefore = await this.backend.getForegroundState();
+    if (this.options.foregroundPolicy === "deny" && foregroundBefore.pid === target.pid) {
+      throw new AgyDelegationError(
+        "GUI_FOREGROUND_POLICY_DENIED",
+        "GUI mutation denied because the approved target belongs to the user's current frontmost app.",
+      );
+    }
     const common = {
       pid: target.pid,
       window_id: target.windowId,
@@ -208,6 +259,34 @@ export class AgyGuiBroker {
             by: intent.by,
           });
           break;
+      }
+    }
+
+    const foregroundAfter = await this.backend.getForegroundState();
+    if (!sameForeground(foregroundBefore, foregroundAfter)) {
+      if (this.options.foregroundPolicy === "deny") {
+        throw new AgyDelegationError(
+          "GUI_FOREGROUND_CHANGED",
+          "Background GUI action changed the user's frontmost app or window; further actions were stopped.",
+        );
+      }
+      try {
+        await this.backend.restoreForeground(foregroundBefore);
+        const restored = await this.backend.getForegroundState();
+        if (!sameForeground(foregroundBefore, restored)) {
+          throw new AgyDelegationError(
+            "GUI_FOREGROUND_RESTORE_FAILED",
+            "DevSpace could not restore the exact frontmost app and window after a GUI action.",
+          );
+        }
+      } catch (error) {
+        if (error instanceof AgyDelegationError && error.code === "GUI_FOREGROUND_RESTORE_FAILED") {
+          throw error;
+        }
+        throw new AgyDelegationError(
+          "GUI_FOREGROUND_RESTORE_FAILED",
+          `DevSpace could not restore the exact frontmost app and window after a GUI action: ${errorMessage(error)}`,
+        );
       }
     }
 
@@ -289,4 +368,16 @@ function numberField(record: Record<string, unknown>, key: string): number | und
 
 function stringField(record: Record<string, unknown>, key: string): string | undefined {
   return typeof record[key] === "string" ? record[key] : undefined;
+}
+
+function booleanField(record: Record<string, unknown>, key: string): boolean | undefined {
+  return typeof record[key] === "boolean" ? record[key] : undefined;
+}
+
+function sameForeground(left: GuiForegroundState, right: GuiForegroundState): boolean {
+  return left.pid === right.pid && left.windowId === right.windowId;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

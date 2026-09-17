@@ -244,6 +244,7 @@ test("enabled Agy delegation exposes stable server-policy MCP schemas", async (t
   assert.equal(runtimeOutput.properties?.requested_effort?.type, "string");
   assert.equal(runtimeOutput.properties?.requested_effort?.const, undefined);
   assert.equal(runtimeOutput.properties?.compatible_versions?.type, "string");
+  assert.equal(runtimeOutput.properties?.gui_foreground_policy?.type, "string");
   assert.equal(delegateOutput.properties?.requested_model?.type, "string");
   assert.equal(delegateOutput.properties?.requested_model?.const, undefined);
   assert.equal(delegateOutput.properties?.requested_effort?.type, "string");
@@ -585,6 +586,7 @@ function fakeAgyService(): {
           requiredModel: "gemini-3.8-flash-high" as const,
           requiredEffort: "high" as const,
           compatibleVersions: ">=1.1.22 <1.2.0",
+          guiForegroundPolicy: "deny" as const,
           requiredFlagsSupported: true,
           resolvedModelTelemetry: "available" as const,
           trustedCliAuthMode: "cached-auth-required" as const,

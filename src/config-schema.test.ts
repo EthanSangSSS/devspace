@@ -25,11 +25,13 @@ const preservedAgyPolicy = devspaceConfigSchema.parse({
     model: " gemini-next-qualified ",
     effort: "\tmedium ",
     compatibleVersions: " >=1.1.22 <2.0.0 ",
+    guiForegroundPolicy: "allow-restore",
   },
 });
 assert.equal(preservedAgyPolicy.agyDelegation.model, " gemini-next-qualified ");
 assert.equal(preservedAgyPolicy.agyDelegation.effort, "\tmedium ");
 assert.equal(preservedAgyPolicy.agyDelegation.compatibleVersions, " >=1.1.22 <2.0.0 ");
+assert.equal(preservedAgyPolicy.agyDelegation.guiForegroundPolicy, "allow-restore");
 
 const generatedSchema = `${JSON.stringify(devspaceConfigJsonSchema(), null, 2)}\n`;
 const committedSchema = readFileSync(
