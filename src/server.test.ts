@@ -537,6 +537,7 @@ function fakeAgyService(): {
           agyExecutableSha256: "abc",
           requiredModel: "gemini-3.8-flash-high" as const,
           requiredEffort: "high" as const,
+          compatibleVersions: ">=1.1.22 <1.2.0",
           requiredFlagsSupported: true,
           resolvedModelTelemetry: "available" as const,
           trustedCliAuthMode: "cached-auth-required" as const,

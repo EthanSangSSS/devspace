@@ -3,9 +3,8 @@ import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { access, readFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
+import { satisfies, valid, validRange } from "semver";
 import {
-  AGY_REQUIRED_EFFORT,
-  AGY_REQUIRED_MODEL,
   AgyDelegationError,
   type AgyDelegationConfig,
   type AgyRuntimePolicy,
@@ -32,8 +31,9 @@ export interface AgyRuntimeInspection {
   agyPath: string;
   agyVersion: string;
   agyExecutableSha256: string;
-  requiredModel: typeof AGY_REQUIRED_MODEL;
-  requiredEffort: typeof AGY_REQUIRED_EFFORT;
+  requiredModel: string;
+  requiredEffort: string;
+  compatibleVersions: string;
   requiredFlagsSupported: boolean;
   resolvedModelTelemetry: "available";
   trustedCliAuthMode: "cached-auth-required";
@@ -45,7 +45,7 @@ export interface AgyRuntimeInspection {
 }
 
 export interface AgyStreamResult {
-  resolvedModel: typeof AGY_REQUIRED_MODEL;
+  resolvedModel: string;
   status: "SUCCESS";
   response: string;
 }
@@ -68,16 +68,19 @@ export async function inspectAgyRuntime(
   });
 
   const helpOutput = `${helpStdout}\n${helpStderr}`;
+  const agyVersion = versionOutput.trim();
+  assertQualifiedAgyVersion(agyVersion, config.compatibleVersions);
   const requiredFlagsSupported = REQUIRED_FLAGS.every((flag) => helpOutput.includes(flag));
   const telemetryEnabled = await readTelemetryEnabled(config.settingsPath);
 
   return {
     runtimeStatus: "available",
     agyPath: config.agyPath,
-    agyVersion: versionOutput.trim(),
+    agyVersion,
     agyExecutableSha256,
-    requiredModel: AGY_REQUIRED_MODEL,
-    requiredEffort: AGY_REQUIRED_EFFORT,
+    requiredModel: config.model,
+    requiredEffort: config.effort,
+    compatibleVersions: config.compatibleVersions,
     requiredFlagsSupported,
     resolvedModelTelemetry: "available",
     trustedCliAuthMode: "cached-auth-required",
@@ -108,7 +111,10 @@ export async function preflightAgyRealRun(
   };
 }
 
-export function verifyAgyCommandArguments(args: readonly string[]): void {
+export function verifyAgyCommandArguments(
+  args: readonly string[],
+  policy: Pick<AgyDelegationConfig, "model" | "effort">,
+): void {
   for (const flag of FORBIDDEN_REAL_RUN_FLAGS) {
     if (args.includes(flag)) {
       throw new AgyDelegationError(
@@ -118,15 +124,18 @@ export function verifyAgyCommandArguments(args: readonly string[]): void {
     }
   }
 
-  requireExactOption(args, "--model", AGY_REQUIRED_MODEL, "MODEL_MISMATCH");
-  requireExactOption(args, "--effort", AGY_REQUIRED_EFFORT, "EFFORT_MISMATCH");
+  requireExactOption(args, "--model", policy.model, "MODEL_MISMATCH");
+  requireExactOption(args, "--effort", policy.effort, "EFFORT_MISMATCH");
   requireExactOption(args, "--output-format", "stream-json", "EVIDENCE_INCOMPLETE");
   if (!args.includes("--sandbox")) {
     throw new AgyDelegationError("POLICY_DENIED", "Agy real runs must enable --sandbox.");
   }
 }
 
-export function parseAgyStream(lines: readonly string[]): AgyStreamResult {
+export function parseAgyStream(
+  lines: readonly string[],
+  expectedModel: string,
+): AgyStreamResult {
   const events = lines
     .map((line) => line.trim())
     .filter(Boolean)
@@ -152,10 +161,10 @@ export function parseAgyStream(lines: readonly string[]): AgyStreamResult {
   if (typeof resolvedModel !== "string" || resolvedModel.length === 0) {
     throw new AgyDelegationError("MODEL_UNVERIFIED", "Agy init event did not report a model.");
   }
-  if (resolvedModel !== AGY_REQUIRED_MODEL) {
+  if (resolvedModel !== expectedModel) {
     throw new AgyDelegationError(
       "MODEL_MISMATCH",
-      `Agy resolved model ${resolvedModel} does not match required ${AGY_REQUIRED_MODEL}.`,
+      `Agy resolved model ${resolvedModel} does not match required ${expectedModel}.`,
     );
   }
 
@@ -171,10 +180,21 @@ export function parseAgyStream(lines: readonly string[]): AgyStreamResult {
   }
 
   return {
-    resolvedModel: AGY_REQUIRED_MODEL,
+    resolvedModel,
     status: "SUCCESS",
     response: result.response,
   };
+}
+
+function assertQualifiedAgyVersion(version: string, compatibleVersions: string): void {
+  const parsedVersion = valid(version);
+  const parsedRange = validRange(compatibleVersions);
+  if (!parsedVersion || !parsedRange || !satisfies(parsedVersion, parsedRange)) {
+    throw new AgyDelegationError(
+      "AGY_VERSION_UNQUALIFIED",
+      `Agy version ${version || "unverified"} is not qualified by configured range ${compatibleVersions}.`,
+    );
+  }
 }
 
 async function assertOwnedExecutable(path: string): Promise<void> {

@@ -25,7 +25,7 @@ export interface AgyHeadlessRunInput {
 }
 
 export interface AgyHeadlessRunResult {
-  resolvedModel: typeof AGY_REQUIRED_MODEL;
+  resolvedModel: string;
   response: string;
   status: "SUCCESS";
   effortSelectionVerified: true;
@@ -84,7 +84,8 @@ export async function runAgyHeadless(input: AgyHeadlessRunInput): Promise<AgyHea
     "--log-file", logPath,
     ...(input.jsonSchema ? ["--json-schema", input.jsonSchema] : []),
   ];
-  verifyAgyCommandArguments(args);
+  const fixedPolicy = { model: AGY_REQUIRED_MODEL, effort: AGY_REQUIRED_EFFORT };
+  verifyAgyCommandArguments(args, fixedPolicy);
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let stdout: string;
@@ -101,7 +102,7 @@ export async function runAgyHeadless(input: AgyHeadlessRunInput): Promise<AgyHea
       const captured = childText(error, "stdout");
       if (captured.trim()) {
         try {
-          parseAgyStream(captured.split(/\r?\n/));
+          parseAgyStream(captured.split(/\r?\n/), AGY_REQUIRED_MODEL);
         } catch (parsedError) {
           if (parsedError instanceof AgyDelegationError
             && ["MODEL_MISMATCH", "MODEL_UNVERIFIED"].includes(parsedError.code)) {
@@ -120,7 +121,7 @@ export async function runAgyHeadless(input: AgyHeadlessRunInput): Promise<AgyHea
     }
 
     try {
-      const parsed = parseAgyStream(stdout.split(/\r?\n/));
+      const parsed = parseAgyStream(stdout.split(/\r?\n/), AGY_REQUIRED_MODEL);
       return {
         resolvedModel: parsed.resolvedModel,
         response: parsed.response,
