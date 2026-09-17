@@ -320,7 +320,7 @@ This applies to:
 
 The proof includes the expected label, strong runtime process identity, and the runtime/plist relationship appropriate to that phase. A same-label process with an unexpected generation or entrypoint is not safe to stop merely because the canonical plist hash still matches.
 
-If ownership cannot be proven, the helper fails closed and does not `bootout` the unknown runtime. During pre-switch CAS this is `LIVE_STATE_CAS_MISMATCH`; during compensating rollback it is `ROLLBACK_REFUSED_CONCURRENT_DRIFT`.
+If ownership cannot be proven, the helper fails closed and does not `bootout` the unknown runtime. During pre-switch CAS this is `LIVE_STATE_CAS_MISMATCH`. During compensating rollback, concrete incompatible runtime/listener/canonical drift is `ROLLBACK_REFUSED_CONCURRENT_DRIFT`, while an observation that is merely insufficient or ambiguous is `ROLLBACK_REFUSED_UNPROVEN_STATE`.
 
 ## 8. Strong Runtime Process Identity
 
@@ -355,7 +355,17 @@ Rollout state lives under:
 ~/.devspace/rollout/
 ```
 
-The lock owner record contains at least:
+V1 uses one fixed cooperative lock file:
+
+```text
+~/.devspace/rollout/rollout.lock
+```
+
+The helper opens that exact path with close-on-exec semantics, verifies that it is a non-symlink regular file owned by the current effective user and not group/world-writable, and then acquires a non-blocking whole-file exclusive kernel advisory lock through a qualified Darwin `flock(2)` adapter.
+
+The lock file is persistent infrastructure. The helper never deletes, renames, or replaces it during normal acquisition, release, or crash recovery. A helper crash therefore releases kernel ownership without requiring a user-space stale-lock reclamation step.
+
+The owner record stored in the locked file contains at least:
 
 ```text
 schema_version
@@ -366,16 +376,26 @@ transaction_id
 created_at
 ```
 
-Lock publication follows the existing DevSpace daemon principles but strengthens ownership beyond PID-only identity:
+The record is diagnostic evidence, not the ownership primitive. Ownership is established only by the kernel lock held on the open file descriptor.
 
-1. write a complete owner record to a temporary file;
-2. atomically publish ownership;
-3. if the owner PID is alive and the start identity matches, return `LOCK_BUSY`;
-4. if the PID no longer identifies that process generation, atomically rename the stale lock out of the ownership path and retry;
-5. if the record is malformed, process identity is unavailable, or ownership is otherwise ambiguous, return `LOCK_AMBIGUOUS` and do not delete it automatically;
-6. release removes the lock only if both process identity and `transaction_nonce` still belong to the releasing helper.
+Acquisition semantics are:
 
-A later transaction must never be able to delete an earlier live transaction's lock merely because a PID was reused.
+1. open/create the fixed lock file without following symlinks;
+2. verify file identity/ownership/mode;
+3. acquire `LOCK_EX | LOCK_NB` on the open descriptor;
+4. if the kernel reports that the lock would block, return `LOCK_BUSY` without modifying the owner record;
+5. only after the exclusive kernel lock succeeds, write the complete current owner record while still holding that lock;
+6. hold the same descriptor and kernel lock for the entire rollout transaction;
+7. on terminal cleanup, if the diagnostic record still carries the current `transaction_nonce`, clear/mark that record as released while the kernel lock is still held;
+8. whether or not the diagnostic record can be updated, always unlock/close the held descriptor during process cleanup so a diagnostic-record anomaly cannot leak kernel ownership after the helper terminates; a nonce mismatch is reported as lock-integrity evidence and the helper never rewrites a record it does not own.
+
+The descriptor must be close-on-exec so `launchctl`, `plutil`, and other child commands cannot accidentally inherit and prolong ownership after the rollout helper exits.
+
+If the lock path is a symlink, not a regular file, has unsafe ownership/mode, cannot be opened safely, or kernel-lock state cannot be determined, return `LOCK_AMBIGUOUS` and perform no rollout mutation.
+
+An old diagnostic owner record from a crashed helper may remain in the persistent file. Once a new helper has successfully acquired the exclusive kernel lock, that old record is not treated as a live owner and may be replaced by the new diagnostic record. There is no stale-lock rename/delete path in V1.
+
+This eliminates the user-space stale-reclamation TOCTOU where two contenders could both observe an old owner and one contender could later rename away the other's newly published lock. It remains a cooperative same-user lock, not a privilege or security boundary: a non-cooperating process with the same local authority can ignore advisory locking.
 
 ## 10. Self-Hosted Rollout Refusal
 
@@ -667,37 +687,76 @@ If runtime ownership cannot be proven, return `ROLLBACK_REFUSED_CONCURRENT_DRIFT
 
 ### 14.2 Failure after `COMMITTED`: compensating rollback
 
-Automatic compensating rollback after `COMMITTED` is allowed only when **both** persistent and runtime CAS still belong to this transaction:
+Automatic compensating rollback after `COMMITTED` is allowed only while the helper still holds the transaction's kernel rollout lock and persistent/runtime state can be classified safely.
+
+The initial rollback eligibility check requires:
 
 ```text
 sha256(current canonical plist) == this transaction's candidate canonical hash
 AND
-loaded runtime is either:
+canonical plist + parent identity still satisfy the qualified file contract
+AND
+kernel rollout lock is still held by this helper descriptor
+AND
+diagnostic owner record transaction_nonce == this transaction_nonce
+AND
+runtime state is one of:
   A. the exact transaction candidate process generation
   OR
   B. a same-candidate-slot KeepAlive replacement that independently passes strong identity
-AND
-listener owner PID == the verified candidate PID
-AND
-no incompatible same-label runtime generation has appeared
+  OR
+  C. confirmed candidate absence: no active same-label service generation and no owner of 127.0.0.1:7676
 ```
 
-If any part differs, another actor changed persistent or runtime state. Return:
+Case C covers a candidate that crashed or otherwise disappeared after commit. Confirmed absence is a candidate/runtime failure, not evidence by itself that another actor changed state.
+
+If a concrete incompatible same-label runtime appears, canonical bytes change, an unrelated process owns port 7676, or this helper no longer owns the rollout lock, return:
 
 ```text
 ROLLBACK_REFUSED_CONCURRENT_DRIFT
+ROLLBACK_REFUSED_UNPROVEN_STATE
 ```
 
 and do not `bootout` the unknown runtime or overwrite the new canonical state with the old backup.
 
-If rollback CAS succeeds:
+If runtime/service/listener ownership cannot be observed with enough certainty to classify it as A, B, C, or concrete drift, return:
 
 ```text
-request candidate bootout
-  -> verify candidate stopped with the bounded stop barrier
-  -> prepare same-directory canonical temp from exact hash-verified old backup
-  -> flush/hash-verify temp
-  -> atomic same-directory rename old temp -> canonical
+ROLLBACK_REFUSED_UNPROVEN_STATE
+```
+
+and leave the committed canonical state untouched for operator recovery.
+
+If the runtime is A or B, prove consequential-stop ownership, request candidate bootout, and verify the bounded stopped barrier. If the runtime is C, no bootout is issued.
+
+The helper then prepares the old canonical bytes in a hidden same-directory temporary file and flushes/hash-verifies them. **Immediately before the rollback rename**, it performs a second gate, `ROLLBACK_PRE_RESTORE_REVALIDATED`:
+
+```text
+sha256(current canonical plist) == this transaction's candidate canonical hash
+AND
+canonical plist + parent identity still satisfy the qualified file contract
+AND
+kernel rollout lock is still held by this helper descriptor
+AND
+diagnostic owner record transaction_nonce == this transaction_nonce
+AND
+same-label service remains confirmed stopped/absent
+AND
+127.0.0.1:7676 remains unowned
+AND
+no incompatible same-label runtime generation has appeared
+AND
+old rollback temp SHA-256 == exact verified old backup SHA-256
+AND
+old rollback temp uid/gid/mode == recorded old canonical uid/gid/mode
+```
+
+If any concrete drift is observed at this final gate, return `ROLLBACK_REFUSED_CONCURRENT_DRIFT`; if the state cannot be proven, return `ROLLBACK_REFUSED_UNPROVEN_STATE`. In either case, do not rename over the canonical plist.
+
+Only after `ROLLBACK_PRE_RESTORE_REVALIDATED` passes may compensating restore proceed:
+
+```text
+atomic same-directory rename old temp -> canonical
   -> synchronize canonical parent directory through the qualified Darwin adapter
   -> bootstrap old definition
   -> resolve old PID/process generation
@@ -714,6 +773,8 @@ SWITCH_FAILED_ROLLBACK_FAILED
 ```
 
 `SWITCH_FAILED_ROLLBACK_OK` means the rollout failed and the old service was restored. It must never be presented as rollout success.
+
+The kernel lock plus these revalidations protect cooperating rollout helpers. They do not create an atomic compare-and-swap guarantee against an arbitrary same-user process that ignores the advisory lock and mutates launchd or the canonical plist between observations.
 
 ## 15. Crash and Power-Loss Semantics
 
@@ -806,6 +867,7 @@ SELF_HOSTED_ROLLOUT_REFUSED
 SWITCH_FAILED_ROLLBACK_OK
 SWITCH_FAILED_ROLLBACK_FAILED
 ROLLBACK_REFUSED_CONCURRENT_DRIFT
+ROLLBACK_REFUSED_UNPROVEN_STATE
 ```
 
 Results include bounded evidence such as hashes, PIDs, process generation identities, entrypoint realpaths, listener ownership, and health status. They do not include credentials, OAuth state, Keychain content, tokens, or arbitrary environment values.
@@ -874,37 +936,41 @@ Required tests include at least:
 7. absolute/escaping symlinks, unsupported entry types, and ambiguous path characters fail artifact qualification;
 8. canonical plist symlink, wrong owner, group/world-writable mode, or unexpected parent directory fails before service interruption;
 9. replacement temp preserves the prechecked canonical uid/gid/mode exactly;
-10. lock refuses a live matching owner;
-11. stale lock with dead/reused process generation is atomically moved and retried;
-12. malformed/ambiguous lock is not auto-deleted;
-13. lock release refuses to remove a different nonce;
-14. ancestry containing live DevSpace PID -> `SELF_HOSTED_ROLLOUT_REFUSED`;
-15. candidate plist changes only the approved entrypoint field;
-16. candidate plist preserves `RunAtLoad=true` and `KeepAlive=true`;
-17. a persistently disabled launchd override fails the persistence contract and the helper never mutates that override;
-18. every consequential bootout refuses an unexpected same-label process generation instead of stopping it;
-19. `bootout` command success alone does not advance state until the expected process is gone and the stop barrier passes;
-20. lingering old/candidate ownership of port 7676 blocks the next bootstrap;
-21. unrelated ownership of port 7676 is concurrent drift and is never killed by the helper;
-22. candidate runtime may not commit until listener owner PID equals candidate PID;
-23. `/healthz` success with wrong listener/process identity still fails;
-24. candidate is booted out, verified stopped, and successfully bootstrapped a second time from the exact same staged plist before commit;
-25. controlled reload failure occurs while canonical disk bytes are still the old known-good definition and cannot report success;
-26. runtime drift after controlled reload but before commit fails `PRE_COMMIT_REVALIDATED` without replacing canonical bytes;
-27. canonical temp is created inside the canonical parent with a non-`.plist` hidden name, exact candidate bytes, and matching hash;
-28. required pre-rename file flush failure leaves old canonical bytes intact and prevents commit;
-29. atomic canonical rename failure leaves old canonical bytes intact;
-30. successful atomic rename is the single `COMMITTED` transition; a later acknowledgement is not a second commit point;
-31. parent-directory synchronization failure occurs after `COMMITTED` and is classified as post-commit qualification failure, eligible only for compensating rollback;
-32. post-commit compensating rollback requires both the transaction candidate canonical hash and the transaction-owned candidate runtime generation/same-slot verified replacement;
-33. same candidate canonical hash with an unexpected same-label runtime -> `ROLLBACK_REFUSED_CONCURRENT_DRIFT` and does not bootout that runtime;
-34. compensating rollback uses same-directory atomic replacement of the exact hash-verified old backup and verifies the old runtime after bootstrap;
-35. a staging-loaded candidate whose staging file/path is gone still reconciles as a valid steady state when canonical definition, strong runtime identity, entrypoint, and listener ownership match;
-36. true canonical/runtime disagreement -> `SPLIT_STATE_DETECTED`;
-37. successful rollout leaves canonical bytes equal to the twice-verified staged definition, preserves persistence flags/file identity, and records `CONTROLLED_RELOAD=PASS`;
-38. result classification distinguishes `ROLLOUT_OK`, pre-commit failure with successful old-runtime recovery, post-commit failure with successful compensating rollback, and rollback refusal/failure.
+10. a live kernel lock causes `LOCK_BUSY` and the contender does not modify the current owner record;
+11. a crashed/released owner leaves the fixed lock file in place, and a later helper can acquire the released kernel lock without stale rename/delete;
+12. two contenders that both observe an old diagnostic record cannot both become owners: once A acquires the kernel lock and writes its record, B's earlier observation cannot rename/delete/replace the lock file and B receives `LOCK_BUSY`;
+13. symlink/non-regular/unsafe lock-file identity or indeterminate kernel-lock state -> `LOCK_AMBIGUOUS` without rollout mutation;
+14. a helper never clears/rewrites another transaction's diagnostic nonce, while terminal cleanup still closes its own held descriptor;
+15. ancestry containing live DevSpace PID -> `SELF_HOSTED_ROLLOUT_REFUSED`;
+16. candidate plist changes only the approved entrypoint field;
+17. candidate plist preserves `RunAtLoad=true` and `KeepAlive=true`;
+18. a persistently disabled launchd override fails the persistence contract and the helper never mutates that override;
+19. every consequential bootout refuses an unexpected same-label process generation instead of stopping it;
+20. `bootout` command success alone does not advance state until the expected process is gone and the stop barrier passes;
+21. lingering old/candidate ownership of port 7676 blocks the next bootstrap;
+22. unrelated ownership of port 7676 is concurrent drift and is never killed by the helper;
+23. candidate runtime may not commit until listener owner PID equals candidate PID;
+24. `/healthz` success with wrong listener/process identity still fails;
+25. candidate is booted out, verified stopped, and successfully bootstrapped a second time from the exact same staged plist before commit;
+26. controlled reload failure occurs while canonical disk bytes are still the old known-good definition and cannot report success;
+27. runtime drift after controlled reload but before commit fails `PRE_COMMIT_REVALIDATED` without replacing canonical bytes;
+28. canonical temp is created inside the canonical parent with a non-`.plist` hidden name, exact candidate bytes, and matching hash;
+29. required pre-rename file flush failure leaves old canonical bytes intact and prevents commit;
+30. atomic canonical rename failure leaves old canonical bytes intact;
+31. successful atomic rename is the single `COMMITTED` transition; a later acknowledgement is not a second commit point;
+32. parent-directory synchronization failure occurs after `COMMITTED` and is classified as post-commit qualification failure, eligible only for compensating rollback;
+33. post-commit compensating rollback accepts an exact transaction candidate generation, a verified same-slot KeepAlive replacement, or confirmed candidate absence; confirmed absence is not mislabeled as concurrent drift;
+34. same candidate canonical hash with an unexpected same-label runtime or unrelated listener -> `ROLLBACK_REFUSED_CONCURRENT_DRIFT` and does not bootout that runtime;
+35. ambiguous/unobservable rollback runtime state -> `ROLLBACK_REFUSED_UNPROVEN_STATE` and leaves canonical bytes untouched;
+36. after initial rollback eligibility succeeds, canonical/runtime/lock drift introduced during the stop barrier or temp preparation is detected by `ROLLBACK_PRE_RESTORE_REVALIDATED` and prevents the final rename;
+37. rollback final revalidation proves the transaction kernel lock/nonce, candidate canonical hash/file identity, stopped/absent service state, unowned listener, and exact old-temp backup hash/uid/gid/mode immediately before restore;
+38. compensating rollback uses same-directory atomic replacement of the exact hash-verified old backup and verifies the old runtime after bootstrap;
+39. a staging-loaded candidate whose staging file/path is gone still reconciles as a valid steady state when canonical definition, strong runtime identity, entrypoint, and listener ownership match;
+40. true canonical/runtime disagreement -> `SPLIT_STATE_DETECTED`;
+41. successful rollout leaves canonical bytes equal to the twice-verified staged definition, preserves persistence flags/file identity, and records `CONTROLLED_RELOAD=PASS`;
+42. result classification distinguishes `ROLLOUT_OK`, pre-commit failure with successful old-runtime recovery, post-commit failure with successful compensating rollback, `ROLLBACK_REFUSED_CONCURRENT_DRIFT`, `ROLLBACK_REFUSED_UNPROVEN_STATE`, and rollback failure.
 
-Optional local qualification may use a disposable launchd label, never the production label, to validate the macOS launchd adapter on the target OS.
+Before the first production-label live use, the macOS launchd/process/listener/filesystem adapter **must** pass a target-host qualification using a disposable launchd label and disposable port/path; mock tests alone are insufficient. The initial target host is currently observed as macOS `27.0`, and the qualification must record the exact target version and adapter evidence without touching `com.ethan.devspace`. A later macOS major-version change requires requalification before another live rollout.
 
 ## 21. Implementation Boundaries
 
@@ -917,7 +983,7 @@ scripts/devspace-macos-rollout.ts
 docs/macos-launchd-rollout.md
 ```
 
-The helper may reuse small generic ideas from the existing local-agent daemon lock implementation, but it must not copy the daemon's PID-only ownership contract. Rollout ownership includes process generation and transaction nonce.
+The helper may reuse generic filesystem-validation or bounded-evidence patterns from existing DevSpace code, but V1 rollout locking does **not** reuse the local-agent daemon's user-space stale-lock reclamation algorithm. Rollout single-writer ownership is the fixed-file kernel `flock(2)` contract in §9; the PID/start-identity/nonce record is diagnostic evidence only.
 
 No refactor of the daemon lock is required for this change.
 
@@ -939,7 +1005,7 @@ Before the helper can be used against `com.ethan.devspace`:
 8. current live process identity is recorded;
 9. current live listener owner and `/healthz` are recorded;
 10. a hash-bound old plist backup exists;
-11. if used, the launchd adapter has passed a disposable-label qualification on the target macOS version;
+11. the launchd/process/listener/filesystem adapter has passed the mandatory disposable-label qualification on the target Mac's current macOS version without touching `com.ethan.devspace`;
 12. an external operator context is chosen whose ancestor chain does not include live DevSpace;
 13. the user explicitly authorizes the actual live switch.
 
@@ -976,10 +1042,11 @@ Only then may `REBOOT_RECOVERY=PASS` be reported.
 
 The implementation PR must include a runbook for at least:
 
-- `LOCK_AMBIGUOUS` inspection without deleting unknown ownership;
+- `LOCK_AMBIGUOUS` inspection without deleting/replacing the fixed lock file;
 - `SPLIT_STATE_DETECTED` where canonical is old but runtime is candidate;
 - candidate start failure with unchanged old canonical plist;
 - `ROLLBACK_REFUSED_CONCURRENT_DRIFT`;
+- `ROLLBACK_REFUSED_UNPROVEN_STATE` where rollback state cannot be proven but no concrete concurrent actor is established;
 - canonical candidate committed but service not running;
 - Mac reboot/login where LaunchAgent did not auto-start;
 - distinguishing local DevSpace recovery from tunnel/public-endpoint recovery.
@@ -1027,8 +1094,8 @@ The implementation is complete when all of the following are true:
 
 - rollout can only proceed from an exact whole-plist and strong process-identity match;
 - candidate artifact identity is verified before old service interruption;
-- only one rollout transaction owns the lock at a time;
-- lock ownership survives PID reuse ambiguity through process-generation identity and nonce;
+- only one cooperating rollout transaction can hold the fixed-file kernel exclusive lock at a time;
+- stale diagnostic records require no rename/delete recovery and cannot let a second cooperating contender displace a later owner;
 - self-hosted descendant execution fails before mutation;
 - the old canonical plist remains unchanged until candidate runtime verification succeeds;
 - candidate listener ownership is tied to the verified candidate PID;
@@ -1037,11 +1104,13 @@ The implementation is complete when all of the following are true:
 - a rollout cannot publish the canonical plist until the candidate has been bootstrapped and re-verified a second time from the exact staged bytes that will be published;
 - every consequential stop has an observable stopped barrier before another generation is bootstrapped;
 - `PRE_COMMIT_REVALIDATED` fresh-checks canonical bytes, candidate bytes, runtime generation, listener ownership, and liveness immediately before commit;
-- post-`COMMITTED` compensating rollback is CAS-protected against both persistent and runtime concurrent drift;
+- post-`COMMITTED` compensating rollback is protected by an initial persistent/runtime eligibility check **and** `ROLLBACK_PRE_RESTORE_REVALIDATED` immediately before the restore rename;
+- confirmed candidate absence is distinguished from concrete concurrent drift, and ambiguous rollback state fails closed as `ROLLBACK_REFUSED_UNPROVEN_STATE`;
 - a successful staging-loaded runtime remains reconcilable after transaction staging cleanup without requiring the historical bootstrap plist path to exist;
 - interrupted transactions are detected as split state rather than silently repaired;
 - `RunAtLoad=true` and `KeepAlive=true` remain mandatory in every committed definition;
 - the service label is verified not to have a persistent disabled override, and rollout never mutates enable/disable policy;
 - ordinary tests never touch the real production LaunchAgent;
+- target-host adapter qualification with a disposable label/port/path is mandatory before first production-label live use and after a macOS major-version change;
 - live rollout remains separately authorization-gated;
 - reboot recovery is not claimed as empirically PASS until a real authorized Mac restart/login qualification succeeds.
