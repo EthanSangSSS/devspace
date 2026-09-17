@@ -90,6 +90,29 @@ macTest("model mismatch returns a typed failure and never invokes a fallback exe
   assert.equal(await fixture.invocations(), 1);
 });
 
+macTest("missing required Agy flag fails before the worker starts", async (t) => {
+  const fixture = await delegationFixture(t, "gemini-3.8-flash-high", currentAgyPolicy, {
+    helpFlags: ["--model", "--effort", "--output-format", "--mode", "--print"],
+  });
+  const service = new AgyDelegationService({
+    config: fixture.config,
+    gitleaksPath: fixture.gitleaksPath,
+  });
+  const result = await service.delegate({
+    profile: "repo-read",
+    task: "Read README.md.",
+    dryRun: false,
+    repositoryRoot: fixture.repo,
+    expectedSourceHead: fixture.head,
+    allowedReadPaths: ["README.md"],
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.envelope.failureClass, "AGY_UNAVAILABLE");
+  assert.equal(result.envelope.workerStarted, false);
+  assert.equal(await fixture.invocations(), 0);
+});
+
 macTest("repo-validate runs declared validation in the disposable snapshot before read-only analysis", async (t) => {
   const fixture = await delegationFixture(t, "gemini-3.8-flash-high");
   const service = new AgyDelegationService({
@@ -191,6 +214,7 @@ async function delegationFixture(
   t: TestContext,
   model: string,
   policy: typeof currentAgyPolicy = currentAgyPolicy,
+  options: { helpFlags?: readonly string[] } = {},
 ): Promise<{
   repo: string;
   head: string;
@@ -223,11 +247,12 @@ async function delegationFixture(
   const invocationsPath = join(root, "invocations.txt");
   const promptsPath = join(root, "prompts.txt");
   const agyPath = join(root, "agy");
+  const helpFlags = options.helpFlags ?? ["--model", "--effort", "--output-format", "--mode", "--sandbox", "--print"];
   await writeFile(agyPath, [
     "#!/bin/sh",
     "case \"$1\" in",
     "  --version) echo 1.1.22; exit 0;;",
-    "  --help) printf '%s\\n' --model --effort --output-format --mode --sandbox --print; exit 0;;",
+    `  --help) printf '%s\\n' ${helpFlags.map((value) => JSON.stringify(value)).join(" ")}; exit 0;;`,
     "esac",
     `printf '%s\\n' invoked >> ${JSON.stringify(invocationsPath)}`,
     `printf '%s\\n' "$2" >> ${JSON.stringify(promptsPath)}`,
