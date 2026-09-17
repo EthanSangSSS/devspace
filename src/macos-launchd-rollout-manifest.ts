@@ -9,12 +9,13 @@ import {
   dirname,
   isAbsolute,
   join,
+  posix,
   relative,
   resolve,
   sep,
 } from "node:path";
 
-const CANDIDATE_ENTRYPOINT_SUFFIX = join(
+const CANDIDATE_ENTRYPOINT_SUFFIX = posix.join(
   "node_modules",
   "@waishnav",
   "devspace",
@@ -28,15 +29,15 @@ export interface CandidateSlotManifest {
 }
 
 export function resolveCandidateSlotRoot(candidateEntrypoint: string): string {
-  if (!isAbsolute(candidateEntrypoint)) {
+  if (!posix.isAbsolute(candidateEntrypoint)) {
     throw new Error("candidate entrypoint must be an absolute path");
   }
-  const normalized = resolve(candidateEntrypoint);
-  const suffix = `${sep}${CANDIDATE_ENTRYPOINT_SUFFIX}`;
+  const normalized = posix.normalize(candidateEntrypoint);
+  const suffix = `/${CANDIDATE_ENTRYPOINT_SUFFIX}`;
   if (!normalized.endsWith(suffix)) {
     throw new Error(`candidate entrypoint must end with ${CANDIDATE_ENTRYPOINT_SUFFIX}`);
   }
-  return normalized.slice(0, -suffix.length) || sep;
+  return normalized.slice(0, -suffix.length) || "/";
 }
 
 export async function buildCandidateSlotManifest(slotRoot: string): Promise<CandidateSlotManifest> {

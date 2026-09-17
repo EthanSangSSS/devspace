@@ -15,6 +15,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 import type { FileIdentity, ProcessIdentity } from "./macos-launchd-rollout.js";
 import {
+  assertDarwinPlatform,
   buildProcessIdentityFromObservations,
   buildQualificationFixture,
   parseLaunchctlPrint,
@@ -33,6 +34,8 @@ import {
   waitForStableState,
   waitForStoppedState,
 } from "./macos-launchd-rollout-darwin.js";
+
+const posixFsTest = process.platform === "win32" ? test.skip : test;
 
 const execFileAsync = promisify(execFile);
 
@@ -203,6 +206,12 @@ test("process and listener parsers preserve exact identity without whitespace sp
   );
 });
 
+test("Darwin adapter platform guard fails closed outside macOS", () => {
+  assert.doesNotThrow(() => assertDarwinPlatform("darwin"));
+  assert.throws(() => assertDarwinPlatform("linux"), /require(?:s)? Darwin/i);
+  assert.throws(() => assertDarwinPlatform("win32"), /require(?:s)? Darwin/i);
+});
+
 test("canonical file identity validation rejects symlink, unsafe mode, owner, and parent drift", async () => {
   const parent = identity({
     path: "/Users/ethan/Library/LaunchAgents",
@@ -240,7 +249,7 @@ test("canonical file identity validation rejects symlink, unsafe mode, owner, an
   }));
 });
 
-test("same-directory canonical temp preserves bytes and file identity, and fsync failures propagate", async (t) => {
+posixFsTest("same-directory canonical temp preserves bytes and file identity, and fsync failures propagate", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-rollout-durability-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const canonicalPath = join(root, "com.ethan.devspace.plist");
@@ -359,7 +368,7 @@ test("file digest observation hashes exact bytes and fails closed on read errors
   assert.equal((await readFileSha256(join(root, "missing.plist"))).kind, "unproven");
 });
 
-test("file identity observation fresh-reads uid/gid/mode and fails closed on missing paths", async (t) => {
+posixFsTest("file identity observation fresh-reads uid/gid/mode and fails closed on missing paths", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-rollout-file-identity-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const path = join(root, "old-restore.tmp");

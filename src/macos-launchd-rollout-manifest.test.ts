@@ -20,6 +20,7 @@ import {
 } from "./macos-launchd-rollout-manifest.js";
 
 const execFileAsync = promisify(execFile);
+const posixFsTest = process.platform === "win32" ? test.skip : test;
 
 async function createSlot(root: string, reverseCreationOrder = false): Promise<string> {
   const slot = join(root, reverseCreationOrder ? "slot-reverse" : "slot-forward");
@@ -42,7 +43,7 @@ async function createSlot(root: string, reverseCreationOrder = false): Promise<s
   return slot;
 }
 
-test("candidate manifest is deterministic and encodes the entire slot", async (t) => {
+posixFsTest("candidate manifest is deterministic and encodes the entire slot", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-rollout-manifest-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const forward = await createSlot(root, false);
@@ -67,7 +68,7 @@ test("candidate manifest is deterministic and encodes the entire slot", async (t
   assert.equal(second.sha256, first.sha256, "directory creation order must not affect digest");
 });
 
-test("candidate manifest rejects escaping symlinks and ambiguous paths", async (t) => {
+posixFsTest("candidate manifest rejects escaping symlinks and ambiguous paths", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-rollout-manifest-invalid-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
 
@@ -88,7 +89,7 @@ test("candidate manifest rejects escaping symlinks and ambiguous paths", async (
   );
 });
 
-test("candidate manifest rejects unsupported filesystem entry types", async (t) => {
+posixFsTest("candidate manifest rejects unsupported filesystem entry types", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-rollout-manifest-fifo-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const fifo = join(root, "runtime.fifo");

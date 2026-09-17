@@ -19,6 +19,8 @@ import {
   type RolloutLockOwnerRecord,
 } from "./macos-launchd-rollout-lock.js";
 
+const posixFsTest = process.platform === "win32" ? test.skip : test;
+
 function owner(transactionId: string, nonce = `${transactionId}-nonce`): RolloutLockOwnerRecord {
   return {
     schema_version: 1 as const,
@@ -30,7 +32,7 @@ function owner(transactionId: string, nonce = `${transactionId}-nonce`): Rollout
   };
 }
 
-test("kernel busy leaves diagnostic owner bytes untouched", async (t) => {
+posixFsTest("kernel busy leaves diagnostic owner bytes untouched", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-rollout-lock-busy-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const lockPath = join(root, "rollout.lock");
@@ -45,7 +47,7 @@ test("kernel busy leaves diagnostic owner bytes untouched", async (t) => {
   assert.equal(await readFile(lockPath, "utf8"), previous);
 });
 
-test("unlocked stale diagnostic record is replaced only after kernel acquisition", async (t) => {
+posixFsTest("unlocked stale diagnostic record is replaced only after kernel acquisition", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-rollout-lock-stale-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const lockPath = join(root, "rollout.lock");
@@ -69,7 +71,7 @@ test("unlocked stale diagnostic record is replaced only after kernel acquisition
   assert.equal(typeof released.released_at, "string");
 });
 
-test("release never overwrites another diagnostic nonce", async (t) => {
+posixFsTest("release never overwrites another diagnostic nonce", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-rollout-lock-nonce-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const lockPath = join(root, "rollout.lock");
@@ -83,7 +85,7 @@ test("release never overwrites another diagnostic nonce", async (t) => {
   assert.deepEqual(JSON.parse(await readFile(lockPath, "utf8")), foreign);
 });
 
-test("unsafe lock identities fail closed as LOCK_AMBIGUOUS", async (t) => {
+posixFsTest("unsafe lock identities fail closed as LOCK_AMBIGUOUS", async (t) => {
   const effectiveUid = process.geteuid?.() ?? process.getuid?.() ?? 0;
   const safe = {
     path: "/tmp/rollout.lock",

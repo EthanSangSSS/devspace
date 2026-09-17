@@ -26,6 +26,7 @@ import {
   dirname,
   isAbsolute,
   join,
+  posix,
   relative,
   resolve,
   sep,
@@ -48,7 +49,7 @@ import type {
 } from "./macos-launchd-rollout.js";
 
 const execFileAsync = promisify(execFile);
-const DEVSPACE_ENTRYPOINT_SUFFIX = join(
+const DEVSPACE_ENTRYPOINT_SUFFIX = posix.join(
   "node_modules",
   "@waishnav",
   "devspace",
@@ -146,6 +147,10 @@ export interface DarwinQualificationFixture {
   serverSource: string;
 }
 
+export function assertDarwinPlatform(platform: NodeJS.Platform = process.platform): void {
+  if (platform !== "darwin") throw new Error("macOS rollout adapters require Darwin");
+}
+
 export function buildQualificationFixture(input: {
   nonce: string;
   port: number;
@@ -160,15 +165,15 @@ export function buildQualificationFixture(input: {
     throw new Error("qualification port is invalid");
   }
   if (input.port === DEFAULT_PORT) throw new Error("qualification must not use the production port");
-  if (!isAbsolute(input.nodeExecutable)) throw new Error("qualification Node executable must be absolute");
+  if (!posix.isAbsolute(input.nodeExecutable)) throw new Error("qualification Node executable must be absolute");
 
   const label = `com.ethan.devspace.rollout-qualification.${input.nonce}`;
-  const root = join(input.tempRoot, `DevSpace Rollout Qualification ${input.nonce}`);
-  const slotRoot = join(root, "Qualification Slot With Space");
-  const entrypointPath = join(slotRoot, DEVSPACE_ENTRYPOINT_SUFFIX);
-  const plistPath = join(input.homeDir, "Library", "LaunchAgents", `${label}.plist`);
-  const stdoutPath = join(root, "stdout.log");
-  const stderrPath = join(root, "stderr.log");
+  const root = posix.join(input.tempRoot, `DevSpace Rollout Qualification ${input.nonce}`);
+  const slotRoot = posix.join(root, "Qualification Slot With Space");
+  const entrypointPath = posix.join(slotRoot, DEVSPACE_ENTRYPOINT_SUFFIX);
+  const plistPath = posix.join(input.homeDir, "Library", "LaunchAgents", `${label}.plist`);
+  const stdoutPath = posix.join(root, "stdout.log");
+  const stderrPath = posix.join(root, "stderr.log");
   const serverSource = [
     'const http = require("node:http");',
     'const port = Number(process.env.DEVSPACE_QUALIFICATION_PORT);',
@@ -280,7 +285,7 @@ export async function runDarwinQualificationSequence(
 }
 
 export async function qualifyDarwinRolloutEnvironment(): Promise<DarwinQualificationResult> {
-  if (process.platform !== "darwin") throw new Error("macOS rollout qualification requires Darwin");
+  assertDarwinPlatform();
   const uid = requireEffectiveUid();
   const nonce = randomBytes(8).toString("hex");
   const port = await findFreeLoopbackPort();
@@ -538,7 +543,7 @@ export function parsePsCommand(output: string): ObservedState<string> {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
-  if (lines.length !== 1 || !isAbsolute(lines[0]!)) {
+  if (lines.length !== 1 || !posix.isAbsolute(lines[0]!)) {
     return { kind: "unproven", reason: "ps comm output is missing, non-absolute, or ambiguous" };
   }
   return { kind: "known", value: lines[0]! };
@@ -596,7 +601,7 @@ export async function buildProcessIdentityFromObservations(input: {
   }
   const argv = input.launchd.normalizedArgv;
   const entrypointIndexes = argv
-    .map((argument, index) => argument.endsWith(`${sep}${DEVSPACE_ENTRYPOINT_SUFFIX}`) ? index : -1)
+    .map((argument, index) => argument.endsWith(`/${DEVSPACE_ENTRYPOINT_SUFFIX}`) ? index : -1)
     .filter((index) => index >= 0);
   if (entrypointIndexes.length !== 1 || entrypointIndexes[0] !== 1 || argv.at(-1) !== "serve") {
     return { kind: "unproven", reason: "launchd arguments do not match the V1 DevSpace topology" };
@@ -869,6 +874,7 @@ export async function waitForStableState(
 export function createDarwinRolloutAdapters(
   options: DarwinRolloutAdapterOptions = {},
 ): MacosRolloutAdapters {
+  assertDarwinPlatform();
   const uid = options.uid ?? requireEffectiveUid();
   const label = options.label ?? DEFAULT_LABEL;
   const canonicalPath = options.canonicalPath
@@ -979,7 +985,7 @@ export function createDarwinRolloutAdapters(
         ) {
           return { kind: "unproven", reason: "canonical plist semantic contract is invalid" };
         }
-        const entrypoints = fields.programArguments.filter((value) => value.endsWith(`${sep}${DEVSPACE_ENTRYPOINT_SUFFIX}`));
+        const entrypoints = fields.programArguments.filter((value) => value.endsWith(`/${DEVSPACE_ENTRYPOINT_SUFFIX}`));
         if (entrypoints.length !== 1 || fields.programArguments[1] !== entrypoints[0]) {
           return { kind: "unproven", reason: "canonical plist has an ambiguous DevSpace entrypoint" };
         }
