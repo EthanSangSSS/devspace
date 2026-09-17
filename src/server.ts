@@ -29,10 +29,6 @@ import {
   type AgyDelegationResult,
 } from "./agy-delegation.js";
 import {
-  AGY_REQUIRED_EFFORT,
-  AGY_REQUIRED_MODEL,
-} from "./agy-delegation-types.js";
-import {
   createOpenAIIncomingArtifactAdapter,
   type IncomingArtifactAdapter,
 } from "./incoming-artifacts.js";
@@ -306,7 +302,7 @@ function registerAgyDelegationTools(
     {
       title: "Inspect Agy runtime",
       description:
-        "Inspect the configured local Agy runtime and fixed delegation policy without starting an agent.",
+        "Inspect the configured local Agy runtime and server-side delegation policy without starting an agent.",
       inputSchema: {},
       outputSchema: resultOutputSchema({
         tool_surface_registered: z.literal(true),
@@ -318,8 +314,9 @@ function registerAgyDelegationTools(
         agy_path: z.string(),
         agy_version: z.string(),
         agy_executable_sha256: z.string(),
-        requested_model: z.literal(AGY_REQUIRED_MODEL),
-        requested_effort: z.literal(AGY_REQUIRED_EFFORT),
+        requested_model: z.string(),
+        requested_effort: z.string(),
+        compatible_versions: z.string(),
         required_flags_supported: z.boolean(),
         telemetry_enabled: z.boolean(),
         trusted_cli_auth_mode: z.string(),
@@ -336,7 +333,7 @@ function registerAgyDelegationTools(
     async () => {
       const startedAt = performance.now();
       const runtime = await service.inspectRuntime();
-      const result = `Agy ${runtime.agyVersion} available; fixed model ${runtime.requiredModel}, effort ${runtime.requiredEffort}.`;
+      const result = `Agy ${runtime.agyVersion} available; configured model ${runtime.requiredModel}, effort ${runtime.requiredEffort}.`;
       logToolCall(config, {
         tool: "get_agy_runtime",
         success: true,
@@ -357,6 +354,7 @@ function registerAgyDelegationTools(
           agy_executable_sha256: runtime.agyExecutableSha256,
           requested_model: runtime.requiredModel,
           requested_effort: runtime.requiredEffort,
+          compatible_versions: runtime.compatibleVersions,
           required_flags_supported: runtime.requiredFlagsSupported,
           telemetry_enabled: runtime.telemetryEnabled,
           trusted_cli_auth_mode: runtime.trustedCliAuthMode,
@@ -377,8 +375,6 @@ function registerAgyDelegationTools(
         profile: z.enum(["repo-read", "repo-validate", "gui-inspect"]),
         task: z.string().min(1),
         dry_run: z.boolean().optional(),
-        requested_model: z.literal(AGY_REQUIRED_MODEL),
-        requested_effort: z.literal(AGY_REQUIRED_EFFORT),
         workspaceId: z.string().optional().describe("Required for repo-read and repo-validate."),
         expected_source_head: z.string().regex(/^[0-9a-f]{40}$/i).optional(),
         allowed_read_paths: z.array(z.string().min(1)).min(1).optional(),
@@ -401,9 +397,9 @@ function registerAgyDelegationTools(
         request_reached_devspace: z.boolean(),
         policy_preflight_passed: z.boolean(),
         worker_started: z.boolean(),
-        requested_model: z.literal(AGY_REQUIRED_MODEL),
+        requested_model: z.string(),
         resolved_model: z.string().optional(),
-        requested_effort: z.literal(AGY_REQUIRED_EFFORT),
+        requested_effort: z.string(),
         effort_selection_verified: z.boolean(),
         expected_source_head: z.string().optional(),
         source_head: z.string().optional(),
@@ -440,7 +436,9 @@ function registerAgyDelegationTools(
 
       if (input.profile === "gui-inspect") {
         if (!input.target) {
-          return agyDelegationToolResponse(policyDeniedAgyResult(input.profile, dryRun));
+          return agyDelegationToolResponse(
+            policyDeniedAgyResult(input.profile, dryRun, config.agyDelegation),
+          );
         }
         request = {
           profile: "gui-inspect",
@@ -454,7 +452,9 @@ function registerAgyDelegationTools(
         };
       } else {
         if (!input.workspaceId || !input.expected_source_head || !input.allowed_read_paths) {
-          return agyDelegationToolResponse(policyDeniedAgyResult(input.profile, dryRun));
+          return agyDelegationToolResponse(
+            policyDeniedAgyResult(input.profile, dryRun, config.agyDelegation),
+          );
         }
         const workspace = workspaces.getWorkspace(input.workspaceId);
         request = {
@@ -485,6 +485,7 @@ function registerAgyDelegationTools(
 function policyDeniedAgyResult(
   profile: "repo-read" | "repo-validate" | "gui-inspect",
   dryRun: boolean,
+  policy: { model: string; effort: string },
 ): AgyDelegationResult {
   return {
     ok: false,
@@ -498,8 +499,8 @@ function policyDeniedAgyResult(
       requestReachedDevspace: true,
       policyPreflightPassed: false,
       workerStarted: false,
-      requestedModel: AGY_REQUIRED_MODEL,
-      requestedEffort: AGY_REQUIRED_EFFORT,
+      requestedModel: policy.model,
+      requestedEffort: policy.effort,
       effortSelectionVerified: false,
       changedPersistentPaths: [],
       failureClass: "POLICY_DENIED",

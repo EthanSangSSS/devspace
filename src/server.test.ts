@@ -215,7 +215,7 @@ test("Agy delegation tools are hidden by default", async (t) => {
   assert.equal(names.includes("delegate_to_agy"), false);
 });
 
-test("enabled Agy delegation exposes honest, fixed-policy MCP schemas", async (t) => {
+test("enabled Agy delegation exposes stable server-policy MCP schemas", async (t) => {
   const service = fakeAgyService();
   const context = await fixture(t, { agyDelegationEnabled: true, agyService: service.service });
   const tools = (await context.client.listTools()).tools;
@@ -228,11 +228,26 @@ test("enabled Agy delegation exposes honest, fixed-policy MCP schemas", async (t
   assert.match(delegate.description ?? "", /model provider/i);
 
   const input = delegate.inputSchema as {
-    properties?: Record<string, { const?: unknown; enum?: unknown[] }>;
+    properties?: Record<string, { const?: unknown; enum?: unknown[]; type?: unknown }>;
+  };
+  const runtimeOutput = runtime.outputSchema as {
+    properties?: Record<string, { const?: unknown; type?: unknown }>;
+  };
+  const delegateOutput = delegate.outputSchema as {
+    properties?: Record<string, { const?: unknown; type?: unknown }>;
   };
   assert.deepEqual(input.properties?.profile?.enum, ["repo-read", "repo-validate", "gui-inspect"]);
-  assert.equal(input.properties?.requested_model?.const, "gemini-3.8-flash-high");
-  assert.equal(input.properties?.requested_effort?.const, "high");
+  assert.equal("requested_model" in (input.properties ?? {}), false);
+  assert.equal("requested_effort" in (input.properties ?? {}), false);
+  assert.equal(runtimeOutput.properties?.requested_model?.type, "string");
+  assert.equal(runtimeOutput.properties?.requested_model?.const, undefined);
+  assert.equal(runtimeOutput.properties?.requested_effort?.type, "string");
+  assert.equal(runtimeOutput.properties?.requested_effort?.const, undefined);
+  assert.equal(runtimeOutput.properties?.compatible_versions?.type, "string");
+  assert.equal(delegateOutput.properties?.requested_model?.type, "string");
+  assert.equal(delegateOutput.properties?.requested_model?.const, undefined);
+  assert.equal(delegateOutput.properties?.requested_effort?.type, "string");
+  assert.equal(delegateOutput.properties?.requested_effort?.const, undefined);
 });
 
 test("delegate_to_agy dry-run resolves the workspace and does not start a worker", async (t) => {
@@ -255,8 +270,6 @@ test("delegate_to_agy dry-run resolves the workspace and does not start a worker
       profile: "repo-read",
       task: "Read README.md.",
       dry_run: true,
-      requested_model: "gemini-3.8-flash-high",
-      requested_effort: "high",
       expected_source_head: head,
       allowed_read_paths: ["README.md"],
     },
@@ -273,6 +286,40 @@ test("delegate_to_agy dry-run resolves the workspace and does not start a worker
   assert.equal(fake.workerStarts, 0);
   assert.equal(structuredContent(result).worker_started, false);
   assert.equal(structuredContent(result).policy_preflight_passed, true);
+});
+
+test("delegate_to_agy ignores legacy model and effort fields as migration-only extras", async (t) => {
+  const fake = fakeAgyService();
+  const context = await fixture(t, {
+    git: true,
+    agyDelegationEnabled: true,
+    agyService: fake.service,
+  });
+  const opened = structuredContent(await callOpen(context.client, context.project, "chat-agy-legacy"));
+  const head = (await execFileAsync("git", ["rev-parse", "HEAD"], {
+    cwd: context.project,
+    encoding: "utf8",
+  })).stdout.trim();
+
+  const result = await context.client.callTool({
+    name: "delegate_to_agy",
+    arguments: {
+      workspaceId: opened.workspaceId,
+      profile: "repo-read",
+      task: "Read README.md.",
+      dry_run: true,
+      requested_model: "legacy-caller-override-must-be-ignored",
+      requested_effort: "low",
+      expected_source_head: head,
+      allowed_read_paths: ["README.md"],
+    },
+  } as Parameters<Client["callTool"]>[0]);
+
+  assert.equal(fake.requests.length, 1);
+  assert.equal("requestedModel" in (fake.requests[0] as unknown as Record<string, unknown>), false);
+  assert.equal("requestedEffort" in (fake.requests[0] as unknown as Record<string, unknown>), false);
+  assert.equal(structuredContent(result).requested_model, "gemini-3.8-flash-high");
+  assert.equal(structuredContent(result).requested_effort, "high");
 });
 
 test("open_workspace keeps lifecycle flags out of model output and preserves complete card metadata", async (t) => {
