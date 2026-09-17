@@ -14,9 +14,14 @@ const currentAgyPolicy = {
   effort: "high",
   compatibleVersions: ">=1.1.22 <1.2.0",
 };
+const customAgyPolicy = {
+  model: "gemini-qualified-model",
+  effort: "medium",
+  compatibleVersions: ">=1.1.22 <1.2.0",
+};
 
 macTest("repo-read returns verified claims and leaves source unchanged", async (t) => {
-  const fixture = await delegationFixture(t, "gemini-3.8-flash-high");
+  const fixture = await delegationFixture(t, "gemini-qualified-model", customAgyPolicy);
   const service = new AgyDelegationService({
     config: fixture.config,
     gitleaksPath: fixture.gitleaksPath,
@@ -33,7 +38,9 @@ macTest("repo-read returns verified claims and leaves source unchanged", async (
 
   assert.equal(result.ok, true, JSON.stringify(result));
   assert.equal(result.envelope.workerStarted, true);
-  assert.equal(result.envelope.resolvedModel, "gemini-3.8-flash-high");
+  assert.equal(result.envelope.requestedModel, "gemini-qualified-model");
+  assert.equal(result.envelope.requestedEffort, "medium");
+  assert.equal(result.envelope.resolvedModel, "gemini-qualified-model");
   assert.equal(result.envelope.expectedSourceHead, fixture.head);
   assert.equal(result.envelope.sourceHead, fixture.head);
   assert.equal(result.envelope.changedPersistentPaths.length, 0);
@@ -41,7 +48,7 @@ macTest("repo-read returns verified claims and leaves source unchanged", async (
 });
 
 macTest("repo-read prompt binds the worker to the exact disposable snapshot root", async (t) => {
-  const fixture = await delegationFixture(t, "gemini-3.8-flash-high");
+  const fixture = await delegationFixture(t, "gemini-qualified-model", customAgyPolicy);
   const service = new AgyDelegationService({
     config: fixture.config,
     gitleaksPath: fixture.gitleaksPath,
@@ -63,7 +70,7 @@ macTest("repo-read prompt binds the worker to the exact disposable snapshot root
 });
 
 macTest("model mismatch returns a typed failure and never invokes a fallback executor", async (t) => {
-  const fixture = await delegationFixture(t, "gemini-3.8-flash-low");
+  const fixture = await delegationFixture(t, "gemini-3.8-flash-low", customAgyPolicy);
   const service = new AgyDelegationService({
     config: fixture.config,
     gitleaksPath: fixture.gitleaksPath,
@@ -124,7 +131,7 @@ macTest("gui-inspect redacts sensitive AX content and brokers one semantic actio
     `printf '%s\\n' \"$2\" >> ${JSON.stringify(promptsPath)}`,
     `printf '%s\\n' invoked >> ${JSON.stringify(invocationsPath)}`,
     `count=$(wc -l < ${JSON.stringify(invocationsPath)} | tr -d ' ')`,
-    "printf '%s\\n' '{\"event\":\"init\",\"init\":{\"model\":\"gemini-3.8-flash-high\"}}'",
+    "printf '%s\\n' '{\"event\":\"init\",\"init\":{\"model\":\"gemini-qualified-model\"}}'",
     "if [ \"$count\" = \"1\" ]; then",
     "  printf '%s\\n' '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"{\\\"kind\\\":\\\"intent\\\",\\\"intent\\\":{\\\"type\\\":\\\"select_existing_tab\\\",\\\"elementIndex\\\":11}}\"}}'",
     "else",
@@ -153,7 +160,7 @@ macTest("gui-inspect redacts sensitive AX content and brokers one semantic actio
       agyPath,
       cuaDriverPath: cuaPath,
       settingsPath,
-      ...currentAgyPolicy,
+      ...customAgyPolicy,
     },
     gitleaksPath: "/usr/bin/true",
   });
@@ -169,6 +176,9 @@ macTest("gui-inspect redacts sensitive AX content and brokers one semantic actio
   if (!result.ok) return;
   assert.equal(result.response, "pins inspected");
   assert.equal(result.envelope.workerStarted, true);
+  assert.equal(result.envelope.requestedModel, "gemini-qualified-model");
+  assert.equal(result.envelope.requestedEffort, "medium");
+  assert.equal(result.envelope.resolvedModel, "gemini-qualified-model");
   const prompts = await readFile(promptsPath, "utf8");
   assert.equal(prompts.includes("SECRET_BODY"), false);
   assert.equal(prompts.includes("SECRET_VALUE"), false);
@@ -177,7 +187,11 @@ macTest("gui-inspect redacts sensitive AX content and brokers one semantic actio
   assert.match(await readFile(actionPath, "utf8"), /"element_index":11/);
 });
 
-async function delegationFixture(t: TestContext, model: string): Promise<{
+async function delegationFixture(
+  t: TestContext,
+  model: string,
+  policy: typeof currentAgyPolicy = currentAgyPolicy,
+): Promise<{
   repo: string;
   head: string;
   config: {
@@ -237,7 +251,7 @@ async function delegationFixture(t: TestContext, model: string): Promise<{
       agyPath,
       cuaDriverPath: join(root, "cua-driver"),
       settingsPath,
-      ...currentAgyPolicy,
+      ...policy,
     },
     gitleaksPath,
     invocations: async () => {

@@ -54,9 +54,9 @@ export interface AgyExecutionEnvelope extends AgyPlatformStages {
   executionId: string;
   profile: AgyProfile;
   dryRun: boolean;
-  requestedModel: typeof AGY_REQUIRED_MODEL;
+  requestedModel: string;
   resolvedModel?: string;
-  requestedEffort: typeof AGY_REQUIRED_EFFORT;
+  requestedEffort: string;
   effortSelectionVerified: boolean;
   workerStarted: boolean;
   failureClass?: AgyFailureClass;

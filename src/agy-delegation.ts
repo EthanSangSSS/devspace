@@ -61,9 +61,9 @@ export interface AgyDelegationEnvelope {
   requestReachedDevspace: true;
   policyPreflightPassed: boolean;
   workerStarted: boolean;
-  requestedModel: typeof AGY_REQUIRED_MODEL;
+  requestedModel: string;
   resolvedModel?: string;
-  requestedEffort: typeof AGY_REQUIRED_EFFORT;
+  requestedEffort: string;
   effortSelectionVerified: boolean;
   expectedSourceHead?: string;
   sourceHead?: string;
@@ -115,8 +115,8 @@ export class AgyDelegationService {
       requestReachedDevspace: true,
       policyPreflightPassed: false,
       workerStarted: false,
-      requestedModel: AGY_REQUIRED_MODEL,
-      requestedEffort: AGY_REQUIRED_EFFORT,
+      requestedModel: this.options.config.model,
+      requestedEffort: this.options.config.effort,
       effortSelectionVerified: false,
       expectedSourceHead: request.expectedSourceHead,
       changedPersistentPaths: [],
@@ -170,6 +170,8 @@ export class AgyDelegationService {
       envelope.workerStarted = true;
       const run = await runAgyHeadless({
         agyPath: this.options.config.agyPath,
+        model: this.options.config.model,
+        effort: this.options.config.effort,
         cwd: snapshot.root,
         taskRoot: snapshot.taskRoot,
         prompt: buildRepositoryPrompt(request, snapshot.root, validationReceipts),
@@ -216,8 +218,8 @@ export class AgyDelegationService {
       requestReachedDevspace: true,
       policyPreflightPassed: false,
       workerStarted: false,
-      requestedModel: AGY_REQUIRED_MODEL,
-      requestedEffort: AGY_REQUIRED_EFFORT,
+      requestedModel: this.options.config.model,
+      requestedEffort: this.options.config.effort,
       effortSelectionVerified: false,
       changedPersistentPaths: [],
     };
@@ -247,6 +249,8 @@ export class AgyDelegationService {
         envelope.workerStarted = true;
         const run = await runAgyHeadless({
           agyPath: this.options.config.agyPath,
+          model: this.options.config.model,
+          effort: this.options.config.effort,
           cwd: taskRoot,
           taskRoot,
           prompt: buildGuiPrompt(request.task, snapshot),

@@ -3,11 +3,7 @@ import { chmod, lstat, mkdir, readlink, realpath, symlink, writeFile } from "nod
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
-import {
-  AGY_REQUIRED_EFFORT,
-  AGY_REQUIRED_MODEL,
-  AgyDelegationError,
-} from "./agy-delegation-types.js";
+import { AgyDelegationError } from "./agy-delegation-types.js";
 import { parseAgyStream, verifyAgyCommandArguments } from "./agy-runtime.js";
 
 const execFileAsync = promisify(execFile);
@@ -16,6 +12,8 @@ const RETRYABLE_STREAM_INTERRUPTION = "The stream was interrupted. Please contin
 
 export interface AgyHeadlessRunInput {
   agyPath: string;
+  model: string;
+  effort: string;
   cwd: string;
   taskRoot: string;
   prompt: string;
@@ -75,8 +73,8 @@ export async function runAgyHeadless(input: AgyHeadlessRunInput): Promise<AgyHea
 
   const args = [
     "--print", input.prompt,
-    "--model", AGY_REQUIRED_MODEL,
-    "--effort", AGY_REQUIRED_EFFORT,
+    "--model", input.model,
+    "--effort", input.effort,
     "--output-format", "stream-json",
     "--mode", "plan",
     "--sandbox",
@@ -84,8 +82,7 @@ export async function runAgyHeadless(input: AgyHeadlessRunInput): Promise<AgyHea
     "--log-file", logPath,
     ...(input.jsonSchema ? ["--json-schema", input.jsonSchema] : []),
   ];
-  const fixedPolicy = { model: AGY_REQUIRED_MODEL, effort: AGY_REQUIRED_EFFORT };
-  verifyAgyCommandArguments(args, fixedPolicy);
+  verifyAgyCommandArguments(args, input);
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let stdout: string;
@@ -102,7 +99,7 @@ export async function runAgyHeadless(input: AgyHeadlessRunInput): Promise<AgyHea
       const captured = childText(error, "stdout");
       if (captured.trim()) {
         try {
-          parseAgyStream(captured.split(/\r?\n/), AGY_REQUIRED_MODEL);
+          parseAgyStream(captured.split(/\r?\n/), input.model);
         } catch (parsedError) {
           if (parsedError instanceof AgyDelegationError
             && ["MODEL_MISMATCH", "MODEL_UNVERIFIED"].includes(parsedError.code)) {
@@ -121,7 +118,7 @@ export async function runAgyHeadless(input: AgyHeadlessRunInput): Promise<AgyHea
     }
 
     try {
-      const parsed = parseAgyStream(stdout.split(/\r?\n/), AGY_REQUIRED_MODEL);
+      const parsed = parseAgyStream(stdout.split(/\r?\n/), input.model);
       return {
         resolvedModel: parsed.resolvedModel,
         response: parsed.response,
