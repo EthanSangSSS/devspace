@@ -28,6 +28,9 @@ export interface AgyDelegationConfig {
   agyPath: string;
   cuaDriverPath: string;
   settingsPath: string;
+  model: string;
+  effort: string;
+  compatibleVersions: string;
 }
 
 export interface AgyPlatformStages {

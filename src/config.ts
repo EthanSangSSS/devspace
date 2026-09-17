@@ -82,6 +82,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       agyPath: normalizePath(stored.agyDelegation.agyPath),
       cuaDriverPath: normalizePath(stored.agyDelegation.cuaDriverPath),
       settingsPath: normalizePath(stored.agyDelegation.settingsPath),
+      model: stored.agyDelegation.model,
+      effort: stored.agyDelegation.effort,
+      compatibleVersions: stored.agyDelegation.compatibleVersions,
     },
     agentDir: normalizePath(stored.skills.agentDir),
     logging: {

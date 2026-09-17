@@ -20,6 +20,11 @@ const requiredHelp = [
   "--print",
 ].join("\n");
 const macTest = process.platform === "darwin" ? test : test.skip;
+const currentAgyPolicy = {
+  model: "gemini-3.8-flash-high",
+  effort: "high",
+  compatibleVersions: ">=1.1.22 <1.2.0",
+};
 
 macTest("runtime introspection probes only local version/help and reports telemetry state", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-agy-runtime-test-"));
@@ -43,6 +48,7 @@ macTest("runtime introspection probes only local version/help and reports teleme
     agyPath,
     cuaDriverPath: join(root, "cua-driver"),
     settingsPath,
+    ...currentAgyPolicy,
   });
 
   assert.equal(result.agyVersion, "1.1.22");
@@ -79,6 +85,7 @@ macTest("runtime introspection accepts Agy help emitted on stderr", async (t) =>
     agyPath,
     cuaDriverPath: join(root, "cua-driver"),
     settingsPath,
+    ...currentAgyPolicy,
   });
 
   assert.equal(result.requiredFlagsSupported, true);
@@ -96,6 +103,7 @@ test("real-run preflight rejects telemetry enabled without mutating settings", a
       agyPath: join(root, "agy"),
       cuaDriverPath: join(root, "cua-driver"),
       settingsPath,
+      ...currentAgyPolicy,
     }),
     (error: unknown) => error instanceof AgyDelegationError && error.code === "TELEMETRY_POLICY_UNENFORCEABLE",
   );

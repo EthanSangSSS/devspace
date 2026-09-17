@@ -9,6 +9,11 @@ import { AgyDelegationService } from "./agy-delegation.js";
 
 const execFileAsync = promisify(execFile);
 const macTest = process.platform === "darwin" ? test : test.skip;
+const currentAgyPolicy = {
+  model: "gemini-3.8-flash-high",
+  effort: "high",
+  compatibleVersions: ">=1.1.22 <1.2.0",
+};
 
 macTest("repo-read returns verified claims and leaves source unchanged", async (t) => {
   const fixture = await delegationFixture(t, "gemini-3.8-flash-high");
@@ -143,7 +148,13 @@ macTest("gui-inspect redacts sensitive AX content and brokers one semantic actio
   const settingsPath = join(root, "settings.json");
   await writeFile(settingsPath, JSON.stringify({ enableTelemetry: false }));
   const service = new AgyDelegationService({
-    config: { enabled: true, agyPath, cuaDriverPath: cuaPath, settingsPath },
+    config: {
+      enabled: true,
+      agyPath,
+      cuaDriverPath: cuaPath,
+      settingsPath,
+      ...currentAgyPolicy,
+    },
     gitleaksPath: "/usr/bin/true",
   });
 
@@ -174,6 +185,9 @@ async function delegationFixture(t: TestContext, model: string): Promise<{
     agyPath: string;
     cuaDriverPath: string;
     settingsPath: string;
+    model: string;
+    effort: string;
+    compatibleVersions: string;
   };
   gitleaksPath: string;
   invocations: () => Promise<number>;
@@ -218,7 +232,13 @@ async function delegationFixture(t: TestContext, model: string): Promise<{
   return {
     repo,
     head,
-    config: { enabled: true, agyPath, cuaDriverPath: join(root, "cua-driver"), settingsPath },
+    config: {
+      enabled: true,
+      agyPath,
+      cuaDriverPath: join(root, "cua-driver"),
+      settingsPath,
+      ...currentAgyPolicy,
+    },
     gitleaksPath,
     invocations: async () => {
       try {
