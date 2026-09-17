@@ -122,7 +122,7 @@ test("disabled-service parser is exact and fails closed on unknown output", asyn
   assert.equal(parsePrintDisabled(enabled, "missing.label").kind, "unproven");
 });
 
-test("process and listener parsers preserve exact identity without whitespace splitting", async () => {
+posixFsTest("process and listener parsers preserve exact identity without whitespace splitting", async () => {
   const txt = [
     "p32479",
     "ftxt",
@@ -439,7 +439,7 @@ test("qualification orchestration is ordered, bounded, and always cleans up", as
   assert.deepEqual(failedCalls, ["version", "lock", "durability", "cleanup"]);
 });
 
-test("qualification fixture is disposable, non-production, and exercises an argv path with spaces", () => {
+posixFsTest("qualification fixture is disposable, non-production, and exercises an argv path with spaces", () => {
   const fixture = buildQualificationFixture({
     nonce: "abc123",
     port: 49123,

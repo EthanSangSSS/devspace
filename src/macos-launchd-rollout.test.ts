@@ -20,6 +20,8 @@ import {
 import { buildCandidateSlotManifest } from "./macos-launchd-rollout-manifest.js";
 import type { RolloutLockLease } from "./macos-launchd-rollout-lock.js";
 
+const rolloutTest = process.platform === "win32" ? test.skip : test;
+
 const known = <T>(value: T): ObservedState<T> => ({ kind: "known", value });
 const unproven = <T>(reason: string): ObservedState<T> => ({ kind: "unproven", reason });
 
@@ -36,7 +38,7 @@ function rollbackState(
   };
 }
 
-test("rollback refusal taxonomy is deterministic and drift-first", async () => {
+rolloutTest("rollback refusal taxonomy is deterministic and drift-first", async () => {
   const cases = [
     {
       name: "canonical hash drift is concrete drift",
@@ -501,7 +503,7 @@ function forwardProcess(pid: number, entrypoint: string, generation: string): Pr
   };
 }
 
-test("forward rollout verifies twice and commits only after pre-commit revalidation", async (t) => {
+rolloutTest("forward rollout verifies twice and commits only after pre-commit revalidation", async (t) => {
   const fixture = await createForwardFixture(t);
   const result = await runMacosLaunchdForwardPath(fixture.request, fixture.adapters);
   assert.equal(result.ok, true);
@@ -517,7 +519,7 @@ test("forward rollout verifies twice and commits only after pre-commit revalidat
   assert.ok(fixture.calls.includes("canonical:parent-synced"));
 });
 
-test("forward rollout pre-commit failures never publish canonical and retain the lease", async (t) => {
+rolloutTest("forward rollout pre-commit failures never publish canonical and retain the lease", async (t) => {
   const cases: Array<{
     name: string;
     fixture: ForwardFixture;
@@ -585,7 +587,7 @@ test("forward rollout pre-commit failures never publish canonical and retain the
   }
 });
 
-test("forward rollout re-qualifies a same-slot KeepAlive replacement before commit", async (t) => {
+rolloutTest("forward rollout re-qualifies a same-slot KeepAlive replacement before commit", async (t) => {
   const fixture = await createForwardFixture(t, { keepAliveReplacementBeforeCommit: true });
   const result = await runMacosLaunchdForwardPath(fixture.request, fixture.adapters);
   assert.equal(result.ok, true);
@@ -594,7 +596,7 @@ test("forward rollout re-qualifies a same-slot KeepAlive replacement before comm
   assert.equal(fixture.calls.includes("COMMITTED"), true);
 });
 
-test("forward rollout preserves the lease when an adapter throws after old bootout", async (t) => {
+rolloutTest("forward rollout preserves the lease when an adapter throws after old bootout", async (t) => {
   const fixture = await createForwardFixture(t, { oldStopBarrierThrows: true });
   const result = await runMacosLaunchdForwardPath(fixture.request, fixture.adapters);
   assert.equal(result.ok, false);
@@ -605,7 +607,7 @@ test("forward rollout preserves the lease when an adapter throws after old booto
   assert.equal(fixture.getReleaseCalls(), 0);
 });
 
-test("pre-commit recovery reuses an exact old runtime that survived the stop request", async (t) => {
+rolloutTest("pre-commit recovery reuses an exact old runtime that survived the stop request", async (t) => {
   const fixture = await createForwardFixture(t, { oldBootoutLeavesRuntime: true });
   const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
 
@@ -615,7 +617,7 @@ test("pre-commit recovery reuses an exact old runtime that survived the stop req
   assert.equal(fixture.getReleaseCalls(), 1);
 });
 
-test("pre-commit recovery stops an owned candidate then bootstraps the unchanged old canonical", async (t) => {
+rolloutTest("pre-commit recovery stops an owned candidate then bootstraps the unchanged old canonical", async (t) => {
   const fixture = await createForwardFixture(t, { firstCandidateHealthy: false });
   const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
 
@@ -626,7 +628,7 @@ test("pre-commit recovery stops an owned candidate then bootstraps the unchanged
   assert.equal(fixture.getReleaseCalls(), 1);
 });
 
-test("pre-commit recovery skips bootout for confirmed candidate absence", async (t) => {
+rolloutTest("pre-commit recovery skips bootout for confirmed candidate absence", async (t) => {
   const fixture = await createForwardFixture(t, { oldStopBarrierThrows: true });
   const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
 
@@ -636,7 +638,7 @@ test("pre-commit recovery skips bootout for confirmed candidate absence", async 
   assert.equal(fixture.getReleaseCalls(), 1);
 });
 
-test("pre-commit recovery classifies concrete canonical/runtime drift separately from unproven state", async (t) => {
+rolloutTest("pre-commit recovery classifies concrete canonical/runtime drift separately from unproven state", async (t) => {
   const cases = [
     {
       name: "canonical hash drift",
@@ -685,7 +687,7 @@ test("pre-commit recovery classifies concrete canonical/runtime drift separately
   }
 });
 
-test("post-commit qualification failure performs runtime-aware compensating rollback", async (t) => {
+rolloutTest("post-commit qualification failure performs runtime-aware compensating rollback", async (t) => {
   const fixture = await createForwardFixture(t, { postCommitHealthFailure: true });
   const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
 
@@ -696,7 +698,7 @@ test("post-commit qualification failure performs runtime-aware compensating roll
   assert.equal(fixture.getReleaseCalls(), 1);
 });
 
-test("post-commit rollback accepts confirmed candidate absence without bootout", async (t) => {
+rolloutTest("post-commit rollback accepts confirmed candidate absence without bootout", async (t) => {
   const fixture = await createForwardFixture(t, {
     postCommitHealthFailure: true,
     postCommitRuntimeAbsent: true,
@@ -710,7 +712,7 @@ test("post-commit rollback accepts confirmed candidate absence without bootout",
   assert.equal(fixture.getReleaseCalls(), 1);
 });
 
-test("post-commit rollback refuses concrete drift and distinguishes unproven lock state", async (t) => {
+rolloutTest("post-commit rollback refuses concrete drift and distinguishes unproven lock state", async (t) => {
   const cases = [
     {
       name: "unexpected same-label runtime",
@@ -742,7 +744,7 @@ test("post-commit rollback refuses concrete drift and distinguishes unproven loc
   }
 });
 
-test("rollback final revalidation refuses drift after initial eligibility and before restore rename", async (t) => {
+rolloutTest("rollback final revalidation refuses drift after initial eligibility and before restore rename", async (t) => {
   const canonicalDrift = await createForwardFixture(t, {
     postCommitHealthFailure: true,
     rollbackFinalCanonicalDrift: true,
@@ -764,7 +766,7 @@ test("rollback final revalidation refuses drift after initial eligibility and be
   assert.equal(tempDrift.getReleaseCalls(), 1);
 });
 
-test("rollback reports failure when old canonical cannot be bootstrapped after an eligible recovery", async (t) => {
+rolloutTest("rollback reports failure when old canonical cannot be bootstrapped after an eligible recovery", async (t) => {
   const fixture = await createForwardFixture(t, {
     firstCandidateHealthy: false,
     rollbackBootstrapFails: true,
@@ -775,7 +777,7 @@ test("rollback reports failure when old canonical cannot be bootstrapped after a
   assert.equal(fixture.getReleaseCalls(), 1);
 });
 
-test("public rollout acknowledges a verified candidate and releases the kernel lease", async (t) => {
+rolloutTest("public rollout acknowledges a verified candidate and releases the kernel lease", async (t) => {
   const fixture = await createForwardFixture(t);
   const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
   assert.equal(outcome.code, "ROLLOUT_OK");
@@ -785,7 +787,7 @@ test("public rollout acknowledges a verified candidate and releases the kernel l
   assert.equal(fixture.getReleaseCalls(), 1);
 });
 
-test("public rollout preserves typed lock acquisition failures", async (t) => {
+rolloutTest("public rollout preserves typed lock acquisition failures", async (t) => {
   for (const code of ["LOCK_BUSY", "LOCK_AMBIGUOUS"] as const) {
     const fixture = await createForwardFixture(t);
     fixture.adapters.acquireLock = async () => {

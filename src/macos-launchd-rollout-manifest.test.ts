@@ -106,7 +106,7 @@ posixFsTest("candidate manifest rejects unsupported filesystem entry types", asy
   );
 });
 
-test("candidate slot root is derived only from the exact V1 package suffix", async () => {
+posixFsTest("candidate slot root is derived only from the exact V1 package suffix", async () => {
   assert.equal(
     resolveCandidateSlotRoot(
       "/Users/ethan/.local/opt/devspace-1.1.0-candidate/node_modules/@waishnav/devspace/dist/cli.js",
@@ -119,7 +119,7 @@ test("candidate slot root is derived only from the exact V1 package suffix", asy
   );
 });
 
-test("candidate manifest verification requires the exact digest", async (t) => {
+posixFsTest("candidate manifest verification requires the exact digest", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-rollout-manifest-verify-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const slot = await createSlot(root);
