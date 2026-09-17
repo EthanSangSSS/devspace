@@ -430,6 +430,79 @@ test("abandoned idle sessions expire without waiting for capacity pressure", asy
   );
 });
 
+test("active MCP requests survive idle cleanup and get a fresh idle window after release", {
+  timeout: 5_000,
+}, async (t) => {
+  const idleTimeoutMs = 200;
+  const cleanupIntervalMs = 20;
+  const fixture = await startFixture(4, undefined, {
+    idleTimeoutMs,
+    cleanupIntervalMs,
+  });
+  const releasePath = join(fixture.root, "active-timeout.release");
+  t.after(async () => {
+    await writeFile(releasePath, "release").catch(() => {});
+    await fixture.close();
+  });
+
+  const active = await initializeReadySession(
+    fixture.baseUrl,
+    fixture.accessToken,
+    fixture.project,
+  );
+  const readyPath = join(fixture.root, "active-timeout.ready");
+  let activeSettled = false;
+  const activeId = nextId++;
+  const activeRequest = postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    {
+      jsonrpc: "2.0",
+      id: activeId,
+      method: "tools/call",
+      params: {
+        name: "exec_command",
+        arguments: activeExecArgs(active.workspaceId, readyPath, releasePath),
+      },
+    },
+    active.sessionId,
+  ).finally(() => {
+    activeSettled = true;
+  });
+  await waitForFile(readyPath, 2_000);
+  assert.equal(activeSettled, false);
+
+  const idleSession = await initializeSession(fixture.baseUrl, fixture.accessToken);
+  await notifyInitialized(fixture.baseUrl, fixture.accessToken, idleSession);
+  assert.equal(
+    (await listTools(fixture.baseUrl, fixture.accessToken, idleSession)).status,
+    200,
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.equal(activeSettled, false);
+  assert.equal(
+    (await listTools(fixture.baseUrl, fixture.accessToken, idleSession)).status,
+    404,
+  );
+  assert.equal(activeSettled, false);
+
+  await writeFile(releasePath, "release");
+  const activeResult = await activeRequest;
+  assert.equal(activeResult.status, 200);
+  assert.equal("error" in responseForId(activeResult, activeId), false);
+  assert.equal(
+    (await listTools(fixture.baseUrl, fixture.accessToken, active.sessionId)).status,
+    200,
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.equal(
+    (await listTools(fixture.baseUrl, fixture.accessToken, active.sessionId)).status,
+    404,
+  );
+});
+
 test("process sessions survive MCP transport expiry and remain writable from a fresh transport", async (t) => {
   const fixture = await startFixture(4, undefined, {
     idleTimeoutMs: 40,

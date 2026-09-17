@@ -82,8 +82,8 @@ import {
 type Transport = StreamableHTTPServerTransport;
 // MCP clients can reconnect without closing the previous transport. Bound stale
 // session retention so abandoned MCP servers do not accumulate for the life of the process.
-const MCP_SESSION_IDLE_TIMEOUT_MS = 5 * 60 * 1_000;
-const MCP_SESSION_CLEANUP_INTERVAL_MS = 60 * 1_000;
+const MCP_SESSION_IDLE_TIMEOUT_MS = 2 * 60 * 1_000;
+const MCP_SESSION_CLEANUP_INTERVAL_MS = 30 * 1_000;
 const MCP_MAX_SESSIONS = 64;
 const MCP_RUNTIME_SNAPSHOT_INTERVAL_MS = 60_000;
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
