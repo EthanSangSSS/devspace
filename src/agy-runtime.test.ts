@@ -24,12 +24,14 @@ const currentAgyPolicy = {
   model: "gemini-3.8-flash-high",
   effort: "high",
   compatibleVersions: ">=1.1.22 <1.2.0",
+  guiForegroundPolicy: "deny" as const,
 };
 
 const customAgyPolicy = {
   model: "gemini-qualified-model",
   effort: "medium",
   compatibleVersions: ">=1.1.22 <1.2.0",
+  guiForegroundPolicy: "deny" as const,
 };
 
 macTest("runtime introspection probes only local version/help and reports telemetry state", async (t) => {
@@ -61,6 +63,7 @@ macTest("runtime introspection probes only local version/help and reports teleme
   assert.equal(result.requiredModel, "gemini-qualified-model");
   assert.equal(result.requiredEffort, "medium");
   assert.equal(result.compatibleVersions, ">=1.1.22 <1.2.0");
+  assert.equal(result.guiForegroundPolicy, "deny");
   assert.equal(result.requiredFlagsSupported, true);
   assert.equal(result.telemetryEnabled, false);
   assert.equal(result.taskLocalSessionEnforcement, "available");

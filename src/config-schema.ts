@@ -49,6 +49,7 @@ const agyDelegationConfigSchema = z.object({
   model: z.string().min(1).regex(/\S/).default("gemini-3.8-flash-high"),
   effort: z.string().min(1).regex(/\S/).default("high"),
   compatibleVersions: z.string().min(1).regex(/\S/).default(">=1.1.22 <1.2.0"),
+  guiForegroundPolicy: z.enum(["deny", "allow-restore"]).default("deny"),
 }).strict().prefault({});
 
 const loggingConfigSchema = z.object({

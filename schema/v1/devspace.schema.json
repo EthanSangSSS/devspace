@@ -248,6 +248,14 @@
           "type": "string",
           "minLength": 1,
           "pattern": "\\S"
+        },
+        "guiForegroundPolicy": {
+          "default": "deny",
+          "type": "string",
+          "enum": [
+            "deny",
+            "allow-restore"
+          ]
         }
       },
       "additionalProperties": false

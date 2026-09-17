@@ -167,8 +167,9 @@ that requirement. Real runs use a task-local HOME, disable update routines, and
 do not use `--continue`, `--conversation`, or
 `--dangerously-skip-permissions`.
 
-The local `agyDelegation` configuration owns model, effort, and the accepted
-Agy semantic-version range. The MCP caller does not select any of these values.
+The local `agyDelegation` configuration owns model, effort, the accepted Agy
+semantic-version range, and GUI foreground policy. The MCP caller does not
+select any of these values.
 Runtime inspection rejects malformed or out-of-range Agy versions with a typed
 fail-closed result, and required CLI capability probes remain independent of
 the version-range check. DevSpace does not auto-upgrade Agy and does not
@@ -224,6 +225,20 @@ DevSpace re-snapshots the exact window, reclassifies the fresh AX role, performs
 the bounded broker action, and snapshots again. Ambiguous or unsupported
 actions fail closed. Scrolling is treated as target-specific transient
 navigation, not as intrinsically side-effect-free observation.
+
+Brokered mutations always use CuaDriver `delivery_mode="background"`. DevSpace
+also records the user's current frontmost PID and exact top-level window using
+CuaDriver WindowServer metadata before and after each action. The default local
+policy is `guiForegroundPolicy="deny"`: a target owned by the current frontmost
+app is rejected before mutation, and any unexpected foreground change stops the
+delegation without attempting to steal focus back. This preserves human control
+when the user changes apps/windows concurrently.
+
+`guiForegroundPolicy="allow-restore"` is a stronger local authority that must
+be explicitly configured. It still attempts the action in background mode
+first, but may use CuaDriver's foreground primitive only to restore the exact
+previous PID/window after an unexpected change, followed by an independent
+frontmost-state verification. Agy cannot request or escalate to this policy.
 
 The safe claim is therefore that V1 intentionally exposes no
 persistent/external mutation capability through the broker. It does not claim
