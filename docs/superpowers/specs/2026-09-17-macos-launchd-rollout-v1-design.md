@@ -118,37 +118,46 @@ No `package.json#bin` entry is added for it, and `src/cli.ts` does not register 
 
 ### 4.2 Deferred persistent commit
 
-The canonical plist is **not** replaced before the candidate has been started and verified.
+The canonical plist is **not** replaced before the candidate has been started, stopped cleanly, started again from the same staged definition, and re-verified.
 
-The helper creates a transaction-local candidate plist outside `~/Library/LaunchAgents`, starts the candidate from that staging plist, validates the resulting process, listener, and liveness, and only then atomically publishes that exact candidate definition into the canonical LaunchAgents path.
+The helper creates a transaction-local candidate plist outside `~/Library/LaunchAgents`, validates the candidate twice through the same launchd lifecycle, performs one final runtime/plist compare-and-swap, and only then publishes the already-qualified candidate bytes into the canonical LaunchAgents path.
 
 This ordering is intentional:
 
 ```text
 canonical disk plist = old known-good
         ↓
-stop old loaded job
+stop old loaded job + verify stopped
         ↓
 bootstrap candidate from transaction staging plist
         ↓
 verify candidate identity + listener ownership + liveness
         ↓
-bootout staging-loaded candidate
+stop staging-loaded candidate + verify stopped
         ↓
 bootstrap the exact same staging candidate plist again
         ↓
 re-verify candidate identity + listener ownership + liveness
         ↓
-atomic publish those already-reloaded candidate bytes to canonical path
+PRE_COMMIT_REVALIDATED
+        ↓
+same-directory atomic canonical replace
         ↓
 COMMITTED
+        ↓
+post-commit durability finalization + qualification
+        ↓
+ROLLOUT_OK
 ```
+
+`COMMITTED` has exactly one meaning in V1: the atomic replacement of the canonical plist has occurred. `ROLLOUT_OK` is a later acknowledgement that durability finalization and post-commit qualification also passed; it is not the transaction commit point.
 
 Consequences:
 
-- before commit, a helper crash cannot make an unverified candidate the reboot target;
-- if the helper dies before canonical publish, the current login session may be split, but the next user-session launch still has the old canonical known-good definition;
-- after commit, the canonical plist is byte-identical to the candidate definition that already passed initial runtime verification and a second controlled reload.
+- before `COMMITTED`, a helper crash cannot make an unverified candidate the canonical reboot target;
+- if the helper dies before the canonical replace, the current login session may be split, but the next user-session launch still has the old canonical known-good definition;
+- after `COMMITTED`, the canonical plist is byte-identical to the candidate definition that already passed initial runtime verification and a second controlled reload;
+- if post-commit qualification fails, recovery is a compensating rollback of an already-committed candidate, not an "uncommitted transaction rollback".
 
 This is stronger than replacing the canonical plist first and then attempting rollback.
 
@@ -160,6 +169,13 @@ Before every rollout, the helper must validate all of the following:
 
 ```text
 canonical plist path == ~/Library/LaunchAgents/com.ethan.devspace.plist
+canonical plist parent == ~/Library/LaunchAgents
+canonical plist is a non-symlink regular file
+canonical plist owner uid == current effective uid
+canonical plist is not group- or world-writable
+canonical plist gid/mode are captured as part of the expected live file identity
+canonical plist parent is a non-symlink directory owned by current effective uid
+canonical plist parent is not group- or world-writable
 Label == com.ethan.devspace
 RunAtLoad == true
 KeepAlive == true
@@ -170,6 +186,8 @@ StandardOutPath and StandardErrorPath are present and preserved
 ```
 
 The candidate plist must be derived from the exact observed canonical plist and may change only the approved DevSpace entrypoint path for V1. All other keys remain semantically identical.
+
+The candidate publish temp and any compensating rollback temp must preserve the prechecked canonical plist's uid, gid, and permission mode exactly. V1 does not hard-code the current machine's numeric uid/gid or `0644` mode into portable logic; it records the qualified live file identity and requires the replacement to match it. A helper run must fail closed before service interruption if ownership or mode cannot be observed or safely reproduced.
 
 In particular, rollout must not silently change:
 
@@ -239,9 +257,21 @@ The helper fails closed if the observed topology differs.
 
 `candidate_entrypoint` must resolve to a regular file inside the candidate slot.
 
-The caller also supplies a deterministic manifest digest for the immutable candidate slot. The implementation must define one canonical manifest format and verify it before stopping the old service.
+The caller also supplies a deterministic manifest digest for the immutable candidate slot. V1 defines one canonical manifest format so caller and helper compute the same artifact identity.
 
-The manifest must cover every runtime-relevant file in the prepared slot, not merely the entrypoint JavaScript file. At minimum its identity includes relative path, entry type, and content digest for regular files; symlink identity must be explicit and must not resolve outside the approved candidate slot.
+The manifest covers the entire candidate slot tree, not a helper-selected subset of "runtime-relevant" files. Entries are emitted in canonical lexical relative-path order using POSIX `/` separators. V1 accepts only directories, regular files, and symlinks. Unsupported filesystem entry types fail closed.
+
+Each canonical manifest line is one of:
+
+```text
+D<TAB><mode-octal><TAB><relative-path><LF>
+F<TAB><mode-octal><TAB><sha256-hex><TAB><relative-path><LF>
+L<TAB><symlink-target><TAB><relative-path><LF>
+```
+
+V1 rejects manifest paths or symlink targets containing NUL, CR, LF, or TAB so the line encoding is unambiguous. Regular-file digests are SHA-256 of exact file bytes. Mode records include the permission/executable bits used by the prepared slot. Symlink targets are recorded exactly as stored and must resolve within the candidate slot; absolute links or links escaping the slot fail closed.
+
+`candidate_slot_manifest_sha256` is SHA-256 of the exact UTF-8 manifest bytes, including the final LF. The slot root itself is not emitted as a record.
 
 The helper verifies the supplied digest. It does not build the manifest from source code, install dependencies, or decide that a different candidate is equivalent.
 
@@ -276,6 +306,21 @@ LIVE_STATE_CAS_MISMATCH
 ```
 
 and performs no switch.
+
+### 7.1 Consequential stop ownership invariant
+
+Every consequential `bootout` must fresh-read and prove that the service being stopped still belongs to the transaction's currently expected state.
+
+This applies to:
+
+- the initial old-service stop;
+- stopping the first candidate generation before controlled reload;
+- any candidate cleanup after a failed pre-commit switch;
+- any post-commit compensating rollback.
+
+The proof includes the expected label, strong runtime process identity, and the runtime/plist relationship appropriate to that phase. A same-label process with an unexpected generation or entrypoint is not safe to stop merely because the canonical plist hash still matches.
+
+If ownership cannot be proven, the helper fails closed and does not `bootout` the unknown runtime. During pre-switch CAS this is `LIVE_STATE_CAS_MISMATCH`; during compensating rollback it is `ROLLBACK_REFUSED_CONCURRENT_DRIFT`.
 
 ## 8. Strong Runtime Process Identity
 
@@ -373,7 +418,22 @@ The implementation must not mutate launchd's persistent enable/disable override 
 
 Candidate start uses the transaction staging plist. The canonical plist remains unchanged until candidate verification succeeds.
 
+`bootout` command success is not equivalent to a verified stopped state. Every stop transition uses a bounded observable barrier after the stop request. The barrier must prove all of the following before another service generation may be bootstrapped:
+
+```text
+the transaction's expected process generation is no longer alive
+the expected service target is no longer active as that generation
+127.0.0.1:7676 is no longer owned by the stopped PID
+no incompatible same-label runtime has appeared
+```
+
+Before starting the next DevSpace generation, the rollout additionally requires that `127.0.0.1:7676` is not owned by an unrelated process. An unexpected owner is concurrent drift, not a reason to kill that process.
+
+The adapter may use bounded polling around ordinary `bootout`. A potentially unbounded `bootout --wait` is not the sole stop-completion mechanism.
+
 When a PID is required, prefer a documented PID-producing interface such as a qualified `launchctl kickstart -p gui/<uid>/<label>` flow if its semantics are verified not to violate the candidate start contract. If the implementation must parse `launchctl print`, that parser is an explicit macOS-version-qualified adapter and fails closed on unknown output. No design claim relies on `launchctl print` text being a stable API.
+
+Successful deferred publish does not require the currently loaded job's original bootstrap plist path to equal the canonical plist path. A staging-loaded job is reconciled with canonical state by service label, canonical definition/hash, strong runtime process identity, expected entrypoint, and listener ownership. The transaction staging path may be deleted after successful completion; its continued existence is not part of steady-state identity.
 
 ## 12. Transaction Files
 
@@ -399,6 +459,41 @@ The transaction directory is evidence, not an automatic crash-recovery journal. 
 
 Cleanup removes only exact known files/directories owned by the completed transaction. It must not use recursive wildcard deletion over shared rollout state.
 
+### 12.1 Canonical publish and durability contract
+
+The helper never renames `candidate.plist` directly from `~/.devspace/rollout/transactions/...` onto the canonical LaunchAgents path.
+
+For canonical publish it creates a hidden temporary file inside the canonical parent directory, for example:
+
+```text
+~/Library/LaunchAgents/.com.ethan.devspace.rollout-<transaction_nonce>.tmp
+```
+
+The temporary filename intentionally does not end in `.plist`.
+
+The publish protocol is:
+
+```text
+copy exact verified candidate.plist bytes to same-directory temp
+  -> verify temp is a non-symlink regular file with required ownership/mode
+  -> verify temp SHA-256 == staged candidate plist SHA-256
+  -> flush temp file through the qualified Darwin filesystem adapter
+  -> PRE_COMMIT_REVALIDATED
+  -> atomic same-directory rename temp -> canonical plist
+  -> COMMITTED
+  -> verify canonical hash/file identity
+  -> flush/synchronize canonical parent directory using the qualified Darwin durability primitive
+  -> POST_COMMIT_VERIFIED
+```
+
+The successful same-directory atomic rename is the **single logical transaction commit point**. The helper must not describe any earlier state as committed. After the rename succeeds, the candidate is the committed canonical definition even if the helper crashes before returning `ROLLOUT_OK`.
+
+Before the old service is stopped, the Darwin filesystem adapter must prove that the required same-directory temp creation, regular-file flush, atomic replacement, and parent-directory synchronization operations are available for the canonical LaunchAgents filesystem. A missing or unsupported durability primitive is a precondition failure, not something discovered for the first time after the candidate has been committed.
+
+The file flush before rename and parent-directory synchronization after rename are crash-oriented durability precautions. The implementation must treat an OS-level flush/sync error as a real failure. V1 does **not** claim a strict formal guarantee that arbitrary sudden power loss at every storage-controller/cache boundary preserves the newest bytes. If a stronger Darwin primitive such as `F_FULLFSYNC` is implemented and qualified, it may strengthen the evidence, but V1 correctness claims do not assume it unless that primitive is actually present and tested.
+
+If the helper dies after the atomic rename but before parent-directory synchronization or `ROLLOUT_OK`, the next invocation must reason from the observed canonical hash/runtime identity. It must not reinterpret the candidate as "uncommitted" merely because the previous process never emitted an acknowledgement.
+
 ## 13. State Machine
 
 The normal state machine is:
@@ -408,12 +503,18 @@ LOCKED
   -> PRECHECKED
   -> BACKED_UP
   -> CANDIDATE_STAGED
-  -> OLD_STOPPED
+  -> OLD_STOP_REQUESTED
+  -> OLD_STOPPED_VERIFIED
   -> CANDIDATE_STARTED
   -> CANDIDATE_VERIFIED
+  -> CANDIDATE_STOP_REQUESTED
+  -> CANDIDATE_STOPPED_VERIFIED
+  -> CONTROLLED_RELOAD_STARTED
   -> CONTROLLED_RELOAD_VERIFIED
-  -> CANONICAL_PUBLISHED
+  -> PRE_COMMIT_REVALIDATED
   -> COMMITTED
+  -> POST_COMMIT_VERIFIED
+  -> ROLLOUT_OK
 ```
 
 ### 13.1 `LOCKED`
@@ -443,17 +544,26 @@ LOCKED
 - candidate staging hash recorded;
 - `RunAtLoad=true` and `KeepAlive=true` still hold.
 
-### 13.5 `OLD_STOPPED`
+### 13.5 `OLD_STOP_REQUESTED`
 
 - final pre-stop CAS has been repeated successfully;
-- old launchd job is booted out from `gui/<uid>`.
+- the consequential-stop ownership invariant still identifies the exact expected old process generation;
+- `bootout` has been requested for `gui/<uid>/com.ethan.devspace`.
 
-### 13.6 `CANDIDATE_STARTED`
+### 13.6 `OLD_STOPPED_VERIFIED`
+
+- the expected old process generation is no longer alive;
+- the expected old service generation is no longer active;
+- `127.0.0.1:7676` is no longer owned by the stopped PID;
+- the port is not owned by an unrelated process;
+- the bounded stop barrier completed before candidate bootstrap.
+
+### 13.7 `CANDIDATE_STARTED`
 
 - candidate staging plist is bootstrapped into `gui/<uid>`;
 - candidate PID/process generation is resolved.
 
-### 13.7 `CANDIDATE_VERIFIED`
+### 13.8 `CANDIDATE_VERIFIED`
 
 - strong process identity matches `candidate_entrypoint`;
 - the listener on `127.0.0.1:7676` is owned by the candidate PID;
@@ -462,43 +572,81 @@ LOCKED
 
 `/healthz` is only a liveness gate. It is not proof that the full ChatGPT/MCP path or all DevSpace features are qualified.
 
-### 13.8 `CONTROLLED_RELOAD_VERIFIED`
+### 13.9 `CANDIDATE_STOP_REQUESTED`
 
-- the first verified candidate generation is booted out;
-- the exact same transaction staging plist is bootstrapped again into `gui/<uid>`;
-- a new launchd PID/process generation is resolved;
+- a fresh ownership read proves the loaded service is the exact verified candidate process generation or a same-slot KeepAlive replacement that independently passes strong identity;
+- `bootout` is requested only after that ownership proof.
+
+### 13.10 `CANDIDATE_STOPPED_VERIFIED`
+
+- the candidate process generation being stopped is no longer alive;
+- the candidate service generation is no longer active;
+- `127.0.0.1:7676` is no longer owned by the stopped PID;
+- the port is not owned by an unrelated process;
+- the bounded stop barrier completed before controlled reload bootstrap.
+
+### 13.11 `CONTROLLED_RELOAD_STARTED`
+
+- the exact same transaction staging plist bytes are bootstrapped again into `gui/<uid>`;
+- a new launchd PID/process generation is resolved.
+
+### 13.12 `CONTROLLED_RELOAD_VERIFIED`
+
 - strong process identity matches the candidate entrypoint;
 - listener owner PID matches the reloaded candidate PID;
 - `/healthz` passes;
 - the bounded stability observation passes again;
 - the staged plist bytes and staged plist hash remain unchanged from the first candidate start.
 
-### 13.9 `CANONICAL_PUBLISHED`
+### 13.13 `PRE_COMMIT_REVALIDATED`
 
-- before publish, canonical disk hash is still the exact old hash;
-- the staged candidate plist is atomically renamed/published into the canonical LaunchAgents path;
-- the newly published canonical hash equals the staged candidate hash;
-- the loaded runtime is still the already-verified candidate process generation or a same-slot KeepAlive replacement that independently passes the full identity/listener/liveness gate.
+- canonical disk hash still equals `expected_live_plist_sha256`;
+- canonical file identity still satisfies the non-symlink regular-file/ownership/mode contract;
+- staged candidate plist hash still equals the previously verified candidate plist hash;
+- the loaded runtime is still the controlled-reload candidate process generation, or a same-slot KeepAlive replacement that independently passes strong identity;
+- listener owner PID equals that verified candidate PID;
+- `/healthz` still passes;
+- no incompatible service/runtime generation has appeared;
+- the same-directory canonical temporary file has exact candidate bytes and has passed its pre-rename flush/hash checks.
 
-Successful atomic canonical publish is the durable commit point. `COMMITTED` is the acknowledged terminal state after the post-publish identity/hash checks below. If the helper process disappears after canonical publish but before it can return `ROLLOUT_OK`, V1 does not silently roll back that already-published state on the next invocation; the next operator must reconcile the observed canonical/runtime identity through the normal CAS rules.
+Any failure here returns a pre-commit failure and does not replace the canonical plist.
 
-### 13.10 `COMMITTED`
+### 13.14 `COMMITTED`
 
-- canonical plist and loaded runtime both identify the candidate slot;
+- the verified same-directory temporary file is atomically renamed over the canonical plist;
+- that successful rename is the single logical commit point;
+- from this point forward, the candidate is the committed canonical definition even if the helper exits before acknowledgement.
+
+### 13.15 `POST_COMMIT_VERIFIED`
+
+- canonical plist hash equals the staged candidate plist hash;
+- canonical file identity still satisfies the recorded uid/gid/mode and non-symlink regular-file contract;
+- parent-directory durability synchronization completed through the qualified Darwin filesystem adapter;
+- the loaded runtime is still the candidate slot under the reconciliation rule in §11;
+- listener owner PID and `/healthz` still pass;
 - persistence contract remains valid;
-- `CONTROLLED_RELOAD=PASS`;
-- transaction reports `ROLLOUT_OK`.
+- `CONTROLLED_RELOAD=PASS`.
+
+Failure after `COMMITTED` is a post-commit qualification failure and may trigger only the runtime-aware compensating rollback in §14.2.
+
+### 13.16 `ROLLOUT_OK`
+
+- post-commit verification passed;
+- the helper returns `ROLLOUT_OK` as acknowledgement of the already-committed candidate.
 
 ## 14. Rollback
 
-### 14.1 Failure before canonical publish
+### 14.1 Failure before `COMMITTED`
 
-Before `CANONICAL_PUBLISHED`, the canonical plist still contains the exact old known-good definition.
+Before `COMMITTED`, the canonical plist still contains the exact old known-good definition.
 
-If failure occurs after `OLD_STOPPED`:
+If failure occurs after `OLD_STOP_REQUESTED`, recovery first applies the consequential-stop ownership invariant to any runtime it intends to stop.
 
 ```text
-stop candidate if it is loaded/running
+fresh-read loaded runtime
+  -> if candidate cleanup is needed, prove it is this transaction's candidate generation or a same-slot verified replacement
+  -> request candidate stop
+  -> verify candidate stopped with the bounded stop barrier
   -> verify canonical plist still equals expected old hash
   -> bootstrap the unchanged canonical old plist
   -> resolve old PID/process generation
@@ -515,27 +663,42 @@ SWITCH_FAILED_ROLLBACK_OK
 
 The helper does not rewrite the canonical plist in this path because it never changed it.
 
-### 14.2 Failure after canonical publish
+If runtime ownership cannot be proven, return `ROLLBACK_REFUSED_CONCURRENT_DRIFT` and do not stop the unknown runtime.
 
-Automatic rollback after canonical publish is allowed only when:
+### 14.2 Failure after `COMMITTED`: compensating rollback
+
+Automatic compensating rollback after `COMMITTED` is allowed only when **both** persistent and runtime CAS still belong to this transaction:
 
 ```text
 sha256(current canonical plist) == this transaction's candidate canonical hash
+AND
+loaded runtime is either:
+  A. the exact transaction candidate process generation
+  OR
+  B. a same-candidate-slot KeepAlive replacement that independently passes strong identity
+AND
+listener owner PID == the verified candidate PID
+AND
+no incompatible same-label runtime generation has appeared
 ```
 
-If the hash differs, another actor changed the live definition. Return:
+If any part differs, another actor changed persistent or runtime state. Return:
 
 ```text
 ROLLBACK_REFUSED_CONCURRENT_DRIFT
 ```
 
-and do not overwrite the new state with the old backup.
+and do not `bootout` the unknown runtime or overwrite the new canonical state with the old backup.
 
 If rollback CAS succeeds:
 
 ```text
-bootout candidate if loaded
-  -> atomically restore exact hash-verified old backup
+request candidate bootout
+  -> verify candidate stopped with the bounded stop barrier
+  -> prepare same-directory canonical temp from exact hash-verified old backup
+  -> flush/hash-verify temp
+  -> atomic same-directory rename old temp -> canonical
+  -> synchronize canonical parent directory through the qualified Darwin adapter
   -> bootstrap old definition
   -> resolve old PID/process generation
   -> verify old process identity
@@ -558,8 +721,8 @@ V1 is intentionally not a journaled crash-recovery transaction manager.
 
 The guarantee is narrower:
 
-- before canonical publish, the old canonical plist remains the durable restart target;
-- after canonical publish, the candidate had already passed runtime verification;
+- before `COMMITTED`, the old canonical plist remains the durable restart target;
+- after `COMMITTED`, the candidate had already passed both runtime verification passes and pre-commit revalidation;
 - if the helper disappears mid-transaction, the next helper invocation must detect any mismatch between canonical plist and loaded runtime and fail closed as `SPLIT_STATE_DETECTED`;
 - V1 does not silently decide which side of a split state should win;
 - the runbook provides explicit recovery procedures.
@@ -567,7 +730,7 @@ The guarantee is narrower:
 Examples:
 
 ```text
-helper dies after OLD_STOPPED
+helper dies after OLD_STOPPED_VERIFIED
   disk canonical = old
   runtime = stopped
   next login/reboot -> old canonical can start automatically
@@ -578,9 +741,10 @@ helper dies after CANDIDATE_STARTED but before commit
   next helper -> SPLIT_STATE_DETECTED
   next login/reboot -> old canonical remains restart target
 
-helper dies after CANONICAL_PUBLISHED
+helper dies after COMMITTED but before POST_COMMIT_VERIFIED / ROLLOUT_OK
   disk canonical = verified candidate
   runtime = candidate that already passed the controlled reload, or a later KeepAlive generation
+  next helper -> reconcile canonical definition and runtime identity; do not call it uncommitted
   next login/reboot -> candidate is restart target
 ```
 
@@ -606,6 +770,24 @@ SPLIT_STATE_DETECTED
 The helper reports observed non-secret identity evidence and exits. It does not auto-repair ambiguous state.
 
 A canonical plist hash that is internally coherent but no longer equals the caller-supplied expected hash is not a split-state classification. It returns `LIVE_STATE_CAS_MISMATCH` under the whole-plist CAS contract.
+
+The following successful deferred-publish steady state is explicitly **not** a split state:
+
+```text
+loaded job was originally bootstrapped from a transaction staging plist
+AND
+loaded service label == com.ethan.devspace
+AND
+canonical plist semantically equals the staged definition that was committed
+AND
+canonical entrypoint == loaded runtime entrypoint
+AND
+strong runtime identity is valid
+AND
+listener owner PID == resolved runtime PID
+```
+
+The original bootstrap plist pathname is not part of durable service identity. The staging file may already have been removed. Reconciliation depends on the committed canonical definition and live runtime identity, not on the historical source path used for `bootstrap`.
 
 ## 17. Result Codes
 
@@ -687,25 +869,40 @@ Required tests include at least:
 2. entrypoint match but whole-plist hash mismatch fails CAS;
 3. runtime process generation changes after precheck and before stop -> `LIVE_STATE_CAS_MISMATCH`;
 4. candidate slot digest mismatch fails before old service stop;
-5. lock refuses a live matching owner;
-6. stale lock with dead/reused process generation is atomically moved and retried;
-7. malformed/ambiguous lock is not auto-deleted;
-8. lock release refuses to remove a different nonce;
-9. ancestry containing live DevSpace PID -> `SELF_HOSTED_ROLLOUT_REFUSED`;
-10. candidate plist changes only the approved entrypoint field;
-11. candidate plist preserves `RunAtLoad=true` and `KeepAlive=true`;
-12. a persistently disabled launchd override fails the persistence contract and the helper never mutates that override;
-13. candidate runtime may not commit until listener owner PID equals candidate PID;
-14. `/healthz` success with wrong listener/process identity still fails;
-15. candidate failure before canonical publish restarts old service from unchanged canonical plist;
-16. rollback after canonical publish requires the transaction's exact candidate plist hash;
-17. concurrent drift after publish -> `ROLLBACK_REFUSED_CONCURRENT_DRIFT`;
-18. split canonical/runtime identity -> `SPLIT_STATE_DETECTED`;
-19. atomic canonical publish failure leaves old canonical bytes intact;
-20. candidate is booted out and successfully bootstrapped a second time from the exact same staged plist before canonical publish;
-21. controlled reload failure occurs while canonical disk bytes are still the old known-good definition and cannot report success;
-22. successful commit atomically publishes the exact already-reloaded staged bytes, preserves persistence flags, and records `CONTROLLED_RELOAD=PASS`;
-23. result classification distinguishes rollout success from failed rollout with successful rollback.
+5. manifest generation is deterministic for an entire slot tree regardless of directory-enumeration order;
+6. manifest records directory/file mode, regular-file SHA-256, and exact symlink target using the canonical line encoding;
+7. absolute/escaping symlinks, unsupported entry types, and ambiguous path characters fail artifact qualification;
+8. canonical plist symlink, wrong owner, group/world-writable mode, or unexpected parent directory fails before service interruption;
+9. replacement temp preserves the prechecked canonical uid/gid/mode exactly;
+10. lock refuses a live matching owner;
+11. stale lock with dead/reused process generation is atomically moved and retried;
+12. malformed/ambiguous lock is not auto-deleted;
+13. lock release refuses to remove a different nonce;
+14. ancestry containing live DevSpace PID -> `SELF_HOSTED_ROLLOUT_REFUSED`;
+15. candidate plist changes only the approved entrypoint field;
+16. candidate plist preserves `RunAtLoad=true` and `KeepAlive=true`;
+17. a persistently disabled launchd override fails the persistence contract and the helper never mutates that override;
+18. every consequential bootout refuses an unexpected same-label process generation instead of stopping it;
+19. `bootout` command success alone does not advance state until the expected process is gone and the stop barrier passes;
+20. lingering old/candidate ownership of port 7676 blocks the next bootstrap;
+21. unrelated ownership of port 7676 is concurrent drift and is never killed by the helper;
+22. candidate runtime may not commit until listener owner PID equals candidate PID;
+23. `/healthz` success with wrong listener/process identity still fails;
+24. candidate is booted out, verified stopped, and successfully bootstrapped a second time from the exact same staged plist before commit;
+25. controlled reload failure occurs while canonical disk bytes are still the old known-good definition and cannot report success;
+26. runtime drift after controlled reload but before commit fails `PRE_COMMIT_REVALIDATED` without replacing canonical bytes;
+27. canonical temp is created inside the canonical parent with a non-`.plist` hidden name, exact candidate bytes, and matching hash;
+28. required pre-rename file flush failure leaves old canonical bytes intact and prevents commit;
+29. atomic canonical rename failure leaves old canonical bytes intact;
+30. successful atomic rename is the single `COMMITTED` transition; a later acknowledgement is not a second commit point;
+31. parent-directory synchronization failure occurs after `COMMITTED` and is classified as post-commit qualification failure, eligible only for compensating rollback;
+32. post-commit compensating rollback requires both the transaction candidate canonical hash and the transaction-owned candidate runtime generation/same-slot verified replacement;
+33. same candidate canonical hash with an unexpected same-label runtime -> `ROLLBACK_REFUSED_CONCURRENT_DRIFT` and does not bootout that runtime;
+34. compensating rollback uses same-directory atomic replacement of the exact hash-verified old backup and verifies the old runtime after bootstrap;
+35. a staging-loaded candidate whose staging file/path is gone still reconciles as a valid steady state when canonical definition, strong runtime identity, entrypoint, and listener ownership match;
+36. true canonical/runtime disagreement -> `SPLIT_STATE_DETECTED`;
+37. successful rollout leaves canonical bytes equal to the twice-verified staged definition, preserves persistence flags/file identity, and records `CONTROLLED_RELOAD=PASS`;
+38. result classification distinguishes `ROLLOUT_OK`, pre-commit failure with successful old-runtime recovery, post-commit failure with successful compensating rollback, and rollback refusal/failure.
 
 Optional local qualification may use a disposable launchd label, never the production label, to validate the macOS launchd adapter on the target OS.
 
@@ -836,13 +1033,15 @@ The implementation is complete when all of the following are true:
 - the old canonical plist remains unchanged until candidate runtime verification succeeds;
 - candidate listener ownership is tied to the verified candidate PID;
 - health is treated as liveness, not complete functional qualification;
-- canonical publish is atomic and becomes the durable last-committed restart definition;
+- the same-directory atomic canonical replace is the single `COMMITTED` transition and becomes the last-committed restart definition, with the explicitly bounded crash-oriented durability precautions in §12.1;
 - a rollout cannot publish the canonical plist until the candidate has been bootstrapped and re-verified a second time from the exact staged bytes that will be published;
-- rollback after canonical publish is CAS-protected against concurrent drift;
+- every consequential stop has an observable stopped barrier before another generation is bootstrapped;
+- `PRE_COMMIT_REVALIDATED` fresh-checks canonical bytes, candidate bytes, runtime generation, listener ownership, and liveness immediately before commit;
+- post-`COMMITTED` compensating rollback is CAS-protected against both persistent and runtime concurrent drift;
+- a successful staging-loaded runtime remains reconcilable after transaction staging cleanup without requiring the historical bootstrap plist path to exist;
 - interrupted transactions are detected as split state rather than silently repaired;
 - `RunAtLoad=true` and `KeepAlive=true` remain mandatory in every committed definition;
 - the service label is verified not to have a persistent disabled override, and rollout never mutates enable/disable policy;
 - ordinary tests never touch the real production LaunchAgent;
 - live rollout remains separately authorization-gated;
 - reboot recovery is not claimed as empirically PASS until a real authorized Mac restart/login qualification succeeds.
-
