@@ -9,9 +9,19 @@ import { AgyDelegationService } from "./agy-delegation.js";
 
 const execFileAsync = promisify(execFile);
 const macTest = process.platform === "darwin" ? test : test.skip;
+const currentAgyPolicy = {
+  model: "gemini-3.8-flash-high",
+  effort: "high",
+  compatibleVersions: ">=1.1.22 <1.2.0",
+};
+const customAgyPolicy = {
+  model: "gemini-qualified-model",
+  effort: "medium",
+  compatibleVersions: ">=1.1.22 <1.2.0",
+};
 
 macTest("repo-read returns verified claims and leaves source unchanged", async (t) => {
-  const fixture = await delegationFixture(t, "gemini-3.8-flash-high");
+  const fixture = await delegationFixture(t, "gemini-qualified-model", customAgyPolicy);
   const service = new AgyDelegationService({
     config: fixture.config,
     gitleaksPath: fixture.gitleaksPath,
@@ -28,7 +38,9 @@ macTest("repo-read returns verified claims and leaves source unchanged", async (
 
   assert.equal(result.ok, true, JSON.stringify(result));
   assert.equal(result.envelope.workerStarted, true);
-  assert.equal(result.envelope.resolvedModel, "gemini-3.8-flash-high");
+  assert.equal(result.envelope.requestedModel, "gemini-qualified-model");
+  assert.equal(result.envelope.requestedEffort, "medium");
+  assert.equal(result.envelope.resolvedModel, "gemini-qualified-model");
   assert.equal(result.envelope.expectedSourceHead, fixture.head);
   assert.equal(result.envelope.sourceHead, fixture.head);
   assert.equal(result.envelope.changedPersistentPaths.length, 0);
@@ -36,7 +48,7 @@ macTest("repo-read returns verified claims and leaves source unchanged", async (
 });
 
 macTest("repo-read prompt binds the worker to the exact disposable snapshot root", async (t) => {
-  const fixture = await delegationFixture(t, "gemini-3.8-flash-high");
+  const fixture = await delegationFixture(t, "gemini-qualified-model", customAgyPolicy);
   const service = new AgyDelegationService({
     config: fixture.config,
     gitleaksPath: fixture.gitleaksPath,
@@ -58,7 +70,7 @@ macTest("repo-read prompt binds the worker to the exact disposable snapshot root
 });
 
 macTest("model mismatch returns a typed failure and never invokes a fallback executor", async (t) => {
-  const fixture = await delegationFixture(t, "gemini-3.8-flash-low");
+  const fixture = await delegationFixture(t, "gemini-3.8-flash-low", customAgyPolicy);
   const service = new AgyDelegationService({
     config: fixture.config,
     gitleaksPath: fixture.gitleaksPath,
@@ -76,6 +88,29 @@ macTest("model mismatch returns a typed failure and never invokes a fallback exe
   assert.equal(result.envelope.failureClass, "MODEL_MISMATCH");
   assert.equal(result.envelope.workerStarted, true);
   assert.equal(await fixture.invocations(), 1);
+});
+
+macTest("missing required Agy flag fails before the worker starts", async (t) => {
+  const fixture = await delegationFixture(t, "gemini-3.8-flash-high", currentAgyPolicy, {
+    helpFlags: ["--model", "--effort", "--output-format", "--mode", "--print"],
+  });
+  const service = new AgyDelegationService({
+    config: fixture.config,
+    gitleaksPath: fixture.gitleaksPath,
+  });
+  const result = await service.delegate({
+    profile: "repo-read",
+    task: "Read README.md.",
+    dryRun: false,
+    repositoryRoot: fixture.repo,
+    expectedSourceHead: fixture.head,
+    allowedReadPaths: ["README.md"],
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.envelope.failureClass, "AGY_UNAVAILABLE");
+  assert.equal(result.envelope.workerStarted, false);
+  assert.equal(await fixture.invocations(), 0);
 });
 
 macTest("repo-validate runs declared validation in the disposable snapshot before read-only analysis", async (t) => {
@@ -119,7 +154,7 @@ macTest("gui-inspect redacts sensitive AX content and brokers one semantic actio
     `printf '%s\\n' \"$2\" >> ${JSON.stringify(promptsPath)}`,
     `printf '%s\\n' invoked >> ${JSON.stringify(invocationsPath)}`,
     `count=$(wc -l < ${JSON.stringify(invocationsPath)} | tr -d ' ')`,
-    "printf '%s\\n' '{\"event\":\"init\",\"init\":{\"model\":\"gemini-3.8-flash-high\"}}'",
+    "printf '%s\\n' '{\"event\":\"init\",\"init\":{\"model\":\"gemini-qualified-model\"}}'",
     "if [ \"$count\" = \"1\" ]; then",
     "  printf '%s\\n' '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"{\\\"kind\\\":\\\"intent\\\",\\\"intent\\\":{\\\"type\\\":\\\"select_existing_tab\\\",\\\"elementIndex\\\":11}}\"}}'",
     "else",
@@ -143,7 +178,13 @@ macTest("gui-inspect redacts sensitive AX content and brokers one semantic actio
   const settingsPath = join(root, "settings.json");
   await writeFile(settingsPath, JSON.stringify({ enableTelemetry: false }));
   const service = new AgyDelegationService({
-    config: { enabled: true, agyPath, cuaDriverPath: cuaPath, settingsPath },
+    config: {
+      enabled: true,
+      agyPath,
+      cuaDriverPath: cuaPath,
+      settingsPath,
+      ...customAgyPolicy,
+    },
     gitleaksPath: "/usr/bin/true",
   });
 
@@ -158,6 +199,9 @@ macTest("gui-inspect redacts sensitive AX content and brokers one semantic actio
   if (!result.ok) return;
   assert.equal(result.response, "pins inspected");
   assert.equal(result.envelope.workerStarted, true);
+  assert.equal(result.envelope.requestedModel, "gemini-qualified-model");
+  assert.equal(result.envelope.requestedEffort, "medium");
+  assert.equal(result.envelope.resolvedModel, "gemini-qualified-model");
   const prompts = await readFile(promptsPath, "utf8");
   assert.equal(prompts.includes("SECRET_BODY"), false);
   assert.equal(prompts.includes("SECRET_VALUE"), false);
@@ -166,7 +210,12 @@ macTest("gui-inspect redacts sensitive AX content and brokers one semantic actio
   assert.match(await readFile(actionPath, "utf8"), /"element_index":11/);
 });
 
-async function delegationFixture(t: TestContext, model: string): Promise<{
+async function delegationFixture(
+  t: TestContext,
+  model: string,
+  policy: typeof currentAgyPolicy = currentAgyPolicy,
+  options: { helpFlags?: readonly string[] } = {},
+): Promise<{
   repo: string;
   head: string;
   config: {
@@ -174,6 +223,9 @@ async function delegationFixture(t: TestContext, model: string): Promise<{
     agyPath: string;
     cuaDriverPath: string;
     settingsPath: string;
+    model: string;
+    effort: string;
+    compatibleVersions: string;
   };
   gitleaksPath: string;
   invocations: () => Promise<number>;
@@ -195,11 +247,12 @@ async function delegationFixture(t: TestContext, model: string): Promise<{
   const invocationsPath = join(root, "invocations.txt");
   const promptsPath = join(root, "prompts.txt");
   const agyPath = join(root, "agy");
+  const helpFlags = options.helpFlags ?? ["--model", "--effort", "--output-format", "--mode", "--sandbox", "--print"];
   await writeFile(agyPath, [
     "#!/bin/sh",
     "case \"$1\" in",
     "  --version) echo 1.1.22; exit 0;;",
-    "  --help) printf '%s\\n' --model --effort --output-format --mode --sandbox --print; exit 0;;",
+    `  --help) printf '%s\\n' ${helpFlags.map((value) => JSON.stringify(value)).join(" ")}; exit 0;;`,
     "esac",
     `printf '%s\\n' invoked >> ${JSON.stringify(invocationsPath)}`,
     `printf '%s\\n' "$2" >> ${JSON.stringify(promptsPath)}`,
@@ -218,7 +271,13 @@ async function delegationFixture(t: TestContext, model: string): Promise<{
   return {
     repo,
     head,
-    config: { enabled: true, agyPath, cuaDriverPath: join(root, "cua-driver"), settingsPath },
+    config: {
+      enabled: true,
+      agyPath,
+      cuaDriverPath: join(root, "cua-driver"),
+      settingsPath,
+      ...policy,
+    },
     gitleaksPath,
     invocations: async () => {
       try {

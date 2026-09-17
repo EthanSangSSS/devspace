@@ -7,6 +7,7 @@ export type AgyFailureClass =
   | "POLICY_DENIED"
   | "AGY_UNAVAILABLE"
   | "AGY_START_FAILED"
+  | "AGY_VERSION_UNQUALIFIED"
   | "MODEL_MISMATCH"
   | "MODEL_UNVERIFIED"
   | "EFFORT_MISMATCH"
@@ -28,6 +29,9 @@ export interface AgyDelegationConfig {
   agyPath: string;
   cuaDriverPath: string;
   settingsPath: string;
+  model: string;
+  effort: string;
+  compatibleVersions: string;
 }
 
 export interface AgyPlatformStages {
@@ -50,9 +54,9 @@ export interface AgyExecutionEnvelope extends AgyPlatformStages {
   executionId: string;
   profile: AgyProfile;
   dryRun: boolean;
-  requestedModel: typeof AGY_REQUIRED_MODEL;
+  requestedModel: string;
   resolvedModel?: string;
-  requestedEffort: typeof AGY_REQUIRED_EFFORT;
+  requestedEffort: string;
   effortSelectionVerified: boolean;
   workerStarted: boolean;
   failureClass?: AgyFailureClass;

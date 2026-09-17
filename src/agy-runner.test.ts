@@ -11,7 +11,7 @@ import {
 
 const macTest = process.platform === "darwin" ? test : test.skip;
 
-macTest("headless runner uses pinned model/effort, stateless flags, and ephemeral HOME", async (t) => {
+macTest("headless runner uses server policy model/effort, stateless flags, and ephemeral HOME", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-agy-runner-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspace = join(root, "workspace");
@@ -26,7 +26,7 @@ macTest("headless runner uses pinned model/effort, stateless flags, and ephemera
     "#!/bin/sh",
     `printf '%s\\n' \"$@\" > ${JSON.stringify(argsLog)}`,
     `printf '%s' \"$HOME\" > ${JSON.stringify(homeLog)}`,
-    "printf '%s\\n' '{\"event\":\"init\",\"init\":{\"model\":\"gemini-3.8-flash-high\"}}'",
+    "printf '%s\\n' '{\"event\":\"init\",\"init\":{\"model\":\"gemini-qualified-model\"}}'",
     "printf '%s\\n' '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"first line\\n\"}}'",
     "",
   ].join("\n"));
@@ -34,6 +34,8 @@ macTest("headless runner uses pinned model/effort, stateless flags, and ephemera
 
   const result = await runAgyHeadless({
     agyPath,
+    model: "gemini-qualified-model",
+    effort: "medium",
     cwd: workspace,
     taskRoot,
     prompt: "Read README.md",
@@ -42,8 +44,8 @@ macTest("headless runner uses pinned model/effort, stateless flags, and ephemera
   });
 
   const args = (await readFile(argsLog, "utf8")).trim().split("\n");
-  assert.deepEqual(option(args, "--model"), ["--model", "gemini-3.8-flash-high"]);
-  assert.deepEqual(option(args, "--effort"), ["--effort", "high"]);
+  assert.deepEqual(option(args, "--model"), ["--model", "gemini-qualified-model"]);
+  assert.deepEqual(option(args, "--effort"), ["--effort", "medium"]);
   assert.deepEqual(option(args, "--output-format"), ["--output-format", "stream-json"]);
   assert.deepEqual(option(args, "--mode"), ["--mode", "plan"]);
   assert.ok(args.includes("--sandbox"));
@@ -78,7 +80,7 @@ macTest("headless runner uses pinned model/effort, stateless flags, and ephemera
     await readlink(join(ephemeralHome, "Library", "Keychains", "login.keychain-db")),
     hostKeychainPath,
   );
-  assert.equal(result.resolvedModel, "gemini-3.8-flash-high");
+  assert.equal(result.resolvedModel, "gemini-qualified-model");
   assert.equal(result.response, "first line\n");
 });
 
@@ -109,6 +111,8 @@ macTest("headless runner retries once after an interrupted terminal stream", asy
 
   const result = await runAgyHeadless({
     agyPath,
+    model: "gemini-3.8-flash-high",
+    effort: "high",
     cwd: workspace,
     taskRoot,
     prompt: "Read README.md",
@@ -144,6 +148,8 @@ macTest("headless runner does not retry ordinary terminal errors", async (t) => 
   await assert.rejects(
     () => runAgyHeadless({
       agyPath,
+      model: "gemini-3.8-flash-high",
+      effort: "high",
       cwd: workspace,
       taskRoot,
       prompt: "Read README.md",

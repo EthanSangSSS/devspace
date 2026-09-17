@@ -10,6 +10,27 @@ assert.throws(
   /Unrecognized key/,
 );
 
+for (const field of ["model", "effort", "compatibleVersions"] as const) {
+  assert.throws(
+    () => devspaceConfigSchema.parse({
+      configVersion: 1,
+      agyDelegation: { [field]: "   \t" },
+    }),
+  );
+}
+
+const preservedAgyPolicy = devspaceConfigSchema.parse({
+  configVersion: 1,
+  agyDelegation: {
+    model: " gemini-next-qualified ",
+    effort: "\tmedium ",
+    compatibleVersions: " >=1.1.22 <2.0.0 ",
+  },
+});
+assert.equal(preservedAgyPolicy.agyDelegation.model, " gemini-next-qualified ");
+assert.equal(preservedAgyPolicy.agyDelegation.effort, "\tmedium ");
+assert.equal(preservedAgyPolicy.agyDelegation.compatibleVersions, " >=1.1.22 <2.0.0 ");
+
 const generatedSchema = `${JSON.stringify(devspaceConfigJsonSchema(), null, 2)}\n`;
 const committedSchema = readFileSync(
   new URL("../schema/v1/devspace.schema.json", import.meta.url),

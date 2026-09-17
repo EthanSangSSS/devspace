@@ -46,6 +46,9 @@ const agyDelegationConfigSchema = z.object({
   agyPath: z.string().trim().min(1).default("~/.local/bin/agy"),
   cuaDriverPath: z.string().trim().min(1).default("~/.local/bin/cua-driver"),
   settingsPath: z.string().trim().min(1).default("~/.gemini/antigravity-cli/settings.json"),
+  model: z.string().min(1).regex(/\S/).default("gemini-3.8-flash-high"),
+  effort: z.string().min(1).regex(/\S/).default("high"),
+  compatibleVersions: z.string().min(1).regex(/\S/).default(">=1.1.22 <1.2.0"),
 }).strict().prefault({});
 
 const loggingConfigSchema = z.object({

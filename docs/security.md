@@ -167,6 +167,13 @@ that requirement. Real runs use a task-local HOME, disable update routines, and
 do not use `--continue`, `--conversation`, or
 `--dangerously-skip-permissions`.
 
+The local `agyDelegation` configuration owns model, effort, and the accepted
+Agy semantic-version range. The MCP caller does not select any of these values.
+Runtime inspection rejects malformed or out-of-range Agy versions with a typed
+fail-closed result, and required CLI capability probes remain independent of
+the version-range check. DevSpace does not auto-upgrade Agy and does not
+auto-select a provider's newest model.
+
 On macOS, Agy's cached authentication is backed by the user's login Keychain.
 The task-local HOME therefore projects only the verified user-owned
 `login.keychain-db` path into its own `Library/Keychains` directory so the
@@ -176,10 +183,13 @@ MCP results. The projection is accepted only when the host keychain is a
 non-symlink regular file owned by the current user and is not group- or
 world-writable; an unexpected task-local projection fails closed.
 
-The model contract is fail-closed: the command contains the exact fixed model
-and effort, the worker emits stream JSON, and `init.model` must equal
-`gemini-3.8-flash-high`. Missing model telemetry is not treated as success.
-There is no internal executor/model fallback inside `delegate_to_agy`.
+The model contract is fail-closed: the command contains the exact server-owned
+configured model and effort, the worker emits stream JSON, and `init.model` must
+equal the configured model exactly. Missing or substituted model telemetry is
+not treated as success. Legacy caller-supplied model/effort fields, if still
+present during the one-time action-schema migration, are non-authoritative and
+cannot override the server policy. There is no internal executor/model fallback
+inside `delegate_to_agy`.
 
 ### Repository profiles
 
