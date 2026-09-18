@@ -93,6 +93,7 @@ export interface MacosRolloutAdapters {
   observeProcess(pid: number): Promise<ObservedState<ProcessIdentity>>;
   observeListener(): Promise<ObservedState<ListenerObservation>>;
   checkHealth(): Promise<ObservedState<"healthy" | "unhealthy">>;
+  waitReady(expectedEntrypoint: string): Promise<ObservedState<ProcessIdentity>>;
   bootoutExpected(expected: ProcessIdentity): Promise<void>;
   bootstrap(plistPath: string): Promise<void>;
   observeDisabledOverride(): Promise<ObservedState<"enabled" | "disabled">>;
@@ -1120,13 +1121,11 @@ async function verifyOldRuntime(
   adapters: MacosRolloutAdapters,
   requireExactInitialGeneration: boolean,
 ): Promise<boolean> {
-  const [canonicalHash, canonicalIdentity, parentIdentity, semantic, launchd, listener, disabled] = await Promise.all([
+  const [canonicalHash, canonicalIdentity, parentIdentity, semantic, disabled] = await Promise.all([
     adapters.readFileSha256(initial.canonical.identity.path),
     adapters.observeFileIdentity(initial.canonical.identity.path),
     adapters.observeFileIdentity(initial.canonical.parentIdentity.path),
     adapters.readCanonical(),
-    adapters.observeLaunchd(),
-    adapters.observeListener(),
     adapters.observeDisabledOverride(),
   ]);
   if (
@@ -1141,24 +1140,17 @@ async function verifyOldRuntime(
     || semantic.value.entrypointRealpath !== request.expectedLiveEntrypoint
     || !semantic.value.runAtLoad
     || !semantic.value.keepAlive
-    || launchd.kind !== "known"
-    || !launchd.value.loaded
-    || !launchd.value.pid
-    || listener.kind !== "known"
     || disabled.kind !== "known"
     || disabled.value !== "enabled"
   ) return false;
 
-  const processState = await adapters.observeProcess(launchd.value.pid);
+  const processState = await adapters.waitReady(request.expectedLiveEntrypoint);
   if (
     processState.kind !== "known"
-    || processState.value.entrypointRealpath !== request.expectedLiveEntrypoint
     || (requireExactInitialGeneration && !sameProcessIdentity(processState.value, initial.process))
-    || listener.value.state !== "owned"
-    || listener.value.ownerPid !== processState.value.pid
   ) return false;
-  const health = await adapters.checkHealth();
-  return health.kind === "known" && health.value === "healthy";
+  const stable = await adapters.waitStable(processState.value);
+  return stable.kind === "known" && stable.value === "stable";
 }
 
 function rolloutOutcome(
@@ -1416,22 +1408,8 @@ async function observeHealthyCandidateRuntime(
   candidateEntrypoint: string,
   adapters: MacosRolloutAdapters,
 ): Promise<{ ok: true; process: ProcessIdentity } | { ok: false; reason: string }> {
-  const launchd = await adapters.observeLaunchd();
-  if (launchd.kind === "unproven") return { ok: false, reason: launchd.reason };
-  if (!launchd.value.loaded || !launchd.value.pid) return { ok: false, reason: "candidate launchd job is not loaded" };
-  const processState = await adapters.observeProcess(launchd.value.pid);
+  const processState = await adapters.waitReady(candidateEntrypoint);
   if (processState.kind === "unproven") return { ok: false, reason: processState.reason };
-  if (processState.value.entrypointRealpath !== candidateEntrypoint) {
-    return { ok: false, reason: "candidate process entrypoint does not match requested candidate" };
-  }
-  const listener = await adapters.observeListener();
-  if (listener.kind === "unproven") return { ok: false, reason: listener.reason };
-  if (listener.value.state !== "owned" || listener.value.ownerPid !== processState.value.pid) {
-    return { ok: false, reason: "candidate listener is not owned by the candidate PID" };
-  }
-  const health = await adapters.checkHealth();
-  if (health.kind === "unproven") return { ok: false, reason: health.reason };
-  if (health.value !== "healthy") return { ok: false, reason: "candidate health check failed" };
   const stable = await adapters.waitStable(processState.value);
   if (stable.kind === "unproven") return { ok: false, reason: stable.reason };
   return { ok: true, process: processState.value };
