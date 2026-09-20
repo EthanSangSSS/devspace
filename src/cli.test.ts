@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -29,6 +29,27 @@ for (const flag of ["-v", "--version"]) {
   }).trim();
 
   assert.equal(output, packageJson.version);
+}
+
+{
+  const configDir = mkdtempSync(join(tmpdir(), "devspace-rollout-preflight-readonly-test-"));
+  try {
+    const legacyPath = join(configDir, "config.json");
+    writeFileSync(legacyPath, JSON.stringify({ port: 8787, allowedRoots: [configDir] }));
+    await assert.rejects(
+      () => execFileAsync("node", ["--import", "tsx", "src/cli.ts", "rollout-preflight"], {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: { ...process.env, DEVSPACE_CONFIG_DIR: configDir },
+      }),
+      /read-only config load refused/,
+    );
+    assert.equal(existsSync(legacyPath), true);
+    assert.equal(existsSync(join(configDir, "config.jsonc")), false);
+    assert.equal(existsSync(join(configDir, "config.json.v1.0.bak")), false);
+  } finally {
+    rmSync(configDir, { recursive: true, force: true });
+  }
 }
 
 const root = mkdtempSync(join(tmpdir(), "devspace-cli-agents-test-"));

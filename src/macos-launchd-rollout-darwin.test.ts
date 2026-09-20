@@ -23,6 +23,7 @@ import {
   assertDarwinPlatform,
   buildProcessIdentityFromObservations,
   buildQualificationFixture,
+  type CommandRunner,
   createDarwinRolloutAdapters,
   parseLaunchctlPrint,
   parseListenerLsof,
@@ -38,12 +39,15 @@ import {
   runDarwinQualificationSequence,
   syncDirectoryDurably,
   validateCanonicalFileIdentity,
+  verifyCandidateRuntimePreflight,
+  waitForInactiveCandidateStoppedState,
   waitForStableState,
   waitForRuntimeReadyState,
   waitForStoppedState,
 } from "./macos-launchd-rollout-darwin.js";
 
 const posixFsTest = process.platform === "win32" ? test.skip : test;
+const darwinTest = process.platform === "darwin" ? test : test.skip;
 
 const execFileAsync = promisify(execFile);
 
@@ -114,6 +118,16 @@ test("launchctl print parser preserves arguments and process generation evidence
     },
   });
   assert.equal(parseLaunchctlPrint("garbled output").kind, "unproven");
+  assert.equal(
+    parseLaunchctlPrint(launchctlFixture().replace("pid = 32479", "pid = unavailable")).kind,
+    "unproven",
+    "a present but malformed pid field must not be treated as confirmed PID absence",
+  );
+  assert.equal(
+    parseLaunchctlPrint(launchctlFixture().replace("runs = 2", "runs = many")).kind,
+    "unproven",
+    "a present but malformed runs field must fail closed",
+  );
 });
 
 test("disabled-service parser is exact and fails closed on unknown output", async () => {
@@ -238,6 +252,280 @@ test("Darwin adapter platform guard fails closed outside macOS", () => {
   assert.doesNotThrow(() => assertDarwinPlatform("darwin"));
   assert.throws(() => assertDarwinPlatform("linux"), /require(?:s)? Darwin/i);
   assert.throws(() => assertDarwinPlatform("win32"), /require(?:s)? Darwin/i);
+});
+
+test("candidate runtime preflight uses the staged Node/environment and rejects a broken SQLite native binding", async () => {
+  const candidate = "/Users/ethan/.local/opt/devspace-candidate/node_modules/@waishnav/devspace/dist/cli.js";
+  const plist = "/tmp/candidate.plist";
+  const node = "/opt/homebrew/opt/node@24/bin/node";
+  const calls: Array<{ executable: string; args: readonly string[]; cwd?: string; home?: string }> = [];
+  const runner = (sqliteLine: string): CommandRunner => ({
+    async run(executable, args, options) {
+      calls.push({ executable, args, cwd: options?.cwd, home: options?.env?.HOME });
+      if (executable === "/usr/bin/plutil") {
+        assert.deepEqual(args, ["-convert", "json", "-o", "-", plist]);
+        return {
+          stdout: JSON.stringify({
+            ProgramArguments: [node, candidate, "serve"],
+            WorkingDirectory: "/Users/ethan",
+            EnvironmentVariables: { HOME: "/Users/ethan", PATH: "/opt/homebrew/bin:/usr/bin:/bin" },
+          }),
+          stderr: "",
+          exitCode: 0,
+        };
+      }
+      if (executable === node) {
+        return {
+          stdout: [
+            "Node: v24.19.0 (supported)",
+            "Node ABI: 137",
+            "Platform: darwin arm64",
+            sqliteLine,
+            "Local MCP URL: http://127.0.0.1:7676/mcp",
+          ].join("\n"),
+          stderr: "",
+          exitCode: 0,
+        };
+      }
+      throw new Error(`unexpected executable ${executable}`);
+    },
+  });
+
+  await verifyCandidateRuntimePreflight(
+    plist,
+    candidate,
+    [node, candidate, "serve"],
+    runner("SQLite native dependency: ok"),
+  );
+  const preflightCall = calls.find((call) => call.executable === node);
+  assert.deepEqual(preflightCall?.args, [candidate, "rollout-preflight"]);
+  assert.equal(preflightCall?.cwd, "/Users/ethan");
+  assert.equal(preflightCall?.home, "/Users/ethan");
+
+  await assert.rejects(
+    () => verifyCandidateRuntimePreflight(
+      plist,
+      candidate,
+      [node, candidate, "serve"],
+      runner("SQLite native dependency: Could not locate the bindings file for node-v137-darwin-arm64"),
+    ),
+    /SQLite native dependency/,
+  );
+  await assert.rejects(
+    () => verifyCandidateRuntimePreflight(
+      plist,
+      candidate,
+      ["/opt/homebrew/opt/node@22/bin/node", candidate, "serve"],
+      runner("SQLite native dependency: ok"),
+    ),
+    /plist argv does not match/,
+  );
+});
+
+darwinTest("inactive candidate bootout requires exact candidate argv and an unowned production listener", async () => {
+  const candidate = "/candidate/node_modules/@waishnav/devspace/dist/cli.js";
+  const expectedArgv = ["/opt/homebrew/opt/node@24/bin/node", candidate, "serve"];
+  let bootoutCalls = 0;
+  let stopped = false;
+  const loadedNoPid = [
+    "gui/501/com.ethan.devspace = {",
+    "\tstate = spawn scheduled",
+    "\targuments = {",
+    `\t\t${expectedArgv[0]}`,
+    `\t\t${expectedArgv[1]}`,
+    `\t\t${expectedArgv[2]}`,
+    "\t}",
+    "\truns = 64",
+    "}",
+    "",
+  ].join("\n");
+  const commandRunner: CommandRunner = {
+    async run(executable, args) {
+      if (executable === "/bin/launchctl" && args[0] === "print") {
+        return stopped
+          ? { stdout: "", stderr: "Could not find service", exitCode: 113 }
+          : { stdout: loadedNoPid, stderr: "", exitCode: 0 };
+      }
+      if (executable === "/usr/sbin/lsof") {
+        return { stdout: "", stderr: "", exitCode: 1 };
+      }
+      if (executable === "/bin/launchctl" && args[0] === "bootout") {
+        bootoutCalls += 1;
+        stopped = true;
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      throw new Error(`unexpected command ${executable} ${args.join(" ")}`);
+    },
+  };
+  const adapters = createDarwinRolloutAdapters({
+    uid: 501,
+    commandRunner,
+    stopTimeoutMs: 50,
+    stopPollIntervalMs: 1,
+    sleep: async () => undefined,
+  });
+
+  await adapters.bootoutInactiveCandidate(expectedArgv);
+  assert.equal(bootoutCalls, 1);
+
+  stopped = false;
+  bootoutCalls = 0;
+  await assert.rejects(
+    () => adapters.bootoutInactiveCandidate([
+      "/opt/homebrew/opt/node@24/bin/node",
+      "/different/node_modules/@waishnav/devspace/dist/cli.js",
+      "serve",
+    ]),
+    /loaded definition is not the expected candidate/,
+  );
+  assert.equal(bootoutCalls, 0);
+});
+
+test("inactive candidate stop barrier bounds hanging probes and rejects success observed after the deadline", async () => {
+  const expectedArgv = ["/opt/homebrew/bin/node", "/candidate/cli.js", "serve"];
+
+  let nowValue = 0;
+  const lateSuccess = await waitForInactiveCandidateStoppedState(expectedArgv, {
+    async observeLaunchd() {
+      nowValue = 100;
+      return { kind: "known", value: { loaded: false } };
+    },
+    async observeListener() {
+      return { kind: "known", value: { state: "unowned" } };
+    },
+  }, {
+    timeoutMs: 5,
+    pollIntervalMs: 1,
+    now: () => nowValue,
+    sleep: async () => undefined,
+  });
+  assert.equal(lateSuccess.kind, "unproven");
+  assert.match(lateSuccess.kind === "unproven" ? lateSuccess.reason : "", /timed out/);
+
+  let sawAbortSignal = false;
+  const hanging = waitForInactiveCandidateStoppedState(expectedArgv, {
+    async observeLaunchd(signal) {
+      sawAbortSignal = Boolean(signal);
+      return await new Promise<ObservedState<LaunchdObservation>>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    },
+    async observeListener() {
+      return { kind: "known", value: { state: "unowned" } };
+    },
+  }, {
+    timeoutMs: 10,
+    pollIntervalMs: 1,
+  });
+  const result = await hanging;
+  assert.equal(sawAbortSignal, true);
+  assert.equal(result.kind, "unproven");
+  assert.match(result.kind === "unproven" ? result.reason : "", /timed out/);
+});
+
+test("inactive candidate stop barrier inherits an outer cancellation signal", async () => {
+  const expectedArgv = ["/opt/homebrew/bin/node", "/candidate/cli.js", "serve"];
+  const controller = new AbortController();
+  controller.abort();
+  let probeCalls = 0;
+  const result = await waitForInactiveCandidateStoppedState(expectedArgv, {
+    async observeLaunchd() {
+      probeCalls += 1;
+      return { kind: "known", value: { loaded: false } };
+    },
+    async observeListener() {
+      probeCalls += 1;
+      return { kind: "known", value: { state: "unowned" } };
+    },
+  }, {
+    deadline: Date.now() + 1_000,
+    signal: controller.signal,
+    pollIntervalMs: 1,
+  });
+  assert.equal(result.kind, "unproven");
+  assert.match(result.kind === "unproven" ? result.reason : "", /timed out/);
+  assert.equal(probeCalls, 0, "an inherited outer abort must prevent new stop-barrier probes");
+});
+
+darwinTest("inactive candidate bootout preserves the outer absolute deadline across barrier handoff", async () => {
+  const candidate = "/candidate/node_modules/@waishnav/devspace/dist/cli.js";
+  const expectedArgv = ["/opt/homebrew/opt/node@24/bin/node", candidate, "serve"];
+  const loadedNoPid = [
+    "gui/501/com.ethan.devspace = {",
+    "\tstate = spawn scheduled",
+    "\targuments = {",
+    `\t\t${expectedArgv[0]}`,
+    `\t\t${expectedArgv[1]}`,
+    `\t\t${expectedArgv[2]}`,
+    "\t}",
+    "\truns = 64",
+    "}",
+    "",
+  ].join("\n");
+  let stopped = false;
+  let postBootoutNowReads = 0;
+  let bootoutCalls = 0;
+  const now = () => {
+    if (!stopped) return 0;
+    postBootoutNowReads += 1;
+    return postBootoutNowReads <= 2 ? 9 : 11;
+  };
+  const commandRunner: CommandRunner = {
+    async run(executable, args) {
+      if (executable === "/bin/launchctl" && args[0] === "print") {
+        return stopped
+          ? { stdout: "", stderr: "Could not find service", exitCode: 113 }
+          : { stdout: loadedNoPid, stderr: "", exitCode: 0 };
+      }
+      if (executable === "/usr/sbin/lsof") {
+        return { stdout: "", stderr: "", exitCode: 1 };
+      }
+      if (executable === "/bin/launchctl" && args[0] === "bootout") {
+        bootoutCalls += 1;
+        stopped = true;
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      throw new Error(`unexpected command ${executable} ${args.join(" ")}`);
+    },
+  };
+  const adapters = createDarwinRolloutAdapters({
+    uid: 501,
+    commandRunner,
+    stopTimeoutMs: 10,
+    stopPollIntervalMs: 1,
+    now,
+    sleep: async () => undefined,
+  });
+
+  await assert.rejects(
+    () => adapters.bootoutInactiveCandidate(expectedArgv),
+    /timed out|deadline expired/,
+  );
+  assert.equal(bootoutCalls, 1);
+  assert.ok(postBootoutNowReads >= 3, "test must cross the original absolute deadline during handoff");
+});
+
+test("inactive candidate stop barrier preserves observed foreign-state refusal", async () => {
+  const expectedArgv = ["/opt/homebrew/bin/node", "/candidate/cli.js", "serve"];
+  let listenerReads = 0;
+  const result = await waitForInactiveCandidateStoppedState(expectedArgv, {
+    async observeLaunchd() {
+      return { kind: "known", value: { loaded: true, normalizedArgv: expectedArgv } };
+    },
+    async observeListener() {
+      listenerReads += 1;
+      return listenerReads === 1
+        ? { kind: "known", value: { state: "owned", ownerPid: 999 } }
+        : { kind: "known", value: { state: "unowned" } };
+    },
+  }, {
+    timeoutMs: 50,
+    pollIntervalMs: 1,
+    sleep: async () => undefined,
+  });
+  assert.equal(result.kind, "unproven");
+  assert.match(result.kind === "unproven" ? result.reason : "", /listener owner appeared/);
+  assert.equal(listenerReads, 1, "foreign listener must fail closed immediately");
 });
 
 test("canonical file identity validation rejects symlink, unsafe mode, owner, and parent drift", async () => {
@@ -605,8 +893,6 @@ posixFsTest("qualification fixture is disposable, non-production, and exercises 
     nodeExecutable: "/opt/homebrew/bin/node",
   }), /production port/i);
 });
-
-const darwinTest = process.platform === "darwin" ? test : test.skip;
 
 darwinTest("health check uses a bounded timeout signal and classifies timeout as unhealthy", async () => {
   const originalFetch = globalThis.fetch;

@@ -78,9 +78,13 @@ rolloutTest("rollback refusal taxonomy is deterministic and drift-first", async 
 interface ForwardFixtureOptions {
   disabled?: boolean;
   selfHosted?: boolean;
+  candidatePreflightFails?: boolean;
+  canonicalArgvDrift?: boolean;
   oldRuntimeDriftsBeforeStop?: boolean;
   firstCandidateListenerPid?: number;
   firstCandidateHealthy?: boolean;
+  candidateCrashBackoffBeforeRecovery?: boolean;
+  candidateCrashBackoffArgvDrift?: boolean;
   reloadCandidateHealthy?: boolean;
   preCommitCanonicalDrift?: boolean;
   keepAliveReplacementBeforeCommit?: boolean;
@@ -89,6 +93,7 @@ interface ForwardFixtureOptions {
   recoveryCanonicalDrift?: "hash" | "identity" | "unproven";
   recoveryRuntimeUnproven?: boolean;
   postCommitHealthFailure?: boolean;
+  postCommitCandidateCrashBackoff?: boolean;
   postCommitRuntimeDrift?: boolean;
   postCommitRuntimeAbsent?: boolean;
   postCommitUnrelatedListener?: boolean;
@@ -148,6 +153,7 @@ async function createForwardFixture(
     | "old"
     | "stopped"
     | "candidate-first"
+    | "candidate-crash-backoff"
     | "candidate-first-stopped"
     | "candidate-reload"
     | "rollback-candidate-stopped"
@@ -186,6 +192,9 @@ async function createForwardFixture(
     identity: canonicalIdentity,
     parentIdentity,
     entrypointRealpath: oldEntrypoint,
+    programArguments: options.canonicalArgvDrift
+      ? ["/opt/homebrew/bin/node-alt", oldEntrypoint, "serve"]
+      : [...oldProcess.normalizedArgv],
     runAtLoad: true,
     keepAlive: true,
   };
@@ -195,6 +204,7 @@ async function createForwardFixture(
     identity: { ...canonicalIdentity, inode: 20 },
     parentIdentity,
     entrypointRealpath: candidateEntrypoint,
+    programArguments: [...candidateFirst.normalizedArgv],
     runAtLoad: true,
     keepAlive: true,
   };
@@ -235,6 +245,14 @@ async function createForwardFixture(
         return { loaded: true, pid: oldProcess.pid, runCount: 1, normalizedArgv: oldProcess.normalizedArgv };
       case "candidate-first":
         return { loaded: true, pid: candidateFirst.pid, runCount: 1, normalizedArgv: candidateFirst.normalizedArgv };
+      case "candidate-crash-backoff":
+        return {
+          loaded: true,
+          runCount: 64,
+          normalizedArgv: options.candidateCrashBackoffArgvDrift
+            ? foreignRuntime.normalizedArgv
+            : candidateFirst.normalizedArgv,
+        };
       case "candidate-reload":
         if (forwardFailed && options.postCommitRuntimeDrift) {
           return { loaded: true, pid: foreignRuntime.pid, runCount: 4, normalizedArgv: foreignRuntime.normalizedArgv };
@@ -281,6 +299,7 @@ async function createForwardFixture(
           return options.firstCandidateListenerPid ?? candidateFirst.pid;
         })(),
       };
+      case "candidate-crash-backoff": return { state: "unowned" };
       case "candidate-reload": return {
         state: "owned",
         ownerPid: forwardFailed && options.postCommitUnrelatedListener
@@ -333,6 +352,11 @@ async function createForwardFixture(
       return known(canonicalCommitted ? candidateCanonical : oldCanonical);
     },
     async validateCandidateEntrypoint() { calls.push("candidate:entrypoint-valid"); },
+    async preflightCandidateRuntime(_plistPath, _candidateEntrypoint, expectedArgv) {
+      calls.push("candidate:runtime-preflight");
+      assert.deepEqual(expectedArgv, candidateFirst.normalizedArgv);
+      if (options.candidatePreflightFails) throw new Error("candidate sqlite native dependency is not loadable");
+    },
     async createCandidatePlist() {
       calls.push("candidate:plist-created");
       return candidateBytes;
@@ -385,6 +409,7 @@ async function createForwardFixture(
       calls.push(`health:${phase}`);
       if (phase === "candidate-first" && options.firstCandidateHealthy === false) {
         forwardFailed = true;
+        if (options.candidateCrashBackoffBeforeRecovery) phase = "candidate-crash-backoff";
         return known("unhealthy");
       }
       if (phase === "candidate-reload" && options.reloadCandidateHealthy === false) {
@@ -393,7 +418,8 @@ async function createForwardFixture(
       }
       if (phase === "candidate-reload" && canonicalCommitted && options.postCommitHealthFailure && !forwardFailed) {
         forwardFailed = true;
-        if (options.postCommitRuntimeAbsent) phase = "rollback-candidate-stopped";
+        if (options.postCommitCandidateCrashBackoff) phase = "candidate-crash-backoff";
+        else if (options.postCommitRuntimeAbsent) phase = "rollback-candidate-stopped";
         return known("unhealthy");
       }
       return known("healthy");
@@ -436,6 +462,18 @@ async function createForwardFixture(
         phase = "rollback-candidate-stopped";
       }
       else throw new Error("unexpected bootout target");
+    },
+    async bootoutInactiveCandidate(expectedArgv) {
+      calls.push("INACTIVE_CANDIDATE_STOP_REQUESTED");
+      if (
+        phase !== "candidate-crash-backoff"
+        || options.candidateCrashBackoffArgvDrift
+        || expectedArgv.length !== candidateFirst.normalizedArgv.length
+        || !expectedArgv.every((value, index) => value === candidateFirst.normalizedArgv[index])
+      ) {
+        throw new Error("inactive candidate definition mismatch");
+      }
+      phase = "rollback-candidate-stopped";
     },
     async bootstrap(plistPath) {
       if (forwardFailed && plistPath === canonicalIdentity.path) {
@@ -589,6 +627,11 @@ rolloutTest("forward rollout pre-commit failures never publish canonical and ret
     expectedCode: "CANDIDATE_ARTIFACT_MISMATCH",
   });
   cases.push({
+    name: "candidate runtime preflight failure",
+    fixture: await createForwardFixture(t, { candidatePreflightFails: true }),
+    expectedCode: "CANDIDATE_ARTIFACT_MISMATCH",
+  });
+  cases.push({
     name: "old runtime generation drift",
     fixture: await createForwardFixture(t, { oldRuntimeDriftsBeforeStop: true }),
     expectedCode: "LIVE_STATE_CAS_MISMATCH",
@@ -624,6 +667,30 @@ rolloutTest("forward rollout pre-commit failures never publish canonical and ret
     assert.equal(result.context.lease, entry.fixture.lease, entry.name);
     assert.equal(entry.fixture.getReleaseCalls(), 0, `${entry.name}: forward path must retain the lock`);
   }
+});
+
+rolloutTest("candidate runtime preflight fails before the old production stop barrier", async (t) => {
+  const fixture = await createForwardFixture(t, { candidatePreflightFails: true });
+  const result = await runMacosLaunchdForwardPath(fixture.request, fixture.adapters);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.phase, "precheck");
+  assert.equal(result.code, "CANDIDATE_ARTIFACT_MISMATCH");
+  assert.equal(result.context.liveMutationStarted, false);
+  assert.equal(fixture.calls.includes("candidate:runtime-preflight"), true);
+  assert.equal(fixture.calls.includes("OLD_STOP_REQUESTED"), false);
+});
+
+rolloutTest("initial state rejects a loaded runtime whose argv differs from canonical ProgramArguments", async (t) => {
+  const fixture = await createForwardFixture(t, { canonicalArgvDrift: true });
+  const result = await runMacosLaunchdForwardPath(fixture.request, fixture.adapters);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.phase, "precheck");
+  assert.equal(result.code, "SPLIT_STATE_DETECTED");
+  assert.match(result.reason, /argv differs from canonical ProgramArguments/);
+  assert.equal(fixture.calls.includes("candidate:runtime-preflight"), false);
+  assert.equal(fixture.calls.includes("OLD_STOP_REQUESTED"), false);
 });
 
 rolloutTest("forward rollout re-qualifies a same-slot KeepAlive replacement before commit", async (t) => {
@@ -665,6 +732,35 @@ rolloutTest("pre-commit recovery stops an owned candidate then bootstraps the un
   assert.equal(fixture.calls.includes("CANDIDATE_STOP_REQUESTED"), true);
   assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), true);
   assert.equal(fixture.calls.includes("ready:old-restored"), true);
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+rolloutTest("pre-commit recovery unloads an exact crash-backoff candidate with no PID and restores old production", async (t) => {
+  const fixture = await createForwardFixture(t, {
+    firstCandidateHealthy: false,
+    candidateCrashBackoffBeforeRecovery: true,
+  });
+  const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+
+  assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
+  assert.equal(outcome.committed, false);
+  assert.equal(fixture.calls.includes("INACTIVE_CANDIDATE_STOP_REQUESTED"), true);
+  assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), true);
+  assert.equal(fixture.calls.includes("ready:old-restored"), true);
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+rolloutTest("pre-commit recovery refuses a no-PID launchd definition whose argv is not the exact candidate", async (t) => {
+  const fixture = await createForwardFixture(t, {
+    firstCandidateHealthy: false,
+    candidateCrashBackoffBeforeRecovery: true,
+    candidateCrashBackoffArgvDrift: true,
+  });
+  const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+
+  assert.equal(outcome.code, "ROLLBACK_REFUSED_CONCURRENT_DRIFT");
+  assert.equal(fixture.calls.includes("INACTIVE_CANDIDATE_STOP_REQUESTED"), false);
+  assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), false);
   assert.equal(fixture.getReleaseCalls(), 1);
 });
 
@@ -760,6 +856,21 @@ rolloutTest("post-commit qualification failure performs runtime-aware compensati
 
   assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
   assert.equal(outcome.committed, true, "candidate commit occurred before compensation");
+  assert.equal(fixture.calls.includes("ROLLBACK_RESTORED_CANONICAL"), true);
+  assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), true);
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+rolloutTest("post-commit compensation unloads an exact crash-backoff candidate with no PID before restoring old canonical", async (t) => {
+  const fixture = await createForwardFixture(t, {
+    postCommitHealthFailure: true,
+    postCommitCandidateCrashBackoff: true,
+  });
+  const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+
+  assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
+  assert.equal(outcome.committed, true);
+  assert.equal(fixture.calls.includes("INACTIVE_CANDIDATE_STOP_REQUESTED"), true);
   assert.equal(fixture.calls.includes("ROLLBACK_RESTORED_CANONICAL"), true);
   assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), true);
   assert.equal(fixture.getReleaseCalls(), 1);

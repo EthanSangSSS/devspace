@@ -76,7 +76,7 @@ export interface CommandRunner {
   run(
     executable: string,
     args: readonly string[],
-    options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal; cwd?: string; env?: NodeJS.ProcessEnv },
   ): Promise<CommandResult>;
 }
 
@@ -96,6 +96,11 @@ export interface RuntimeReadinessProbe {
   observeProcess(pid: number, signal?: AbortSignal): Promise<ObservedState<ProcessIdentity>>;
   observeListener(signal?: AbortSignal): Promise<ObservedState<ListenerObservation>>;
   checkHealth(signal?: AbortSignal): Promise<ObservedState<"healthy" | "unhealthy">>;
+}
+
+export interface InactiveCandidateStopProbe {
+  observeLaunchd(signal?: AbortSignal): Promise<ObservedState<LaunchdObservation>>;
+  observeListener(signal?: AbortSignal): Promise<ObservedState<ListenerObservation>>;
 }
 
 export interface DarwinRolloutAdapterOptions {
@@ -920,14 +925,14 @@ export async function waitForRuntimeReadyState(
 
   try {
     while (true) {
-      const launchdStep = await awaitReadinessStep(
+      const launchdStep = await awaitDeadlineStep(
         (signal) => probe.observeLaunchd(signal),
         controller.signal,
       );
       if (launchdStep.timedOut || deadlineExpired()) return timedOut();
       const launchd = launchdStep.value;
       if (launchd.kind === "known" && launchd.value.loaded && launchd.value.pid) {
-        const processStep = await awaitReadinessStep(
+        const processStep = await awaitDeadlineStep(
           (signal) => probe.observeProcess(launchd.value.pid!, signal),
           controller.signal,
         );
@@ -938,7 +943,7 @@ export async function waitForRuntimeReadyState(
             return { kind: "unproven", reason: "incompatible same-label runtime appeared during readiness wait" };
           }
 
-          const listenerStep = await awaitReadinessStep(
+          const listenerStep = await awaitDeadlineStep(
             (signal) => probe.observeListener(signal),
             controller.signal,
           );
@@ -949,7 +954,7 @@ export async function waitForRuntimeReadyState(
               return { kind: "unproven", reason: "unrelated listener owner appeared during readiness wait" };
             }
             if (listener.value.state === "owned" && listener.value.ownerPid === processState.value.pid) {
-              const healthStep = await awaitReadinessStep(
+              const healthStep = await awaitDeadlineStep(
                 (signal) => probe.checkHealth(signal),
                 controller.signal,
               );
@@ -978,7 +983,7 @@ export async function waitForRuntimeReadyState(
 
       if (deadlineExpired()) return timedOut();
       const remainingMs = Math.max(0, deadline - now());
-      const sleepStep = await awaitReadinessStep(
+      const sleepStep = await awaitDeadlineStep(
         () => sleep(Math.min(options.pollIntervalMs, remainingMs)),
         controller.signal,
       );
@@ -989,7 +994,7 @@ export async function waitForRuntimeReadyState(
   }
 }
 
-async function awaitReadinessStep<T>(
+async function awaitDeadlineStep<T>(
   operation: (signal: AbortSignal) => Promise<T>,
   signal: AbortSignal,
 ): Promise<{ timedOut: false; value: T } | { timedOut: true }> {
@@ -1017,6 +1022,77 @@ async function awaitReadinessStep<T>(
       },
     );
   });
+}
+
+export async function waitForInactiveCandidateStoppedState(
+  expectedArgv: readonly string[],
+  probe: InactiveCandidateStopProbe,
+  options: {
+    timeoutMs?: number;
+    deadline?: number;
+    signal?: AbortSignal;
+    pollIntervalMs: number;
+    now?: () => number;
+    sleep?: (ms: number) => Promise<void>;
+  },
+): Promise<ObservedState<"stopped">> {
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? delay;
+  if (options.deadline === undefined && options.timeoutMs === undefined) {
+    throw new Error("inactive candidate stop barrier requires a timeout or absolute deadline");
+  }
+  const deadline = options.deadline ?? (now() + options.timeoutMs!);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(0, deadline - now()));
+  const signal = options.signal
+    ? AbortSignal.any([options.signal, controller.signal])
+    : controller.signal;
+  const expired = () => signal.aborted || now() >= deadline;
+  const timedOut = (): ObservedState<"stopped"> => ({
+    kind: "unproven",
+    reason: "inactive candidate stop barrier timed out before service/listener absence was proven",
+  });
+
+  try {
+    while (true) {
+      const launchdStep = await awaitDeadlineStep(
+        (signal) => probe.observeLaunchd(signal),
+        signal,
+      );
+      if (launchdStep.timedOut || expired()) return timedOut();
+      const launchd = launchdStep.value;
+      if (launchd.kind === "unproven") return launchd;
+      if (launchd.value.loaded) {
+        if (launchd.value.pid !== undefined) {
+          return { kind: "unproven", reason: "runtime appeared during inactive candidate stop barrier" };
+        }
+        if (!sameArgv(launchd.value.normalizedArgv, expectedArgv)) {
+          return { kind: "unproven", reason: "incompatible same-label definition appeared during inactive candidate stop barrier" };
+        }
+      }
+
+      const listenerStep = await awaitDeadlineStep(
+        (signal) => probe.observeListener(signal),
+        signal,
+      );
+      if (listenerStep.timedOut || expired()) return timedOut();
+      const listener = listenerStep.value;
+      if (listener.kind === "unproven") return listener;
+      if (listener.value.state === "owned") {
+        return { kind: "unproven", reason: "listener owner appeared during inactive candidate stop barrier" };
+      }
+
+      if (!launchd.value.loaded) return { kind: "known", value: "stopped" };
+      const remainingMs = Math.max(0, deadline - now());
+      const sleepStep = await awaitDeadlineStep(
+        () => sleep(Math.min(options.pollIntervalMs, remainingMs)),
+        signal,
+      );
+      if (sleepStep.timedOut || expired()) return timedOut();
+    }
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export function createDarwinRolloutAdapters(
@@ -1168,6 +1244,7 @@ export function createDarwinRolloutAdapters(
             identity,
             parentIdentity,
             entrypointRealpath,
+            programArguments: [...fields.programArguments],
             runAtLoad: true,
             keepAlive: true,
           },
@@ -1191,6 +1268,10 @@ export function createDarwinRolloutAdapters(
       if (relationship === ".." || relationship.startsWith(`..${sep}`) || isAbsolute(relationship)) {
         throw new Error("candidate entrypoint escapes candidate slot root");
       }
+    },
+
+    async preflightCandidateRuntime(plistPath, candidateEntrypoint, expectedArgv) {
+      await verifyCandidateRuntimePreflight(plistPath, candidateEntrypoint, expectedArgv, runner);
     },
 
     createCandidatePlist(oldBytes, candidateEntrypoint) {
@@ -1270,6 +1351,64 @@ export function createDarwinRolloutAdapters(
       }
       const result = await runner.run("/bin/launchctl", ["bootout", serviceTarget]);
       if (result.exitCode !== 0) throw new Error(`launchctl bootout failed with code ${result.exitCode}`);
+    },
+
+    async bootoutInactiveCandidate(expectedArgv) {
+      const deadline = now() + stopTimeoutMs;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), Math.max(0, deadline - now()));
+      const expired = () => controller.signal.aborted || now() >= deadline;
+      const timeoutError = () => new Error("inactive candidate stop deadline expired");
+      try {
+        const launchdStep = await awaitDeadlineStep(
+          (signal) => observeLaunchd(signal),
+          controller.signal,
+        );
+        if (launchdStep.timedOut || expired()) throw timeoutError();
+        const launchd = launchdStep.value;
+        const listenerStep = await awaitDeadlineStep(
+          (signal) => observeListener(signal),
+          controller.signal,
+        );
+        if (listenerStep.timedOut || expired()) throw timeoutError();
+        const listener = listenerStep.value;
+        if (
+          launchd.kind !== "known"
+          || !launchd.value.loaded
+          || launchd.value.pid !== undefined
+          || !sameArgv(launchd.value.normalizedArgv, expectedArgv)
+        ) {
+          throw new Error("refusing inactive-candidate bootout because loaded definition is not the expected candidate");
+        }
+        if (listener.kind !== "known" || listener.value.state !== "unowned") {
+          throw new Error("refusing inactive-candidate bootout because the production listener is not proven unowned");
+        }
+
+        const bootoutStep = await awaitDeadlineStep(
+          (signal) => runner.run("/bin/launchctl", ["bootout", serviceTarget], { signal }),
+          controller.signal,
+        );
+        if (bootoutStep.timedOut || expired()) throw timeoutError();
+        if (bootoutStep.value.exitCode !== 0) {
+          throw new Error(`launchctl bootout failed with code ${bootoutStep.value.exitCode}`);
+        }
+
+        const stopped = await waitForInactiveCandidateStoppedState(expectedArgv, {
+          observeLaunchd,
+          observeListener,
+        }, {
+          deadline,
+          signal: controller.signal,
+          pollIntervalMs: stopPollIntervalMs,
+          now,
+          sleep,
+        });
+        if (stopped.kind !== "known" || expired()) {
+          throw stopped.kind === "unproven" ? new Error(stopped.reason) : timeoutError();
+        }
+      } finally {
+        clearTimeout(timer);
+      }
     },
 
     async bootstrap(plistPath) {
@@ -1379,6 +1518,8 @@ function createExecFileRunner(): CommandRunner {
           encoding: "utf8",
           maxBuffer: 8 * 1024 * 1024,
           signal: options?.signal,
+          cwd: options?.cwd,
+          env: options?.env,
         });
         return { stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
       } catch (error) {
@@ -1391,6 +1532,91 @@ function createExecFileRunner(): CommandRunner {
         };
       }
     },
+  };
+}
+
+export async function verifyCandidateRuntimePreflight(
+  plistPath: string,
+  candidateEntrypoint: string,
+  expectedArgv: readonly string[],
+  runner: CommandRunner,
+): Promise<void> {
+  const fields = await readCandidateRuntimePlistFields(plistPath, runner);
+  if (
+    !sameArgv(fields.programArguments, expectedArgv)
+    || fields.programArguments.length < 3
+    || fields.programArguments[1] !== candidateEntrypoint
+    || fields.programArguments.at(-1) !== "serve"
+  ) {
+    throw new Error("candidate runtime preflight plist argv does not match the staged candidate");
+  }
+  const nodeExecutable = fields.programArguments[0]!;
+  if (!isAbsolute(nodeExecutable)) {
+    throw new Error("candidate runtime preflight requires an absolute Node executable");
+  }
+
+  const result = await runner.run(nodeExecutable, [candidateEntrypoint, "rollout-preflight"], {
+    cwd: fields.workingDirectory,
+    env: { ...fields.environmentVariables },
+    signal: AbortSignal.timeout(5_000),
+  });
+  const lines = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const sqliteStatus = lines.find((line) => line.startsWith("SQLite native dependency:"));
+  if (sqliteStatus !== "SQLite native dependency: ok") {
+    throw new Error(`candidate runtime preflight failed: ${sqliteStatus ?? "SQLite native dependency status is missing"}`);
+  }
+  if (result.exitCode !== 0) {
+    throw new Error(`candidate runtime preflight exited with code ${result.exitCode}`);
+  }
+  if (!lines.some((line) => line.startsWith("Local MCP URL:"))) {
+    throw new Error("candidate runtime preflight failed: production-style config did not load");
+  }
+}
+
+async function readCandidateRuntimePlistFields(
+  path: string,
+  runner: CommandRunner,
+): Promise<{
+  programArguments: string[];
+  workingDirectory?: string;
+  environmentVariables: NodeJS.ProcessEnv;
+}> {
+  const result = await runner.run("/usr/bin/plutil", ["-convert", "json", "-o", "-", path]);
+  if (result.exitCode !== 0) throw new Error("plutil failed to parse staged candidate plist");
+  const parsed = JSON.parse(result.stdout) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("candidate plist root is not a dictionary");
+  }
+  const plist = parsed as Record<string, unknown>;
+  const argsValue = plist.ProgramArguments;
+  const workingDirectoryValue = plist.WorkingDirectory;
+  const envValue = plist.EnvironmentVariables;
+  if (!Array.isArray(argsValue) || argsValue.some((value) => typeof value !== "string")) {
+    throw new Error("candidate ProgramArguments is not a string array");
+  }
+  if (workingDirectoryValue !== undefined && typeof workingDirectoryValue !== "string") {
+    throw new Error("candidate WorkingDirectory is not a string");
+  }
+  const workingDirectory = typeof workingDirectoryValue === "string"
+    ? workingDirectoryValue.trim() || undefined
+    : undefined;
+  if (workingDirectory && !isAbsolute(workingDirectory)) {
+    throw new Error("candidate WorkingDirectory must be absolute");
+  }
+  const environmentVariables: NodeJS.ProcessEnv = {};
+  if (envValue !== undefined) {
+    if (!envValue || typeof envValue !== "object" || Array.isArray(envValue)) {
+      throw new Error("candidate EnvironmentVariables is not a string map");
+    }
+    for (const [key, value] of Object.entries(envValue)) {
+      if (typeof value !== "string") throw new Error("candidate EnvironmentVariables is not a string map");
+      environmentVariables[key] = value;
+    }
+  }
+  return {
+    programArguments: argsValue as string[],
+    ...(workingDirectory ? { workingDirectory } : {}),
+    environmentVariables,
   };
 }
 
@@ -1447,15 +1673,19 @@ function parseUniqueIntegerLine(
   lines: readonly string[],
   key: string,
 ): ObservedState<number | undefined> {
-  const values = lines
-    .map((line) => new RegExp(`^${escapeRegExp(key)}\\s*=\\s*(\\d+)\\s*$`).exec(line.trim())?.[1])
-    .filter((value): value is string => value !== undefined)
-    .map(Number);
-  if (values.length === 0) return { kind: "known", value: undefined };
-  if (values.length !== 1 || !Number.isSafeInteger(values[0]) || values[0]! < 0) {
+  const keyPattern = new RegExp(`^${escapeRegExp(key)}\\s*=`);
+  const matchingLines = lines.map((line) => line.trim()).filter((line) => keyPattern.test(line));
+  if (matchingLines.length === 0) return { kind: "known", value: undefined };
+  if (matchingLines.length !== 1) {
     return { kind: "unproven", reason: `${key} output is ambiguous` };
   }
-  return { kind: "known", value: values[0] };
+  const match = new RegExp(`^${escapeRegExp(key)}\\s*=\\s*(\\d+)\\s*$`).exec(matchingLines[0]!);
+  if (!match) return { kind: "unproven", reason: `${key} output is malformed` };
+  const value = Number(match[1]);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    return { kind: "unproven", reason: `${key} output is outside the supported range` };
+  }
+  return { kind: "known", value };
 }
 
 function parsePlutilBoolean(value: string, key: string): boolean {
@@ -1471,6 +1701,14 @@ function sameProcessIdentity(left: ProcessIdentity, right: ProcessIdentity): boo
     && left.entrypointRealpath === right.entrypointRealpath
     && left.normalizedArgv.length === right.normalizedArgv.length
     && left.normalizedArgv.every((value, index) => value === right.normalizedArgv[index]);
+}
+
+function sameArgv(left: readonly string[] | undefined, right: readonly string[]): boolean {
+  return Boolean(
+    left
+    && left.length === right.length
+    && left.every((value, index) => value === right[index]),
+  );
 }
 
 function startIdentityTimestamp(identity: string): string {
