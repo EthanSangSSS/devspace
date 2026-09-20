@@ -1028,7 +1028,9 @@ export async function waitForInactiveCandidateStoppedState(
   expectedArgv: readonly string[],
   probe: InactiveCandidateStopProbe,
   options: {
-    timeoutMs: number;
+    timeoutMs?: number;
+    deadline?: number;
+    signal?: AbortSignal;
     pollIntervalMs: number;
     now?: () => number;
     sleep?: (ms: number) => Promise<void>;
@@ -1036,10 +1038,16 @@ export async function waitForInactiveCandidateStoppedState(
 ): Promise<ObservedState<"stopped">> {
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? delay;
-  const deadline = now() + options.timeoutMs;
+  if (options.deadline === undefined && options.timeoutMs === undefined) {
+    throw new Error("inactive candidate stop barrier requires a timeout or absolute deadline");
+  }
+  const deadline = options.deadline ?? (now() + options.timeoutMs!);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(0, deadline - now()));
-  const expired = () => controller.signal.aborted || now() >= deadline;
+  const signal = options.signal
+    ? AbortSignal.any([options.signal, controller.signal])
+    : controller.signal;
+  const expired = () => signal.aborted || now() >= deadline;
   const timedOut = (): ObservedState<"stopped"> => ({
     kind: "unproven",
     reason: "inactive candidate stop barrier timed out before service/listener absence was proven",
@@ -1049,7 +1057,7 @@ export async function waitForInactiveCandidateStoppedState(
     while (true) {
       const launchdStep = await awaitDeadlineStep(
         (signal) => probe.observeLaunchd(signal),
-        controller.signal,
+        signal,
       );
       if (launchdStep.timedOut || expired()) return timedOut();
       const launchd = launchdStep.value;
@@ -1065,7 +1073,7 @@ export async function waitForInactiveCandidateStoppedState(
 
       const listenerStep = await awaitDeadlineStep(
         (signal) => probe.observeListener(signal),
-        controller.signal,
+        signal,
       );
       if (listenerStep.timedOut || expired()) return timedOut();
       const listener = listenerStep.value;
@@ -1078,7 +1086,7 @@ export async function waitForInactiveCandidateStoppedState(
       const remainingMs = Math.max(0, deadline - now());
       const sleepStep = await awaitDeadlineStep(
         () => sleep(Math.min(options.pollIntervalMs, remainingMs)),
-        controller.signal,
+        signal,
       );
       if (sleepStep.timedOut || expired()) return timedOut();
     }
@@ -1389,12 +1397,15 @@ export function createDarwinRolloutAdapters(
           observeLaunchd,
           observeListener,
         }, {
-          timeoutMs: Math.max(0, deadline - now()),
+          deadline,
+          signal: controller.signal,
           pollIntervalMs: stopPollIntervalMs,
           now,
           sleep,
         });
-        if (stopped.kind !== "known") throw new Error(stopped.reason);
+        if (stopped.kind !== "known" || expired()) {
+          throw stopped.kind === "unproven" ? new Error(stopped.reason) : timeoutError();
+        }
       } finally {
         clearTimeout(timer);
       }

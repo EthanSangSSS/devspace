@@ -423,6 +423,88 @@ test("inactive candidate stop barrier bounds hanging probes and rejects success 
   assert.match(result.kind === "unproven" ? result.reason : "", /timed out/);
 });
 
+test("inactive candidate stop barrier inherits an outer cancellation signal", async () => {
+  const expectedArgv = ["/opt/homebrew/bin/node", "/candidate/cli.js", "serve"];
+  const controller = new AbortController();
+  controller.abort();
+  let probeCalls = 0;
+  const result = await waitForInactiveCandidateStoppedState(expectedArgv, {
+    async observeLaunchd() {
+      probeCalls += 1;
+      return { kind: "known", value: { loaded: false } };
+    },
+    async observeListener() {
+      probeCalls += 1;
+      return { kind: "known", value: { state: "unowned" } };
+    },
+  }, {
+    deadline: Date.now() + 1_000,
+    signal: controller.signal,
+    pollIntervalMs: 1,
+  });
+  assert.equal(result.kind, "unproven");
+  assert.match(result.kind === "unproven" ? result.reason : "", /timed out/);
+  assert.equal(probeCalls, 0, "an inherited outer abort must prevent new stop-barrier probes");
+});
+
+darwinTest("inactive candidate bootout preserves the outer absolute deadline across barrier handoff", async () => {
+  const candidate = "/candidate/node_modules/@waishnav/devspace/dist/cli.js";
+  const expectedArgv = ["/opt/homebrew/opt/node@24/bin/node", candidate, "serve"];
+  const loadedNoPid = [
+    "gui/501/com.ethan.devspace = {",
+    "\tstate = spawn scheduled",
+    "\targuments = {",
+    `\t\t${expectedArgv[0]}`,
+    `\t\t${expectedArgv[1]}`,
+    `\t\t${expectedArgv[2]}`,
+    "\t}",
+    "\truns = 64",
+    "}",
+    "",
+  ].join("\n");
+  let stopped = false;
+  let postBootoutNowReads = 0;
+  let bootoutCalls = 0;
+  const now = () => {
+    if (!stopped) return 0;
+    postBootoutNowReads += 1;
+    return postBootoutNowReads <= 2 ? 9 : 11;
+  };
+  const commandRunner: CommandRunner = {
+    async run(executable, args) {
+      if (executable === "/bin/launchctl" && args[0] === "print") {
+        return stopped
+          ? { stdout: "", stderr: "Could not find service", exitCode: 113 }
+          : { stdout: loadedNoPid, stderr: "", exitCode: 0 };
+      }
+      if (executable === "/usr/sbin/lsof") {
+        return { stdout: "", stderr: "", exitCode: 1 };
+      }
+      if (executable === "/bin/launchctl" && args[0] === "bootout") {
+        bootoutCalls += 1;
+        stopped = true;
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      throw new Error(`unexpected command ${executable} ${args.join(" ")}`);
+    },
+  };
+  const adapters = createDarwinRolloutAdapters({
+    uid: 501,
+    commandRunner,
+    stopTimeoutMs: 10,
+    stopPollIntervalMs: 1,
+    now,
+    sleep: async () => undefined,
+  });
+
+  await assert.rejects(
+    () => adapters.bootoutInactiveCandidate(expectedArgv),
+    /timed out|deadline expired/,
+  );
+  assert.equal(bootoutCalls, 1);
+  assert.ok(postBootoutNowReads >= 3, "test must cross the original absolute deadline during handoff");
+});
+
 test("inactive candidate stop barrier preserves observed foreign-state refusal", async () => {
   const expectedArgv = ["/opt/homebrew/bin/node", "/candidate/cli.js", "serve"];
   let listenerReads = 0;
