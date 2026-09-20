@@ -1039,7 +1039,6 @@ export async function waitForInactiveCandidateStoppedState(
   const deadline = now() + options.timeoutMs;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(0, deadline - now()));
-  timer.unref?.();
   const expired = () => controller.signal.aborted || now() >= deadline;
   const timedOut = (): ObservedState<"stopped"> => ({
     kind: "unproven",
@@ -1350,7 +1349,6 @@ export function createDarwinRolloutAdapters(
       const deadline = now() + stopTimeoutMs;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), Math.max(0, deadline - now()));
-      timer.unref?.();
       const expired = () => controller.signal.aborted || now() >= deadline;
       const timeoutError = () => new Error("inactive candidate stop deadline expired");
       try {
