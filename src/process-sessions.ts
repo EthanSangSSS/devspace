@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
@@ -11,6 +12,8 @@ const DEFAULT_BUFFER_CHARACTERS = 1_000_000;
 const COMPLETED_SESSION_TTL_MS = 5 * 60 * 1_000;
 const DEFAULT_COLUMNS = 80;
 const DEFAULT_ROWS = 24;
+const PROCESS_SESSION_ID_BYTES = 6;
+const PROCESS_SESSION_ID_ATTEMPTS = 16;
 
 export interface StartCommandInput {
   workspaceId: string;
@@ -69,6 +72,22 @@ interface ProcessSession {
 interface ProcessSessionManagerOptions {
   maxBufferCharacters?: number;
   completedSessionTtlMs?: number;
+  sessionIdGenerator?: () => number;
+}
+
+function randomProcessSessionId(): number {
+  // Six bytes fit exactly inside JavaScript's safe-integer range while giving
+  // each process handle 48 bits of runtime-independent entropy. Process session
+  // IDs are opaque handles; callers must never infer ordering or reuse them
+  // across DevSpace runtime generations.
+  let id = 0;
+  while (id === 0) {
+    id = randomBytes(PROCESS_SESSION_ID_BYTES).readUIntBE(
+      0,
+      PROCESS_SESSION_ID_BYTES,
+    );
+  }
+  return id;
 }
 
 function boundedInteger(value: number | undefined, fallback: number, maximum: number): number {
@@ -215,11 +234,12 @@ export class ProcessSessionManager {
   private readonly sessions = new Map<number, ProcessSession>();
   private readonly maxBufferCharacters: number;
   private readonly completedSessionTtlMs: number;
-  private nextSessionId = 1;
+  private readonly sessionIdGenerator: () => number;
 
   constructor(options: ProcessSessionManagerOptions = {}) {
     this.maxBufferCharacters = options.maxBufferCharacters ?? DEFAULT_BUFFER_CHARACTERS;
     this.completedSessionTtlMs = options.completedSessionTtlMs ?? COMPLETED_SESSION_TTL_MS;
+    this.sessionIdGenerator = options.sessionIdGenerator ?? randomProcessSessionId;
   }
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
@@ -310,7 +330,7 @@ export class ProcessSessionManager {
     });
 
     return {
-      id: this.nextSessionId++,
+      id: this.allocateSessionId(),
       workspaceId: input.workspaceId,
       startedAt: Date.now(),
       columns: terminalSize(input.columns, DEFAULT_COLUMNS),
@@ -320,6 +340,17 @@ export class ProcessSessionManager {
       exitPromise,
       resolveExit,
     };
+  }
+
+  private allocateSessionId(): number {
+    for (let attempt = 0; attempt < PROCESS_SESSION_ID_ATTEMPTS; attempt += 1) {
+      const candidate = this.sessionIdGenerator();
+      if (!Number.isSafeInteger(candidate) || candidate < 1) {
+        throw new Error("Process session ID generator must return a positive safe integer.");
+      }
+      if (!this.sessions.has(candidate)) return candidate;
+    }
+    throw new Error("Unable to allocate a unique process session ID.");
   }
 
   private startPipe(session: ProcessSession, input: StartCommandInput): void {
