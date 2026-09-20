@@ -76,7 +76,7 @@ export interface CommandRunner {
   run(
     executable: string,
     args: readonly string[],
-    options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal; cwd?: string; env?: NodeJS.ProcessEnv },
   ): Promise<CommandResult>;
 }
 
@@ -1193,6 +1193,10 @@ export function createDarwinRolloutAdapters(
       }
     },
 
+    async preflightCandidateRuntime(plistPath, candidateEntrypoint) {
+      await verifyCandidateRuntimePreflight(plistPath, candidateEntrypoint, runner);
+    },
+
     createCandidatePlist(oldBytes, candidateEntrypoint) {
       return rewriteCandidatePlistBytes(oldBytes, candidateEntrypoint);
     },
@@ -1270,6 +1274,35 @@ export function createDarwinRolloutAdapters(
       }
       const result = await runner.run("/bin/launchctl", ["bootout", serviceTarget]);
       if (result.exitCode !== 0) throw new Error(`launchctl bootout failed with code ${result.exitCode}`);
+    },
+
+    async bootoutInactiveCandidate(expectedArgv) {
+      const [launchd, listener] = await Promise.all([observeLaunchd(), observeListener()]);
+      if (
+        launchd.kind !== "known"
+        || !launchd.value.loaded
+        || launchd.value.pid !== undefined
+        || !sameArgv(launchd.value.normalizedArgv, expectedArgv)
+      ) {
+        throw new Error("refusing inactive-candidate bootout because loaded definition is not the expected candidate");
+      }
+      if (listener.kind !== "known" || listener.value.state !== "unowned") {
+        throw new Error("refusing inactive-candidate bootout because the production listener is not proven unowned");
+      }
+      const result = await runner.run("/bin/launchctl", ["bootout", serviceTarget]);
+      if (result.exitCode !== 0) throw new Error(`launchctl bootout failed with code ${result.exitCode}`);
+
+      const deadline = now() + stopTimeoutMs;
+      while (true) {
+        const [afterLaunchd, afterListener] = await Promise.all([observeLaunchd(), observeListener()]);
+        if (afterLaunchd.kind === "unproven") throw new Error(afterLaunchd.reason);
+        if (afterListener.kind === "unproven") throw new Error(afterListener.reason);
+        if (!afterLaunchd.value.loaded && afterListener.value.state === "unowned") return;
+        if (now() >= deadline) {
+          throw new Error("inactive candidate stop barrier timed out before service/listener absence was proven");
+        }
+        await sleep(stopPollIntervalMs);
+      }
     },
 
     async bootstrap(plistPath) {
@@ -1379,6 +1412,8 @@ function createExecFileRunner(): CommandRunner {
           encoding: "utf8",
           maxBuffer: 8 * 1024 * 1024,
           signal: options?.signal,
+          cwd: options?.cwd,
+          env: options?.env,
         });
         return { stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
       } catch (error) {
@@ -1391,6 +1426,93 @@ function createExecFileRunner(): CommandRunner {
         };
       }
     },
+  };
+}
+
+export async function verifyCandidateRuntimePreflight(
+  plistPath: string,
+  candidateEntrypoint: string,
+  runner: CommandRunner,
+): Promise<void> {
+  const fields = await readCandidateRuntimePlistFields(plistPath, runner);
+  if (
+    fields.programArguments.length < 3
+    || fields.programArguments[1] !== candidateEntrypoint
+    || fields.programArguments.at(-1) !== "serve"
+  ) {
+    throw new Error("candidate runtime preflight plist argv does not match the staged candidate");
+  }
+  const nodeExecutable = fields.programArguments[0]!;
+  if (!isAbsolute(nodeExecutable)) {
+    throw new Error("candidate runtime preflight requires an absolute Node executable");
+  }
+
+  const result = await runner.run(nodeExecutable, [candidateEntrypoint, "doctor"], {
+    cwd: fields.workingDirectory,
+    env: { ...fields.environmentVariables },
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(`candidate runtime preflight doctor exited with code ${result.exitCode}`);
+  }
+  const lines = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const sqliteStatus = lines.find((line) => line.startsWith("SQLite native dependency:"));
+  if (sqliteStatus !== "SQLite native dependency: ok") {
+    throw new Error(`candidate runtime preflight failed: ${sqliteStatus ?? "SQLite native dependency status is missing"}`);
+  }
+  const configFailure = lines.find((line) => line.startsWith("Config status:"));
+  if (configFailure) {
+    throw new Error(`candidate runtime preflight failed: ${configFailure}`);
+  }
+  if (!lines.some((line) => line.startsWith("Local MCP URL:"))) {
+    throw new Error("candidate runtime preflight failed: production-style config did not load");
+  }
+}
+
+async function readCandidateRuntimePlistFields(
+  path: string,
+  runner: CommandRunner,
+): Promise<{
+  programArguments: string[];
+  workingDirectory?: string;
+  environmentVariables: NodeJS.ProcessEnv;
+}> {
+  const result = await runner.run("/usr/bin/plutil", ["-convert", "json", "-o", "-", path]);
+  if (result.exitCode !== 0) throw new Error("plutil failed to parse staged candidate plist");
+  const parsed = JSON.parse(result.stdout) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("candidate plist root is not a dictionary");
+  }
+  const plist = parsed as Record<string, unknown>;
+  const argsValue = plist.ProgramArguments;
+  const workingDirectoryValue = plist.WorkingDirectory;
+  const envValue = plist.EnvironmentVariables;
+  if (!Array.isArray(argsValue) || argsValue.some((value) => typeof value !== "string")) {
+    throw new Error("candidate ProgramArguments is not a string array");
+  }
+  if (workingDirectoryValue !== undefined && typeof workingDirectoryValue !== "string") {
+    throw new Error("candidate WorkingDirectory is not a string");
+  }
+  const workingDirectory = typeof workingDirectoryValue === "string"
+    ? workingDirectoryValue.trim() || undefined
+    : undefined;
+  if (workingDirectory && !isAbsolute(workingDirectory)) {
+    throw new Error("candidate WorkingDirectory must be absolute");
+  }
+  const environmentVariables: NodeJS.ProcessEnv = {};
+  if (envValue !== undefined) {
+    if (!envValue || typeof envValue !== "object" || Array.isArray(envValue)) {
+      throw new Error("candidate EnvironmentVariables is not a string map");
+    }
+    for (const [key, value] of Object.entries(envValue)) {
+      if (typeof value !== "string") throw new Error("candidate EnvironmentVariables is not a string map");
+      environmentVariables[key] = value;
+    }
+  }
+  return {
+    programArguments: argsValue as string[],
+    ...(workingDirectory ? { workingDirectory } : {}),
+    environmentVariables,
   };
 }
 
@@ -1471,6 +1593,14 @@ function sameProcessIdentity(left: ProcessIdentity, right: ProcessIdentity): boo
     && left.entrypointRealpath === right.entrypointRealpath
     && left.normalizedArgv.length === right.normalizedArgv.length
     && left.normalizedArgv.every((value, index) => value === right.normalizedArgv[index]);
+}
+
+function sameArgv(left: readonly string[] | undefined, right: readonly string[]): boolean {
+  return Boolean(
+    left
+    && left.length === right.length
+    && left.every((value, index) => value === right[index]),
+  );
 }
 
 function startIdentityTimestamp(identity: string): string {

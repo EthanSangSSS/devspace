@@ -131,6 +131,17 @@ void (async () => {
 
 The rollout helper independently rebuilds the manifest and requires the exact digest. A mismatch returns `CANDIDATE_ARTIFACT_MISMATCH` before production is stopped.
 
+The manifest proves artifact byte identity, not runtime loadability. Before the old service is stopped, the helper also runs a bounded candidate runtime preflight from the staged candidate plist. The preflight uses the exact Node executable from `ProgramArguments[0]`, the staged candidate entrypoint, and the plist-defined `WorkingDirectory` / `EnvironmentVariables`, then runs the candidate's `doctor` command. It requires both:
+
+```text
+SQLite native dependency: ok
+Local MCP URL: ...
+```
+
+and rejects any `Config status:` failure. This catches native ABI/package errors such as a missing `better-sqlite3` binding while `liveMutationStarted=false`. A preflight failure is `CANDIDATE_ARTIFACT_MISMATCH`; the old production service must still be running.
+
+Build candidate slots under the production Node major/architecture with dependency lifecycle scripts enabled. Do not use `npm install --ignore-scripts` for a production candidate unless every required native dependency is separately rebuilt and the runtime preflight passes. `devspace --version` alone is not a sufficient candidate qualification because it does not load SQLite.
+
 ## Commit and controlled-reload semantics
 
 The sole logical commit point is the successful same-directory atomic rename of the verified hidden temp file over the canonical plist:
@@ -226,6 +237,17 @@ Treat current runtime/disk state as externally changed. Re-read from scratch. Do
 ### `ROLLBACK_REFUSED_UNPROVEN_STATE`
 
 Resolve the failed observation first. Examples include unreadable file identity, unavailable process generation evidence, or ambiguous listener data. Do not relabel unknown state as drift or absence merely to continue.
+
+A launchd crash-backoff state is not automatically ambiguous. While the transaction lock is still owned, recovery may treat a loaded job with **no observable PID** as this transaction's inactive candidate only when all of the following are freshly proven:
+
+```text
+loaded normalized argv == exact expected candidate argv
+canonical state == the recovery phase's expected canonical state
+production listener == unowned
+rollout lock / owner record == this transaction
+```
+
+In that bounded case, the helper may boot out the exact inactive candidate definition, wait until both the launchd job and listener are absent, and then continue normal old-runtime recovery. A different/ambiguous argv, an owned listener, canonical drift, or lock drift still fails closed as concurrent drift or unproven state.
 
 ### `LOCK_BUSY` and `LOCK_AMBIGUOUS`
 

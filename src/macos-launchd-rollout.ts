@@ -64,6 +64,7 @@ export interface MacosRolloutAdapters {
   }): Promise<RolloutLockLease>;
   readCanonical(): Promise<ObservedState<CanonicalPlistSnapshot>>;
   validateCandidateEntrypoint(path: string): Promise<void>;
+  preflightCandidateRuntime(plistPath: string, candidateEntrypoint: string): Promise<void>;
   createCandidatePlist(oldBytes: Buffer, candidateEntrypoint: string): Promise<Buffer>;
   writeOldBackup(input: {
     transactionDir: string;
@@ -95,6 +96,7 @@ export interface MacosRolloutAdapters {
   checkHealth(): Promise<ObservedState<"healthy" | "unhealthy">>;
   waitReady(expectedEntrypoint: string): Promise<ObservedState<ProcessIdentity>>;
   bootoutExpected(expected: ProcessIdentity): Promise<void>;
+  bootoutInactiveCandidate(expectedArgv: readonly string[]): Promise<void>;
   bootstrap(plistPath: string): Promise<void>;
   observeDisabledOverride(): Promise<ObservedState<"enabled" | "disabled">>;
   observeAncestors(pid: number): Promise<ObservedState<number[]>>;
@@ -240,7 +242,7 @@ interface RolloutTransactionIdentity {
 
 interface RecoveryObservation {
   refusal?: RollbackRefusal;
-  runtimeRole: "old" | "candidate" | "absent" | "drift" | "unproven";
+  runtimeRole: "old" | "candidate" | "candidate-inactive" | "absent" | "drift" | "unproven";
   process?: ProcessIdentity;
   listener: ObservedState<"expected" | "unowned" | "drift">;
 }
@@ -388,6 +390,7 @@ export async function runMacosLaunchdForwardPath(
         { initial },
       );
     }
+    await adapters.preflightCandidateRuntime(candidatePlistPath, request.candidateEntrypoint);
   } catch (error) {
     return forwardFailure(context, "precheck", "CANDIDATE_ARTIFACT_MISMATCH", errorMessage(error), { initial });
   }
@@ -663,7 +666,7 @@ async function recoverPreCommitFailure(
     );
   }
 
-  if (observed.runtimeRole === "candidate") {
+  if (observed.runtimeRole === "candidate" || observed.runtimeRole === "candidate-inactive") {
     const stopped = await stopRecoveryCandidate({
       expectedCanonical: "old",
       request,
@@ -765,7 +768,7 @@ async function compensateCommittedCandidate(
   if (observed.refusal) {
     return rolloutOutcome(observed.refusal, context, true, controlledReloadStatus(context), "FAIL");
   }
-  if (observed.runtimeRole === "candidate") {
+  if (observed.runtimeRole === "candidate" || observed.runtimeRole === "candidate-inactive") {
     const stopped = await stopRecoveryCandidate({
       expectedCanonical: "candidate",
       request,
@@ -882,6 +885,32 @@ async function stopRecoveryCandidate(input: {
     );
   }
   if (fresh.runtimeRole === "absent") return undefined;
+  if (fresh.runtimeRole === "candidate-inactive") {
+    const expectedArgv = expectedCandidateArgv(input.initial, input.request.candidateEntrypoint);
+    try {
+      await input.adapters.bootoutInactiveCandidate(expectedArgv);
+    } catch (error) {
+      const afterFailure = await observeRecoveryState(input);
+      if (afterFailure.refusal) {
+        return rolloutOutcome(
+          afterFailure.refusal,
+          input.context,
+          input.expectedCanonical === "candidate",
+          controlledReloadStatus(input.context),
+          "FAIL",
+        );
+      }
+      return rolloutOutcome(
+        "SWITCH_FAILED_ROLLBACK_FAILED",
+        input.context,
+        input.expectedCanonical === "candidate",
+        controlledReloadStatus(input.context),
+        "FAIL",
+        errorMessage(error),
+      );
+    }
+    return undefined;
+  }
   if (fresh.runtimeRole !== "candidate" || !fresh.process) {
     return rolloutOutcome(
       "ROLLBACK_REFUSED_CONCURRENT_DRIFT",
@@ -968,7 +997,14 @@ async function observeRecoveryState(input: {
     runtimeRole = "absent";
     runtime = { kind: "known", value: "absent" };
   } else if (!launchd.value.pid) {
-    runtime = { kind: "unproven", reason: "loaded launchd job has no observable PID" };
+    const expectedArgv = expectedCandidateArgv(input.initial, input.request.candidateEntrypoint);
+    if (sameArgv(launchd.value.normalizedArgv, expectedArgv)) {
+      runtimeRole = "candidate-inactive";
+      runtime = { kind: "known", value: "expected" };
+    } else {
+      runtimeRole = "drift";
+      runtime = { kind: "known", value: "drift" };
+    }
   } else {
     observedRuntimePid = launchd.value.pid;
     const processState = await input.adapters.observeProcess(launchd.value.pid);
@@ -1017,6 +1053,25 @@ async function observeRecoveryState(input: {
     ...(processValue ? { process: processValue } : {}),
     listener,
   };
+}
+
+function expectedCandidateArgv(
+  initial: InitialRolloutState,
+  candidateEntrypoint: string,
+): string[] {
+  const argv = [...initial.process.normalizedArgv];
+  if (argv.length < 2) return [];
+  argv[1] = candidateEntrypoint;
+  return argv;
+}
+
+function sameArgv(actual: readonly string[] | undefined, expected: readonly string[]): boolean {
+  return Boolean(
+    actual
+    && expected.length > 0
+    && actual.length === expected.length
+    && actual.every((value, index) => value === expected[index]),
+  );
 }
 
 async function observeExpectedCanonical(input: {

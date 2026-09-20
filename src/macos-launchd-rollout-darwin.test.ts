@@ -23,6 +23,7 @@ import {
   assertDarwinPlatform,
   buildProcessIdentityFromObservations,
   buildQualificationFixture,
+  type CommandRunner,
   createDarwinRolloutAdapters,
   parseLaunchctlPrint,
   parseListenerLsof,
@@ -38,6 +39,7 @@ import {
   runDarwinQualificationSequence,
   syncDirectoryDurably,
   validateCanonicalFileIdentity,
+  verifyCandidateRuntimePreflight,
   waitForStableState,
   waitForRuntimeReadyState,
   waitForStoppedState,
@@ -238,6 +240,122 @@ test("Darwin adapter platform guard fails closed outside macOS", () => {
   assert.doesNotThrow(() => assertDarwinPlatform("darwin"));
   assert.throws(() => assertDarwinPlatform("linux"), /require(?:s)? Darwin/i);
   assert.throws(() => assertDarwinPlatform("win32"), /require(?:s)? Darwin/i);
+});
+
+test("candidate runtime preflight uses the staged Node/environment and rejects a broken SQLite native binding", async () => {
+  const candidate = "/Users/ethan/.local/opt/devspace-candidate/node_modules/@waishnav/devspace/dist/cli.js";
+  const plist = "/tmp/candidate.plist";
+  const node = "/opt/homebrew/opt/node@24/bin/node";
+  const calls: Array<{ executable: string; args: readonly string[]; cwd?: string; home?: string }> = [];
+  const runner = (sqliteLine: string): CommandRunner => ({
+    async run(executable, args, options) {
+      calls.push({ executable, args, cwd: options?.cwd, home: options?.env?.HOME });
+      if (executable === "/usr/bin/plutil") {
+        assert.deepEqual(args, ["-convert", "json", "-o", "-", plist]);
+        return {
+          stdout: JSON.stringify({
+            ProgramArguments: [node, candidate, "serve"],
+            WorkingDirectory: "/Users/ethan",
+            EnvironmentVariables: { HOME: "/Users/ethan", PATH: "/opt/homebrew/bin:/usr/bin:/bin" },
+          }),
+          stderr: "",
+          exitCode: 0,
+        };
+      }
+      if (executable === node) {
+        return {
+          stdout: [
+            "Node: v24.19.0 (supported)",
+            "Node ABI: 137",
+            "Platform: darwin arm64",
+            sqliteLine,
+            "Local MCP URL: http://127.0.0.1:7676/mcp",
+          ].join("\n"),
+          stderr: "",
+          exitCode: 0,
+        };
+      }
+      throw new Error(`unexpected executable ${executable}`);
+    },
+  });
+
+  await verifyCandidateRuntimePreflight(
+    plist,
+    candidate,
+    runner("SQLite native dependency: ok"),
+  );
+  const doctorCall = calls.find((call) => call.executable === node);
+  assert.deepEqual(doctorCall?.args, [candidate, "doctor"]);
+  assert.equal(doctorCall?.cwd, "/Users/ethan");
+  assert.equal(doctorCall?.home, "/Users/ethan");
+
+  await assert.rejects(
+    () => verifyCandidateRuntimePreflight(
+      plist,
+      candidate,
+      runner("SQLite native dependency: Could not locate the bindings file for node-v137-darwin-arm64"),
+    ),
+    /SQLite native dependency/,
+  );
+});
+
+test("inactive candidate bootout requires exact candidate argv and an unowned production listener", async () => {
+  const candidate = "/candidate/node_modules/@waishnav/devspace/dist/cli.js";
+  const expectedArgv = ["/opt/homebrew/opt/node@24/bin/node", candidate, "serve"];
+  let bootoutCalls = 0;
+  let stopped = false;
+  const loadedNoPid = [
+    "gui/501/com.ethan.devspace = {",
+    "\tstate = spawn scheduled",
+    "\targuments = {",
+    `\t\t${expectedArgv[0]}`,
+    `\t\t${expectedArgv[1]}`,
+    `\t\t${expectedArgv[2]}`,
+    "\t}",
+    "\truns = 64",
+    "}",
+    "",
+  ].join("\n");
+  const commandRunner: CommandRunner = {
+    async run(executable, args) {
+      if (executable === "/bin/launchctl" && args[0] === "print") {
+        return stopped
+          ? { stdout: "", stderr: "Could not find service", exitCode: 113 }
+          : { stdout: loadedNoPid, stderr: "", exitCode: 0 };
+      }
+      if (executable === "/usr/sbin/lsof") {
+        return { stdout: "", stderr: "", exitCode: 1 };
+      }
+      if (executable === "/bin/launchctl" && args[0] === "bootout") {
+        bootoutCalls += 1;
+        stopped = true;
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      throw new Error(`unexpected command ${executable} ${args.join(" ")}`);
+    },
+  };
+  const adapters = createDarwinRolloutAdapters({
+    uid: 501,
+    commandRunner,
+    stopTimeoutMs: 50,
+    stopPollIntervalMs: 1,
+    sleep: async () => undefined,
+  });
+
+  await adapters.bootoutInactiveCandidate(expectedArgv);
+  assert.equal(bootoutCalls, 1);
+
+  stopped = false;
+  bootoutCalls = 0;
+  await assert.rejects(
+    () => adapters.bootoutInactiveCandidate([
+      "/opt/homebrew/opt/node@24/bin/node",
+      "/different/node_modules/@waishnav/devspace/dist/cli.js",
+      "serve",
+    ]),
+    /loaded definition is not the expected candidate/,
+  );
+  assert.equal(bootoutCalls, 0);
 });
 
 test("canonical file identity validation rejects symlink, unsafe mode, owner, and parent drift", async () => {
