@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   McpSessionAdmissionError,
   McpSessionRegistry,
+  type McpSessionLifecycleEvent,
 } from "./mcp-sessions.js";
 
 interface FakeTransport {
@@ -374,3 +375,124 @@ await commitRaceClose;
 assert.equal(commitRaceRegistry.snapshot().current, 0);
 assert.equal(commitRaceRegistry.snapshot().pendingReservations, 0);
 assert.equal(commitRaceRegistry.snapshot().state, "closed");
+
+// Active execution must not inherit a stale idle timestamp. If a session is
+// force-detached while a request lease is active, idleForMs is intentionally
+// absent and the event reports the active request count instead.
+now = 0;
+const lifecycleEvents: McpSessionLifecycleEvent[] = [];
+const telemetryRegistry = new McpSessionRegistry<FakeTransport>({
+  now: () => now,
+  onEvent: (event) => lifecycleEvents.push(event),
+});
+const telemetryTransport = createTransport();
+const telemetryReservation = await telemetryRegistry.reserve();
+const telemetryInitializationLease = await telemetryRegistry.commit(
+  telemetryReservation,
+  "telemetry",
+  telemetryTransport,
+);
+assert.ok(telemetryInitializationLease);
+assert.equal(telemetryRegistry.release(telemetryInitializationLease), true);
+
+now = 1_000;
+const telemetryLease = telemetryRegistry.acquire("telemetry", {
+  requestId: "request-active",
+});
+assert.ok(telemetryLease);
+now = 5_000;
+assert.deepEqual(
+  await telemetryRegistry.dispose("telemetry", "server_shutdown"),
+  { sessionId: "telemetry" },
+);
+const telemetryClosed = lifecycleEvents.find(
+  (event) => event.type === "closed" && event.sessionId === "telemetry",
+);
+assert.ok(telemetryClosed);
+assert.equal(telemetryClosed.sessionAgeMs, 5_000);
+assert.equal(telemetryClosed.idleForMs, undefined);
+assert.equal(telemetryClosed.activeRequests, 1);
+assert.equal(telemetryClosed.closeInitiator, "server_policy");
+
+// transport_close must carry bounded lifecycle context even though the SDK has
+// already closed the underlying transport and the registry must not close it
+// recursively.
+now = 10_000;
+const transportCloseEvents: McpSessionLifecycleEvent[] = [];
+const transportCloseRegistry = new McpSessionRegistry<FakeTransport>({
+  now: () => now,
+  onEvent: (event) => transportCloseEvents.push(event),
+});
+const transportClosedTransport = createTransport();
+const transportCloseReservation = await transportCloseRegistry.reserve();
+const transportCloseInitializationLease = await transportCloseRegistry.commit(
+  transportCloseReservation,
+  "transport-closed",
+  transportClosedTransport,
+);
+assert.ok(transportCloseInitializationLease);
+assert.equal(
+  transportCloseRegistry.release(transportCloseInitializationLease),
+  true,
+);
+now = 13_500;
+assert.deepEqual(
+  await transportCloseRegistry.dispose(
+    "transport-closed",
+    "transport_close",
+    { closeInitiator: "explicit_delete", requestId: "request-delete" },
+  ),
+  { sessionId: "transport-closed" },
+);
+assert.equal(transportClosedTransport.closeCalls, 0);
+const transportClosedEvent = transportCloseEvents.find(
+  (event) => event.type === "closed" && event.sessionId === "transport-closed",
+);
+assert.ok(transportClosedEvent);
+assert.equal(transportClosedEvent.sessionAgeMs, 3_500);
+assert.equal(transportClosedEvent.idleForMs, 3_500);
+assert.equal(transportClosedEvent.activeRequests, 0);
+assert.equal(transportClosedEvent.closeInitiator, "explicit_delete");
+assert.equal(transportClosedEvent.requestId, "request-delete");
+
+const sdkCallbackEvents: McpSessionLifecycleEvent[] = [];
+const sdkCallbackRegistry = new McpSessionRegistry<FakeTransport>({
+  onEvent: (event) => sdkCallbackEvents.push(event),
+});
+const sdkCallbackTransport = createTransport();
+const sdkCallbackReservation = await sdkCallbackRegistry.reserve();
+const sdkCallbackInitializationLease = await sdkCallbackRegistry.commit(
+  sdkCallbackReservation,
+  "sdk-callback",
+  sdkCallbackTransport,
+);
+assert.ok(sdkCallbackInitializationLease);
+assert.equal(
+  sdkCallbackRegistry.release(sdkCallbackInitializationLease),
+  true,
+);
+assert.deepEqual(
+  await sdkCallbackRegistry.dispose("sdk-callback", "transport_close"),
+  { sessionId: "sdk-callback" },
+);
+const sdkCallbackClosed = sdkCallbackEvents.find(
+  (event) => event.type === "closed" && event.sessionId === "sdk-callback",
+);
+assert.ok(sdkCallbackClosed);
+assert.equal(sdkCallbackClosed.closeInitiator, "sdk_callback");
+assert.equal(sdkCallbackTransport.closeCalls, 0);
+
+// Unknown-session accounting remains exact even if the server chooses to
+// rate-limit detailed miss logs.
+const missEvents: McpSessionLifecycleEvent[] = [];
+const missRegistry = new McpSessionRegistry<FakeTransport>({
+  onEvent: (event) => missEvents.push(event),
+});
+for (let index = 0; index < 1_000; index += 1) {
+  assert.equal(
+    missRegistry.acquire("missing-session", { requestId: `miss-${index}` }),
+    undefined,
+  );
+}
+assert.equal(missRegistry.snapshot().unknownSessionTotal, 1_000);
+assert.equal(missEvents.filter((event) => event.type === "miss").length, 1_000);

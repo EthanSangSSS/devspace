@@ -1,12 +1,15 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { accessSync, constants as fsConstants, readFileSync, realpathSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
 import { delimiter, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import {
+  hostHeaderValidation,
+  localhostHostValidation,
+} from "@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
@@ -36,7 +39,6 @@ import {
   logEvent,
   requestIp,
   requestPath,
-  sessionIdPrefix,
 } from "./logger.js";
 import { readFileTool } from "./pi-tools.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
@@ -44,7 +46,9 @@ import {
   MCP_SESSION_DRAIN_TIMEOUT_MS,
   McpSessionAdmissionError,
   McpSessionRegistry,
+  type McpSessionCloseInitiator,
   type McpSessionLease,
+  type McpSessionLifecycleEvent,
 } from "./mcp-sessions.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
@@ -86,10 +90,28 @@ const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
 const MCP_MAX_SESSIONS = 64;
 const MCP_RUNTIME_SNAPSHOT_INTERVAL_MS = 60_000;
+const MCP_SESSION_MISS_DETAIL_LIMIT = 8;
+const MCP_SESSION_MISS_DETAIL_WINDOW_MS = 60_000;
+const MCP_SESSION_CORRELATION_LENGTH = 16;
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
 
+export interface McpHttpLifecycleEvent {
+  type:
+    | "request_start"
+    | "request_aborted"
+    | "early_response_finished"
+    | "response_closed_before_finish";
+  requestId: string;
+  method: string;
+  path: string;
+  durationMs?: number;
+  headersSent?: boolean;
+  statusCode?: number;
+  responsePhase?: "before_headers" | "headers_sent";
+}
+
 interface RunningServer {
-  app: ReturnType<typeof createMcpExpressApp>;
+  app: ReturnType<typeof express>;
   config: ServerConfig;
   localAgentProviders: LocalAgentProviderStatus[];
   close(): Promise<void>;
@@ -1001,17 +1023,26 @@ export function createMcpServer(
 export interface CreateServerOptions {
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
   mcpInitializeCommitBarrier?: (sessionId: string) => Promise<void>;
+  mcpDeleteHandleBarrier?: (sessionId: string, requestId: string) => Promise<void>;
   mcpMaxSessions?: number;
+  mcpSessionIdleTimeoutMs?: number;
+  mcpSessionCleanupIntervalMs?: number;
   runtimeSnapshotIntervalMs?: number;
+  mcpSessionLifecycleObserver?: (event: McpSessionLifecycleEvent) => void;
+  httpLifecycleObserver?: (event: McpHttpLifecycleEvent) => void;
 }
 
 function logMcpRuntimeSnapshot(
   config: ServerConfig,
   transports: McpSessionRegistry<Transport>,
+  runtimeGeneration: string,
+  sessionMissLogSuppressedTotal: number,
 ): void {
   const memory = process.memoryUsage();
   logEvent(config.logging, "info", "mcp_runtime_snapshot", {
+    runtimeGeneration,
     sessions: transports.snapshot(),
+    sessionMissLogSuppressedTotal,
     memory: {
       heapUsedBytes: memory.heapUsed,
       heapTotalBytes: memory.heapTotal,
@@ -1030,28 +1061,156 @@ export function createServer(
   const allowedHosts = config.allowedHosts.includes("*")
     ? undefined
     : Array.from(new Set([config.host, ...config.allowedHosts]));
-  const app = createMcpExpressApp({
-    host: config.host,
-    ...(allowedHosts ? { allowedHosts } : {}),
+  const app = express();
+  const runtimeGeneration = randomUUID();
+  const sessionCorrelationKey = randomBytes(32);
+  let missDetailWindowStartedAt = Date.now();
+  let missDetailsInWindow = 0;
+  let sessionMissLogSuppressedTotal = 0;
+  let sessionMissSuppressedSinceDetail = 0;
+  const explicitDeleteRequests = new Map<string, Set<string>>();
+
+  const sessionCorrelation = (sessionId: string | undefined): string | undefined =>
+    sessionId
+      ? createHmac("sha256", sessionCorrelationKey)
+          .update(sessionId)
+          .digest("hex")
+          .slice(0, MCP_SESSION_CORRELATION_LENGTH)
+      : undefined;
+
+  const emitHttpLifecycle = (event: McpHttpLifecycleEvent): void => {
+    options.httpLifecycleObserver?.(event);
+    if (!config.logging.requests) return;
+    logEvent(config.logging, "info", `mcp_http_${event.type}`, {
+      runtimeGeneration,
+      ...event,
+    });
+  };
+
+  if (config.logging.trustProxy) {
+    app.set("trust proxy", true);
+  }
+
+  // This observation must run before express.json() so a client that disconnects
+  // while uploading an incomplete body still leaves request-arrival evidence.
+  app.use((req, res, next) => {
+    const requestId = randomUUID();
+    const startedAt = performance.now();
+    const path = requestPath(req);
+    let responseFinished = false;
+    res.locals.requestId = requestId;
+
+    if (path === "/mcp") {
+      emitHttpLifecycle({
+        type: "request_start",
+        requestId,
+        method: req.method,
+        path,
+      });
+
+      req.once("aborted", () => {
+        emitHttpLifecycle({
+          type: "request_aborted",
+          requestId,
+          method: req.method,
+          path,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+      });
+
+      res.once("finish", () => {
+        responseFinished = true;
+        if (res.locals.mcpDetailedHttpLoggerReached === true) return;
+        emitHttpLifecycle({
+          type: "early_response_finished",
+          requestId,
+          method: req.method,
+          path,
+          durationMs: Math.round(performance.now() - startedAt),
+          headersSent: res.headersSent,
+          statusCode: res.statusCode,
+          responsePhase: res.headersSent ? "headers_sent" : "before_headers",
+        });
+      });
+      res.once("close", () => {
+        if (responseFinished) return;
+        emitHttpLifecycle({
+          type: "response_closed_before_finish",
+          requestId,
+          method: req.method,
+          path,
+          durationMs: Math.round(performance.now() - startedAt),
+          headersSent: res.headersSent,
+          statusCode: res.statusCode,
+          responsePhase: res.headersSent ? "headers_sent" : "before_headers",
+        });
+      });
+    }
+
+    next();
   });
+
+  app.use(express.json());
+  if (allowedHosts) {
+    app.use(hostHeaderValidation(allowedHosts));
+  } else {
+    const localhostHosts = ["127.0.0.1", "localhost", "::1"];
+    if (localhostHosts.includes(config.host)) {
+      app.use(localhostHostValidation());
+    } else if (config.host === "0.0.0.0" || config.host === "::") {
+      console.warn(
+        `Warning: Server is binding to ${config.host} without DNS rebinding protection. `
+        + "Consider using the allowedHosts option to restrict allowed hosts, "
+        + "or use authentication to protect your server.",
+      );
+    }
+  }
+
   const transports = new McpSessionRegistry<Transport>({
     maxSessions: options.mcpMaxSessions ?? MCP_MAX_SESSIONS,
     onEvent: (event) => {
+      options.mcpSessionLifecycleObserver?.(event);
       const names = {
         created: "mcp_session_created",
         closed: "mcp_session_closed",
         evicted: "mcp_session_evicted",
+        miss: "mcp_session_miss",
         capacity_rejected: "mcp_session_capacity_rejected",
         close_failed: "mcp_session_close_failed",
       } as const;
+
+      if (event.type === "miss") {
+        const now = Date.now();
+        if (now - missDetailWindowStartedAt >= MCP_SESSION_MISS_DETAIL_WINDOW_MS) {
+          missDetailWindowStartedAt = now;
+          missDetailsInWindow = 0;
+        }
+        if (missDetailsInWindow >= MCP_SESSION_MISS_DETAIL_LIMIT) {
+          sessionMissLogSuppressedTotal += 1;
+          sessionMissSuppressedSinceDetail += 1;
+          return;
+        }
+        missDetailsInWindow += 1;
+      }
+
+      const suppressedSincePreviousDetail = sessionMissSuppressedSinceDetail;
+      if (event.type === "miss") sessionMissSuppressedSinceDetail = 0;
       logEvent(
         config.logging,
-        event.type === "close_failed" ? "warn" : "info",
+        event.type === "close_failed" || event.type === "miss" ? "warn" : "info",
         names[event.type],
         {
+          runtimeGeneration,
           requestId: event.requestId,
           reason: event.reason,
-          sessionIdPrefix: sessionIdPrefix(event.sessionId),
+          closeInitiator: event.closeInitiator,
+          sessionCorrelation: sessionCorrelation(event.sessionId),
+          sessionAgeMs: event.sessionAgeMs,
+          idleForMs: event.idleForMs,
+          activeRequests: event.activeRequests,
+          ...(event.type === "miss" && suppressedSincePreviousDetail > 0
+            ? { suppressedSincePreviousDetail }
+            : {}),
           sessions: event.snapshot,
         },
       );
@@ -1079,23 +1238,29 @@ export function createServer(
   );
 
   const sessionCleanupTimer = setInterval(() => {
-    void transports.closeIdle(MCP_SESSION_IDLE_TIMEOUT_MS);
-  }, MCP_SESSION_CLEANUP_INTERVAL_MS);
+    void transports.closeIdle(
+      options.mcpSessionIdleTimeoutMs ?? MCP_SESSION_IDLE_TIMEOUT_MS,
+    );
+  }, options.mcpSessionCleanupIntervalMs ?? MCP_SESSION_CLEANUP_INTERVAL_MS);
   sessionCleanupTimer.unref();
 
   const runtimeSnapshotTimer = setInterval(() => {
-    logMcpRuntimeSnapshot(config, transports);
+    logMcpRuntimeSnapshot(
+      config,
+      transports,
+      runtimeGeneration,
+      sessionMissLogSuppressedTotal,
+    );
   }, options.runtimeSnapshotIntervalMs ?? MCP_RUNTIME_SNAPSHOT_INTERVAL_MS);
   runtimeSnapshotTimer.unref();
 
-  if (config.logging.trustProxy) {
-    app.set("trust proxy", true);
-  }
-
   app.use((req, res, next) => {
-    const requestId = randomUUID();
+    const requestId = res.locals.requestId as string | undefined ?? randomUUID();
     const startedAt = performance.now();
     res.locals.requestId = requestId;
+    if (requestPath(req) === "/mcp") {
+      res.locals.mcpDetailedHttpLoggerReached = true;
+    }
 
     res.on("finish", () => {
       const path = requestPath(req);
@@ -1146,7 +1311,7 @@ export function createServer(
   });
 
   app.all("/mcp", async (req, res) => {
-    const requestId = res.locals.requestId as string | undefined;
+    const requestId = res.locals.requestId as string;
     const sessionId = req.header("mcp-session-id");
     const initializeRequest = req.method === "POST" && isInitializeRequest(req.body);
 
@@ -1171,16 +1336,17 @@ export function createServer(
     }
 
     logEvent(config.logging, "debug", "mcp_request", {
+      runtimeGeneration,
       requestId,
       method: req.method,
       sessionIdPresent: Boolean(sessionId),
-      sessionIdPrefix: sessionIdPrefix(sessionId),
+      sessionCorrelation: sessionCorrelation(sessionId),
       isInitialize: initializeRequest,
     });
 
     try {
       if (sessionId) {
-        const lease = transports.acquire(sessionId);
+        const lease = transports.acquire(sessionId, { requestId });
         if (!lease) {
           if (transports.snapshot().state !== "running") {
             sendJsonRpcError(
@@ -1195,9 +1361,26 @@ export function createServer(
           return;
         }
 
+        const explicitDelete = req.method === "DELETE";
+        if (explicitDelete) {
+          const activeDeletes = explicitDeleteRequests.get(sessionId)
+            ?? new Set<string>();
+          activeDeletes.add(requestId);
+          explicitDeleteRequests.set(sessionId, activeDeletes);
+        }
         try {
+          if (explicitDelete) {
+            await options.mcpDeleteHandleBarrier?.(sessionId, requestId);
+          }
           await lease.transport.handleRequest(req, res, req.body);
         } finally {
+          if (explicitDelete) {
+            const activeDeletes = explicitDeleteRequests.get(sessionId);
+            activeDeletes?.delete(requestId);
+            if (activeDeletes?.size === 0) {
+              explicitDeleteRequests.delete(sessionId);
+            }
+          }
           transports.release(lease);
         }
         return;
@@ -1249,7 +1432,19 @@ export function createServer(
         transport.onclose = () => {
           const closedSessionId = transport?.sessionId;
           if (!closedSessionId) return;
-          void transports.dispose(closedSessionId, "transport_close");
+          const activeDeletes = explicitDeleteRequests.get(closedSessionId);
+          const explicitDelete = (activeDeletes?.size ?? 0) > 0;
+          const closeRequestId = activeDeletes?.size === 1
+            ? activeDeletes.values().next().value as string | undefined
+            : undefined;
+          const closeInitiator: McpSessionCloseInitiator =
+            explicitDelete
+              ? "explicit_delete"
+              : "sdk_callback";
+          void transports.dispose(closedSessionId, "transport_close", {
+            closeInitiator,
+            requestId: closeRequestId,
+          });
         };
 
         const server = createMcpServer(
