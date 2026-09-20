@@ -275,7 +275,9 @@ V1 rejects manifest paths or symlink targets containing NUL, CR, LF, or TAB so t
 
 The helper verifies the supplied digest. It does not build the manifest from source code, install dependencies, or decide that a different candidate is equivalent.
 
-Artifact identity alone is insufficient to prove that the packaged candidate can execute under the production runtime ABI. Before `OLD_STOP_REQUESTED`, the helper must run a bounded candidate runtime preflight using the staged candidate plist's exact Node executable, candidate entrypoint, `WorkingDirectory`, and plist-defined environment. The preflight runs the candidate's read-only `doctor` path and requires the SQLite native dependency to load successfully and the production-style config to parse. Failure is `CANDIDATE_ARTIFACT_MISMATCH` while `liveMutationStarted=false`; production must not be stopped.
+Artifact identity alone is insufficient to prove that the packaged candidate can execute under the production runtime ABI. Before `OLD_STOP_REQUESTED`, the helper must run a bounded candidate runtime preflight using the staged candidate plist's exact Node executable, candidate entrypoint, `WorkingDirectory`, and plist-defined environment. The preflight runs the candidate's dedicated `rollout-preflight` path, which loads the SQLite native dependency and parses production-style configuration with legacy migration disabled. It must not create, migrate, rename, or rewrite DevSpace config files. Failure is `CANDIDATE_ARTIFACT_MISMATCH` while `liveMutationStarted=false`; production must not be stopped.
+
+Before staging the candidate, the loaded old runtime argv must exactly match the verified canonical `ProgramArguments`. Candidate argv is defined as that canonical argv with only `ProgramArguments[1]` replaced by the verified candidate entrypoint. Recovery must use this canonical-derived candidate argv rather than assuming the loaded process and canonical definition were already identical.
 
 ## 7. Whole-Plist CAS
 
@@ -681,7 +683,8 @@ B2. this transaction's candidate launchd definition is loaded in crash backoff w
    -> treat it as an inactive transaction candidate, not generic absence
    -> revalidate canonical + transaction lock ownership
    -> boot out the exact loaded candidate definition
-   -> prove launchd job absent + listener unowned with the bounded stop barrier
+   -> with one shared absolute deadline, prove launchd job absent + listener unowned
+   -> any observed PID, incompatible same-label argv, foreign listener, malformed observation, or post-deadline success fails closed
    -> bootstrap the unchanged canonical old plist
 
 C. confirmed candidate absence: no active same-label service generation and no owner of 127.0.0.1:7676
@@ -748,7 +751,7 @@ ROLLBACK_REFUSED_UNPROVEN_STATE
 
 and leave the committed canonical state untouched for operator recovery.
 
-If the runtime is A or B, prove consequential-stop ownership, request candidate bootout, and verify the bounded stopped barrier. For B2, revalidate the exact loaded candidate argv and unowned listener immediately before bootout, unload that inactive candidate definition, and prove service/listener absence. If the runtime is C, no bootout is issued.
+If the runtime is A or B, prove consequential-stop ownership, request candidate bootout, and verify the bounded stopped barrier. For B2, revalidate the exact loaded candidate argv and unowned listener immediately before bootout, unload that inactive candidate definition, and prove service/listener absence under one absolute deadline. Probes must receive the deadline signal; a success result arriving after the deadline is not accepted. Once a foreign runtime/listener state is observed, recovery fails closed rather than waiting for that evidence to disappear. If the runtime is C, no bootout is issued.
 
 The helper then prepares the old canonical bytes in a hidden same-directory temporary file and flushes/hash-verifies them. **Immediately before the rollback rename**, it performs a second gate, `ROLLBACK_PRE_RESTORE_REVALIDATED`:
 

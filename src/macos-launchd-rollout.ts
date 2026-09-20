@@ -47,6 +47,7 @@ export interface CanonicalPlistSnapshot {
   identity: FileIdentity;
   parentIdentity: FileIdentity;
   entrypointRealpath: string;
+  programArguments: string[];
   runAtLoad: boolean;
   keepAlive: boolean;
 }
@@ -64,7 +65,11 @@ export interface MacosRolloutAdapters {
   }): Promise<RolloutLockLease>;
   readCanonical(): Promise<ObservedState<CanonicalPlistSnapshot>>;
   validateCandidateEntrypoint(path: string): Promise<void>;
-  preflightCandidateRuntime(plistPath: string, candidateEntrypoint: string): Promise<void>;
+  preflightCandidateRuntime(
+    plistPath: string,
+    candidateEntrypoint: string,
+    expectedArgv: readonly string[],
+  ): Promise<void>;
   createCandidatePlist(oldBytes: Buffer, candidateEntrypoint: string): Promise<Buffer>;
   writeOldBackup(input: {
     transactionDir: string;
@@ -390,7 +395,11 @@ export async function runMacosLaunchdForwardPath(
         { initial },
       );
     }
-    await adapters.preflightCandidateRuntime(candidatePlistPath, request.candidateEntrypoint);
+    await adapters.preflightCandidateRuntime(
+      candidatePlistPath,
+      request.candidateEntrypoint,
+      expectedCandidateArgv(initial, request.candidateEntrypoint),
+    );
   } catch (error) {
     return forwardFailure(context, "precheck", "CANDIDATE_ARTIFACT_MISMATCH", errorMessage(error), { initial });
   }
@@ -1059,7 +1068,7 @@ function expectedCandidateArgv(
   initial: InitialRolloutState,
   candidateEntrypoint: string,
 ): string[] {
-  const argv = [...initial.process.normalizedArgv];
+  const argv = [...initial.canonical.programArguments];
   if (argv.length < 2) return [];
   argv[1] = candidateEntrypoint;
   return argv;
@@ -1330,6 +1339,9 @@ async function readAndValidateInitialState(input: {
   if (processState.kind === "unproven") return { ok: false, code: "PRECONDITION_FAILED", reason: processState.reason };
   if (processState.value.entrypointRealpath !== input.request.expectedLiveEntrypoint) {
     return { ok: false, code: "SPLIT_STATE_DETECTED", reason: "loaded runtime entrypoint differs from canonical expected entrypoint" };
+  }
+  if (!sameArgv(processState.value.normalizedArgv, canonical.value.programArguments)) {
+    return { ok: false, code: "SPLIT_STATE_DETECTED", reason: "loaded runtime argv differs from canonical ProgramArguments" };
   }
   const listener = await input.adapters.observeListener();
   if (listener.kind === "unproven") return { ok: false, code: "PRECONDITION_FAILED", reason: listener.reason };

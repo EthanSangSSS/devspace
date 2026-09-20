@@ -3,7 +3,12 @@ import type { ToolMode } from "./config-schema.js";
 import { expandHomePath } from "./roots.js";
 import type { LoggingConfig } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
-import { devspaceAgentsDir, devspaceSkillsDir, loadDevspaceFiles } from "./user-config.js";
+import {
+  devspaceAgentsDir,
+  devspaceSkillsDir,
+  loadDevspaceFiles,
+  type LoadDevspaceFilesOptions,
+} from "./user-config.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
 import type { AgyDelegationConfig } from "./agy-delegation-types.js";
 
@@ -33,8 +38,11 @@ export interface ServerConfig {
   logging: LoggingConfig;
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
-  const files = loadDevspaceFiles(env);
+export function loadConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  options: LoadDevspaceFilesOptions = {},
+): ServerConfig {
+  const files = loadDevspaceFiles(env, options);
   const stored = files.config;
   const host = stored.server.host;
   const port = stored.server.port;

@@ -79,6 +79,7 @@ interface ForwardFixtureOptions {
   disabled?: boolean;
   selfHosted?: boolean;
   candidatePreflightFails?: boolean;
+  canonicalArgvDrift?: boolean;
   oldRuntimeDriftsBeforeStop?: boolean;
   firstCandidateListenerPid?: number;
   firstCandidateHealthy?: boolean;
@@ -191,6 +192,9 @@ async function createForwardFixture(
     identity: canonicalIdentity,
     parentIdentity,
     entrypointRealpath: oldEntrypoint,
+    programArguments: options.canonicalArgvDrift
+      ? ["/opt/homebrew/bin/node-alt", oldEntrypoint, "serve"]
+      : [...oldProcess.normalizedArgv],
     runAtLoad: true,
     keepAlive: true,
   };
@@ -200,6 +204,7 @@ async function createForwardFixture(
     identity: { ...canonicalIdentity, inode: 20 },
     parentIdentity,
     entrypointRealpath: candidateEntrypoint,
+    programArguments: [...candidateFirst.normalizedArgv],
     runAtLoad: true,
     keepAlive: true,
   };
@@ -347,8 +352,9 @@ async function createForwardFixture(
       return known(canonicalCommitted ? candidateCanonical : oldCanonical);
     },
     async validateCandidateEntrypoint() { calls.push("candidate:entrypoint-valid"); },
-    async preflightCandidateRuntime() {
+    async preflightCandidateRuntime(_plistPath, _candidateEntrypoint, expectedArgv) {
       calls.push("candidate:runtime-preflight");
+      assert.deepEqual(expectedArgv, candidateFirst.normalizedArgv);
       if (options.candidatePreflightFails) throw new Error("candidate sqlite native dependency is not loadable");
     },
     async createCandidatePlist() {
@@ -672,6 +678,18 @@ rolloutTest("candidate runtime preflight fails before the old production stop ba
   assert.equal(result.code, "CANDIDATE_ARTIFACT_MISMATCH");
   assert.equal(result.context.liveMutationStarted, false);
   assert.equal(fixture.calls.includes("candidate:runtime-preflight"), true);
+  assert.equal(fixture.calls.includes("OLD_STOP_REQUESTED"), false);
+});
+
+rolloutTest("initial state rejects a loaded runtime whose argv differs from canonical ProgramArguments", async (t) => {
+  const fixture = await createForwardFixture(t, { canonicalArgvDrift: true });
+  const result = await runMacosLaunchdForwardPath(fixture.request, fixture.adapters);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.phase, "precheck");
+  assert.equal(result.code, "SPLIT_STATE_DETECTED");
+  assert.match(result.reason, /argv differs from canonical ProgramArguments/);
+  assert.equal(fixture.calls.includes("candidate:runtime-preflight"), false);
   assert.equal(fixture.calls.includes("OLD_STOP_REQUESTED"), false);
 });
 

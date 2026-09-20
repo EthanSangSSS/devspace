@@ -50,6 +50,10 @@ export interface DevspaceConfigEdit {
   value: unknown;
 }
 
+export interface LoadDevspaceFilesOptions {
+  migrateLegacy?: boolean;
+}
+
 export function devspaceConfigDir(env: NodeJS.ProcessEnv = process.env): string {
   return resolve(expandHomePath(env.DEVSPACE_CONFIG_DIR ?? join(homedir(), ".devspace")));
 }
@@ -78,12 +82,21 @@ export function devspaceAgentsDir(env: NodeJS.ProcessEnv = process.env): string 
   return join(devspaceConfigDir(env), "agents");
 }
 
-export function loadDevspaceFiles(env: NodeJS.ProcessEnv = process.env): DevspaceFiles {
+export function loadDevspaceFiles(
+  env: NodeJS.ProcessEnv = process.env,
+  options: LoadDevspaceFilesOptions = {},
+): DevspaceFiles {
   const dir = devspaceConfigDir(env);
   const configPath = devspaceConfigPath(env);
   const legacyConfigPath = devspaceLegacyConfigPath(env);
   const authPath = devspaceAuthPath(env);
-  const migratedLegacyConfig = !existsSync(configPath) && existsSync(legacyConfigPath)
+  const legacyOnly = !existsSync(configPath) && existsSync(legacyConfigPath);
+  if (legacyOnly && options.migrateLegacy === false) {
+    throw new Error(
+      `Legacy DevSpace config requires migration from ${legacyConfigPath}; read-only config load refused.`,
+    );
+  }
+  const migratedLegacyConfig = legacyOnly
     ? migrateLegacyConfigFile(legacyConfigPath, configPath, devspaceLegacyConfigBackupPath(env))
     : false;
   const configExists = existsSync(configPath);

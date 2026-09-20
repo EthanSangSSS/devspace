@@ -57,6 +57,7 @@ type Command =
   | "serve"
   | "init"
   | "doctor"
+  | "rollout-preflight"
   | "config"
   | "agents"
   | "show-changes"
@@ -82,6 +83,9 @@ async function main(argv: string[]): Promise<void> {
     case "doctor":
       await runDoctor();
       return;
+    case "rollout-preflight":
+      await runRolloutPreflight();
+      return;
     case "config":
       runConfigCommand(args);
       return;
@@ -105,6 +109,7 @@ function normalizeCommand(command: string | undefined): Command {
   if (
     command === "init"
     || command === "doctor"
+    || command === "rollout-preflight"
     || command === "config"
     || command === "agents"
     || command === "show-changes"
@@ -367,6 +372,20 @@ async function runDoctor(): Promise<void> {
   } catch (error) {
     console.log(`Config status: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+async function runRolloutPreflight(): Promise<void> {
+  const sqliteStatus = checkSqliteNative();
+  console.log(`Node: ${process.version} (${nodeVersionStatus()})`);
+  console.log(`Node ABI: ${process.versions.modules}`);
+  console.log(`Platform: ${process.platform} ${process.arch}`);
+  console.log(`SQLite native dependency: ${sqliteStatus}`);
+  if (sqliteStatus !== "ok") {
+    throw new Error(`SQLite native dependency is not loadable: ${sqliteStatus}`);
+  }
+
+  const config = loadConfig(process.env, { migrateLegacy: false });
+  console.log(`Local MCP URL: http://${config.host}:${config.port}/mcp`);
 }
 
 function runConfigCommand(args: string[]): void {
