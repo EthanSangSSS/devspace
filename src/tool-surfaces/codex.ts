@@ -246,7 +246,12 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
           .describe("Workspace identifier used to start the process."),
         sessionId: z
           .number()
-          .describe("Process session identifier returned by exec_command."),
+          .int()
+          .positive()
+          .safe()
+          .describe(
+            "Opaque process session identifier returned by exec_command. Reuse only the exact value returned by the current DevSpace runtime; do not synthesize or reuse identifiers from an earlier runtime.",
+          ),
         chars: z
           .string()
           .optional()
