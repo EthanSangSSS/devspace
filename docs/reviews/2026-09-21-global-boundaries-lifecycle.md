@@ -30,6 +30,17 @@ soak-metrics unit test passed. A further cached-root adversarial regression was
 then reproduced and fixed; the final exact commit must pass the complete suite
 and GitHub checks again before landing.
 
+Final local checkpoint at source commit
+`7b4759f64f7d4006f675ba883e85dd780eb365fd` (tree
+`715bd9f165b060285ab4b79471141953812972db`): **236/236 tests passed**, zero
+failures and zero skips, with typecheck, build, diff check, canary syntax,
+operator tests (3), soak-metrics tests and disposable Darwin qualification all
+passing. Qualification used label suffix `fe39b00a40c059ed` and port `60649`;
+cleanup passed. The working diff and new-file hashes were compared with the
+validation receipt immediately before commit. This documentation-only update
+does not change that tested runtime tree; its own exact remote HEAD still
+requires CI and Secret Scan before merge.
+
 `scripts/devspace-shutdown-canary.mjs` runs the actual built CLI in a private
 fixture, with synthetic test authentication and an allocated non-7676 loopback
 port. It never loads production configuration or starts a delegated agent.
