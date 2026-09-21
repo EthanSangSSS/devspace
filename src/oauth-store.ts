@@ -33,8 +33,10 @@ function redirectHostAllowed(redirectUri: string, allowedHosts: string[]): boole
     return false;
   }
 
+  if (parsed.username || parsed.password || parsed.hash) return false;
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false;
   if (["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)) return true;
-  return allowedHosts.includes(parsed.hostname);
+  return parsed.protocol === "https:" && allowedHosts.includes(parsed.hostname);
 }
 
 export class SqliteOAuthStore {
@@ -57,7 +59,7 @@ export class SqliteOAuthStore {
     client: Omit<OAuthClientInformationFull, "client_id" | "client_id_issued_at">,
     allowedRedirectHosts: string[],
   ): OAuthClientInformationFull {
-    if (!client.redirect_uris.every((uri) => redirectHostAllowed(String(uri), allowedRedirectHosts))) {
+    if (client.redirect_uris.length === 0 || !client.redirect_uris.every((uri) => redirectHostAllowed(String(uri), allowedRedirectHosts))) {
       throw new InvalidRequestError("Client redirect_uri is not allowed for this DevSpace server");
     }
 
@@ -194,7 +196,11 @@ export class SqliteOAuthClientsStore implements OAuthRegisteredClientsStore {
   ) {}
 
   getClient(clientId: string): OAuthClientInformationFull | undefined {
-    return this.store.getClient(clientId);
+    const client = this.store.getClient(clientId);
+    if (!client?.redirect_uris.length || !client.redirect_uris.every((uri) => redirectHostAllowed(String(uri), this.allowedRedirectHosts))) {
+      return undefined;
+    }
+    return client;
   }
 
   registerClient(

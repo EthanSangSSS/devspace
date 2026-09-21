@@ -51,7 +51,7 @@ import {
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
 import { readReviewRef } from "./review-checkpoints.js";
-import { shutdownHttpServer } from "./server-shutdown.js";
+import { shutdownHttpServer, trackHttpConnections } from "./server-shutdown.js";
 
 type Command =
   | "serve"
@@ -328,6 +328,7 @@ async function serve(): Promise<void> {
     console.log(`subagent providers: ${formatLocalAgentProviderStatusSummary(localAgentProviders)}`);
   });
 
+  trackHttpConnections(httpServer);
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;

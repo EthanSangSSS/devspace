@@ -5,6 +5,7 @@ import { mkdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import type { ServerConfig } from "./config.js";
 import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
+import { gitEnvironment } from "./git-environment.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -110,22 +111,19 @@ async function resolveGitRoot(path: string, allowedRoots: string[]): Promise<str
 }
 
 async function assertGitRootAllowed(gitRoot: string, allowedRoots: string[]): Promise<string> {
-  try {
+  if (allowedRoots.some((root) => isPathInsideRoot(gitRoot, root))) {
     return assertAllowedPath(gitRoot, allowedRoots);
-  } catch {
-    const canonicalGitRoot = await realpath(gitRoot);
-    for (const allowedRoot of allowedRoots) {
-      const canonicalAllowedRoot = await realpath(allowedRoot).catch(() => undefined);
-      if (!canonicalAllowedRoot || !isPathInsideRoot(canonicalGitRoot, canonicalAllowedRoot)) {
-        continue;
-      }
-
-      const logicalGitRoot = resolve(allowedRoot, relative(canonicalAllowedRoot, canonicalGitRoot));
-      return assertAllowedPath(logicalGitRoot, allowedRoots);
-    }
-
-    return assertAllowedPath(canonicalGitRoot, allowedRoots);
   }
+  const canonicalGitRoot = await realpath(gitRoot);
+  for (const allowedRoot of allowedRoots) {
+    const canonicalAllowedRoot = await realpath(allowedRoot).catch(() => undefined);
+    if (!canonicalAllowedRoot || !isPathInsideRoot(canonicalGitRoot, canonicalAllowedRoot)) {
+      continue;
+    }
+    const logicalGitRoot = resolve(allowedRoot, relative(canonicalAllowedRoot, canonicalGitRoot));
+    return assertAllowedPath(logicalGitRoot, allowedRoots);
+  }
+  return assertAllowedPath(canonicalGitRoot, allowedRoots);
 }
 
 async function resolveBaseCommit(sourceRoot: string, baseRef: string): Promise<string> {
@@ -163,6 +161,7 @@ async function git(args: string[], cwd: string): Promise<string> {
   try {
     const { stdout } = await execFileAsync("git", args, {
       cwd,
+      env: gitEnvironment(),
       maxBuffer: 10 * 1024 * 1024,
     });
     return stdout;

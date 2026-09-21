@@ -34,6 +34,7 @@ import {
 } from "./local-agent-daemon-protocol.js";
 import {
   LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
+  assertLocalAgentEndpoint,
   ensureLocalAgentDaemonSecret,
   isProcessAlive,
   localAgentDaemonPaths,
@@ -50,6 +51,7 @@ import type {
 } from "./local-agent-manager.js";
 import type { LocalAgentRecord, LocalAgentWorkspaceScope } from "./local-agent-store.js";
 import { devspaceConfigDir } from "./user-config.js";
+import { gitEnvironment } from "./git-environment.js";
 
 const DEFAULT_STARTUP_TIMEOUT_MS = 8_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -84,6 +86,7 @@ export class LocalAgentClient {
     this.stateDir = options.stateDir;
     this.paths = localAgentDaemonPaths(options.stateDir);
     this.endpoint = options.endpoint ?? this.paths.endpoint;
+    assertLocalAgentEndpoint(this.endpoint);
     this.startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.spawnDaemon = options.spawnDaemon ?? (() => spawnLocalAgentDaemon(
@@ -432,7 +435,7 @@ export function localAgentDaemonEnvironment(
   configDir: string,
   env: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-  return { ...env, DEVSPACE_CONFIG_DIR: configDir };
+  return { ...gitEnvironment(env), DEVSPACE_CONFIG_DIR: configDir };
 }
 
 export function daemonExecArgv(execArgv: readonly string[]): string[] {

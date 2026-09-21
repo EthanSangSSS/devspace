@@ -35,6 +35,7 @@ export function localAgentDaemonPaths(
 ): LocalAgentDaemonPaths {
   const resolvedStateDir = resolve(stateDir);
   const socketPath = join(resolvedStateDir, LOCAL_AGENT_DAEMON_SOCKET_NAME);
+  assertLocalAgentEndpoint(socketPath, platform);
   return {
     stateDir: resolvedStateDir,
     socketPath,
@@ -46,6 +47,16 @@ export function localAgentDaemonPaths(
       ? `\\\\.\\pipe\\devspace-agentd-${hashStateDir(resolvedStateDir)}`
       : socketPath,
   };
+}
+
+export function assertLocalAgentEndpoint(endpoint: string, platform: NodeJS.Platform = process.platform): void {
+  if (!endpoint || endpoint.includes("\0")) throw new Error("Daemon socket endpoint is invalid");
+  if (platform === "win32") return;
+  const limit = platform === "linux" ? 107 : 103;
+  const bytes = Buffer.byteLength(endpoint, "utf8");
+  if (bytes > limit) {
+    throw new Error(`Daemon socket path is ${bytes} bytes; maximum is ${limit}. Choose a shorter state directory.`);
+  }
 }
 
 export function ensureLocalAgentDaemonStateDir(stateDir: string): void {

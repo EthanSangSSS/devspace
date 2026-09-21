@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { gitEnvironment } from "./git-environment.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -23,7 +24,7 @@ export async function git(
 ): Promise<GitCommandResult> {
   const { stdout, stderr } = await execFileAsync("git", args, {
     cwd,
-    env: options.env ? { ...process.env, ...options.env } : process.env,
+    env: gitEnvironment(process.env, options.env),
     maxBuffer: options.maxBuffer ?? 10 * 1024 * 1024,
   });
 

@@ -6,6 +6,7 @@ import {
   isProgrammerDefect,
 } from "./local-agent-errors.js";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
+import { gitEnvironment } from "./git-environment.js";
 import type {
   LocalAgentDriver,
   LocalAgentRunCallbacks,
@@ -345,7 +346,7 @@ function claudeAuthorityOptions(
 }
 
 export function claudeCommandEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const next = { ...env };
+  const next = gitEnvironment(env);
   for (const key of [
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -140,6 +140,16 @@ test("workspace paths outside the allowed roots are rejected", async (t) => {
     () => context.registry.openWorkspace(context.outsideRoot),
     /outside allowed roots/,
   );
+});
+
+test("cached workspace access rejects a root replaced with an outside symlink", { skip: platform() === "win32" }, async (t) => {
+  const context = await fixture(t);
+  const project = join(context.root, "cached-project");
+  await mkdir(project);
+  const opened = await context.registry.openWorkspace(project);
+  await rename(project, join(context.root, "original-project"));
+  await symlink(context.outsideRoot, project, "dir");
+  assert.throws(() => context.registry.getWorkspace(opened.workspace.id), /outside allowed roots/);
 });
 
 test("a symlinked allowed root preserves checkout and worktree path behavior", { skip: platform() === "win32" }, async (t) => {

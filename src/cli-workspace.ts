@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { assertAllowedPath } from "./roots.js";
+import { gitEnvironment } from "./git-environment.js";
 
 export interface CliWorkspaceContext {
   workspaceId?: string;
@@ -17,7 +18,7 @@ export function resolveCliWorkspaceContext(
   const workspaceId = env.DEVSPACE_WORKSPACE_ID?.trim() || undefined;
   const injectedRoot = workspaceId ? env.DEVSPACE_WORKSPACE_ROOT?.trim() : undefined;
   const candidate = canonicalizePath(
-    injectedRoot ? resolve(injectedRoot) : findGitRoot(cwd) ?? resolve(cwd),
+    injectedRoot ? resolve(injectedRoot) : findGitRoot(cwd, env) ?? resolve(cwd),
   );
 
   if (!workspaceId) return { workspaceId, workspaceRoot: candidate };
@@ -36,9 +37,11 @@ function canonicalizePath(path: string): string {
   }
 }
 
-function findGitRoot(cwd: string): string | undefined {
+function findGitRoot(cwd: string, env: NodeJS.ProcessEnv): string | undefined {
   const result = spawnSync("git", ["rev-parse", "--show-toplevel"], {
     cwd: resolve(cwd),
+    env: gitEnvironment(env),
+    timeout: 5_000,
     encoding: "utf8",
     windowsHide: true,
     stdio: ["ignore", "pipe", "ignore"],

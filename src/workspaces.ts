@@ -245,6 +245,9 @@ export class WorkspaceRegistry {
   getWorkspace(workspaceId: string): Workspace {
     const workspace = this.workspaces.get(workspaceId);
     if (workspace) {
+      // A cached ID is not a permanent filesystem authorization. Recheck the
+      // configured roots before using a checkout that may have been replaced.
+      this.assertWorkspaceRootAllowed(workspace.root, workspace.mode, workspace.sourceRoot);
       this.store?.touchSession(workspaceId);
       return workspace;
     }
@@ -534,7 +537,7 @@ function isInitialAgentsFilePath(path: string, root: string, agentDir: string): 
 
 async function readResolvedContextFile(
   path: string,
-  fallbackContent: string,
+  _fallbackContent: string,
   root: string,
   agentDir: string,
 ): Promise<string | undefined> {
@@ -543,7 +546,7 @@ async function readResolvedContextFile(
     if (!isInitialAgentsFilePath(resolvedPath, root, agentDir)) return undefined;
     return await readFile(resolvedPath, "utf8");
   } catch {
-    return fallbackContent;
+    return undefined;
   }
 }
 

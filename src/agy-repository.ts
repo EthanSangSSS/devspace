@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { AgyDelegationError } from "./agy-delegation-types.js";
+import { gitEnvironment } from "./git-environment.js";
 
 const execFileAsync = promisify(execFile);
 const SENSITIVE_SEGMENTS = new Set([
@@ -97,6 +98,7 @@ export async function fingerprintRepository(repositoryRoot: string): Promise<str
     gitText(root, ["rev-parse", "HEAD"]),
     execFileAsync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
       cwd: root,
+      env: gitEnvironment(),
       encoding: "utf8",
       timeout: 10_000,
       maxBuffer: 8 * 1024 * 1024,
@@ -219,6 +221,7 @@ async function runGitleaks(gitleaksPath: string, snapshotRoot: string): Promise<
 async function gitText(cwd: string, args: string[]): Promise<string> {
   const { stdout } = await execFileAsync("git", args, {
     cwd,
+    env: gitEnvironment(),
     encoding: "utf8",
     timeout: 10_000,
     maxBuffer: 8 * 1024 * 1024,

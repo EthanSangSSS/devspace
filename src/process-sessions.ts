@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { gitEnvironment } from "./git-environment.js";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
@@ -112,7 +113,7 @@ function processEnvironment(input?: {
 }): Record<string, string> {
   return {
     ...Object.fromEntries(
-      Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+      Object.entries(gitEnvironment()).filter((entry): entry is [string, string] => entry[1] !== undefined),
     ),
     NO_COLOR: "1",
     TERM: "dumb",
@@ -235,6 +236,8 @@ export class ProcessSessionManager {
   private readonly maxBufferCharacters: number;
   private readonly completedSessionTtlMs: number;
   private readonly sessionIdGenerator: () => number;
+  private closing = false;
+  private shutdownPromise?: Promise<void>;
 
   constructor(options: ProcessSessionManagerOptions = {}) {
     this.maxBufferCharacters = options.maxBufferCharacters ?? DEFAULT_BUFFER_CHARACTERS;
@@ -243,6 +246,9 @@ export class ProcessSessionManager {
   }
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
+    if (this.closing) throw new Error("Process session manager is shutting down");
+    const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, MAX_COMMAND_YIELD_MS);
+    boundedInteger(input.maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 100_000);
     const session = this.createSession(input);
     this.sessions.set(session.id, session);
 
@@ -254,7 +260,6 @@ export class ProcessSessionManager {
       throw error;
     }
 
-    const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, MAX_COMMAND_YIELD_MS);
     await this.waitForExit(session, yieldTimeMs);
 
     const snapshot = this.consume(session, input.maxOutputTokens);
@@ -301,12 +306,28 @@ export class ProcessSessionManager {
     if (session.running) session.process?.kill("SIGTERM");
   }
 
-  shutdown(): void {
-    for (const session of this.sessions.values()) {
+  async shutdown(options: { graceMs?: number; killWaitMs?: number } = {}): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    const graceMs = boundedInteger(options.graceMs, 1_000, 10_000);
+    const killWaitMs = boundedInteger(options.killWaitMs, 1_000, 10_000);
+    this.closing = true;
+    const sessions = [...this.sessions.values()];
+    for (const session of sessions) {
       if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
       if (session.running) session.process?.kill("SIGTERM");
     }
-    this.sessions.clear();
+    this.shutdownPromise = (async () => {
+      await Promise.all(sessions.map((session) => this.waitForExit(session, graceMs)));
+      for (const session of sessions) {
+        if (session.running) session.process?.kill("SIGKILL");
+      }
+      await Promise.all(sessions.map((session) => this.waitForExit(session, killWaitMs)));
+      this.sessions.clear();
+      if (sessions.some((session) => session.running)) {
+        throw new Error("Owned process shutdown deadline exceeded; termination unproven");
+      }
+    })();
+    return this.shutdownPromise;
   }
 
   private async waitForExit(session: ProcessSession, yieldTimeMs: number): Promise<void> {
@@ -375,6 +396,7 @@ export class ProcessSessionManager {
     };
     child.stdout.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
     child.stderr.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
+    child.stdin.on("error", (error: NodeJS.ErrnoException) => this.append(session, `stdin failed: ${error.code ?? "UNKNOWN"}\n`));
     child.on("error", (error) => this.append(session, `${error.message}\n`));
     child.on("close", (code, signal) => this.finish(session, code ?? undefined, signal ?? undefined));
   }
@@ -385,6 +407,10 @@ export class ProcessSessionManager {
       nodePty = await import("node-pty");
     } catch {
       throw new Error("PTY support requires the optional node-pty dependency.");
+    }
+    if (this.closing) {
+      this.finish(session, undefined, "shutdown");
+      throw new Error("Process session manager is shutting down");
     }
 
     const shell = resolveShellCommand(input.command);
@@ -421,6 +447,7 @@ export class ProcessSessionManager {
     session.exitCode = exitCode;
     session.signal = signal;
     session.resolveExit();
+    if (this.closing) return;
     session.cleanupTimer = setTimeout(
       () => this.sessions.delete(session.id),
       this.completedSessionTtlMs,

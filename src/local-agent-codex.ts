@@ -1,4 +1,5 @@
 import { homedir } from "node:os";
+import { gitEnvironment } from "./git-environment.js";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { delimiter, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -28,7 +29,7 @@ export interface ResolvedCodexCommand {
 export type CodexCommandResolver = (env: NodeJS.ProcessEnv) => ResolvedCodexCommand | undefined;
 
 export function codexCommandEnvironment(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const next = { ...env };
+  const next = gitEnvironment(env);
   delete next.CODEX_INTERNAL_ORIGINATOR_OVERRIDE;
   if (env.CODEX_COMMAND) return next;
   if (next.PATH) next.PATH = removeDevspaceNodeModulesBinFromPath(next.PATH);
@@ -88,7 +89,7 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
 
   constructor(private readonly options: CodexAppServerRuntimeOptions) {
     this.child = spawn(options.command, ["app-server"], {
-      env: options.env,
+      env: gitEnvironment(options.env),
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
       windowsHide: true,

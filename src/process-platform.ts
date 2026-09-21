@@ -24,6 +24,7 @@ const defaultProcessTreeRuntime: ProcessTreeRuntime = {
     const result = spawnSync("taskkill.exe", ["/pid", String(pid), "/T", "/F"], {
       stdio: "ignore",
       windowsHide: true,
+      timeout: 5_000,
     });
     return !result.error && result.status === 0;
   },

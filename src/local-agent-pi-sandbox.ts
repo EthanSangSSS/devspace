@@ -25,8 +25,9 @@ import {
   type ReadOperations,
   type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
-import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
+import { assertAllowedPath, isPathInsideRoot, resolvePhysicalPath } from "./roots.js";
 import { terminateProcessTree } from "./process-platform.js";
+import { gitEnvironment } from "./git-environment.js";
 
 export type PiSandboxWriteMode = "read_only" | "allowed" | "full_access";
 
@@ -107,7 +108,9 @@ export function createPiSandboxExtension(
     const restrictedLs = createLsTool(workspace, { operations: createLsOperations(workspace) });
     pi.registerTool(dynamicTool(localLs, restrictedLs, modeRef));
 
-    const localBash = createBashTool(workspace);
+    const localBash = createBashTool(workspace, {
+      spawnHook: (context) => ({ ...context, env: gitEnvironment(context.env) }),
+    });
     const restrictedBash = createBashTool(workspace, {
       operations: createSandboxedBashOperations(),
     });
@@ -398,7 +401,7 @@ function spawnSandboxedCommand(
   return new Promise((resolveResult, reject) => {
     const child = spawn(executable, args, {
       cwd,
-      env: { ...environment, ...options.env },
+      env: gitEnvironment({ ...environment, ...options.env }),
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
       shell: false,
@@ -464,32 +467,7 @@ async function assertPiWorkspacePath(
   _forWrite = false,
 ): Promise<string> {
   const resolvedWorkspace = resolveWorkspace(workspace);
-  const absolutePath = resolve(path);
-  const { boundaryPath, suffix } = await resolveExistingBoundary(absolutePath);
-  if (!isPathInsideRoot(boundaryPath, resolvedWorkspace)) {
-    assertAllowedPath(boundaryPath, [resolvedWorkspace]);
-  }
-  const operationPath = suffix ? resolve(boundaryPath, suffix) : boundaryPath;
-  if (!isPathInsideRoot(operationPath, resolvedWorkspace)) {
-    assertAllowedPath(operationPath, [resolvedWorkspace]);
-  }
-  return operationPath;
-}
-
-async function resolveExistingBoundary(path: string): Promise<{ boundaryPath: string; suffix: string }> {
-  let candidate = path;
-  for (;;) {
-    try {
-      return {
-        boundaryPath: await realpath(candidate),
-        suffix: relative(candidate, path),
-      };
-    } catch {
-      const parent = dirname(candidate);
-      if (parent === candidate) return { boundaryPath: candidate, suffix: relative(candidate, path) };
-      candidate = parent;
-    }
-  }
+  return resolvePhysicalPath(assertAllowedPath(path, [resolvedWorkspace]));
 }
 
 async function withSandboxCommand<T>(operation: () => Promise<T>): Promise<T> {
