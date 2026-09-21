@@ -295,9 +295,23 @@ export async function runMacosLaunchdRollout(
         forward.reason,
       );
     }
-    const recovery = forward.committed
-      ? await compensateCommittedCandidate(request, forward, adapters)
-      : await recoverPreCommitFailure(request, forward, adapters);
+    let recovery: RolloutOutcome;
+    try {
+      recovery = forward.committed
+        ? await compensateCommittedCandidate(request, forward, adapters)
+        : await recoverPreCommitFailure(request, forward, adapters);
+    } catch (error) {
+      // A failed observation must never be reported as a completed rollback.
+      // Keep the lease until this terminal, explicitly unproven result exists.
+      recovery = rolloutOutcome(
+        "ROLLBACK_REFUSED_UNPROVEN_STATE",
+        context,
+        context.committed,
+        controlledReloadStatus(context),
+        "FAIL",
+        `recovery could not prove a terminal state: ${errorMessage(error)}`,
+      );
+    }
     return {
       ...recovery,
       evidence: {
@@ -421,7 +435,7 @@ export async function runMacosLaunchdForwardPath(
     return forwardFailure(context, "precheck", "CANDIDATE_ARTIFACT_MISMATCH", errorMessage(error), { initial });
   }
 
-  const beforeStop = await revalidateBeforeOldStop({ initial, request, adapters });
+  const beforeStop = await revalidateBeforeOldStop({ initial, request, adapters, lease });
   if (!beforeStop.ok) {
     return forwardFailure(context, "old_stop", beforeStop.code, beforeStop.reason, { initial });
   }
@@ -445,6 +459,7 @@ export async function runMacosLaunchdForwardPath(
   }
   context.phase = "candidate_first_verify";
   const firstCandidate = await verifyCandidateRuntime({
+    initial,
     candidateEntrypoint: request.candidateEntrypoint,
     candidatePlistPath,
     candidatePlistSha256,
@@ -502,6 +517,7 @@ export async function runMacosLaunchdForwardPath(
     );
   }
   const reloadedCandidate = await verifyCandidateRuntime({
+    initial,
     candidateEntrypoint: request.candidateEntrypoint,
     candidatePlistPath,
     candidatePlistSha256,
@@ -592,6 +608,32 @@ export async function runMacosLaunchdForwardPath(
   }
   candidateForCommit = immediatelyBeforeCommit.process;
   rememberCandidateProcess(context, candidateForCommit);
+  // Readiness/stability awaits above must not leave the final filesystem CAS
+  // bound to observations made before those awaits.
+  const [tempHash, tempIdentity, finalCanonical, finalLock] = await Promise.all([
+    adapters.readFileSha256(prepared.path),
+    adapters.observeFileIdentity(prepared.path),
+    adapters.readCanonical(),
+    lease.assertOwned(),
+  ]);
+  if (
+    tempHash.kind !== "known"
+    || tempHash.value !== candidatePlistSha256
+    || tempIdentity.kind !== "known"
+    || !sameFileIdentity(tempIdentity.value, prepared.identity)
+    || tempIdentity.value.kind !== "file"
+    || tempIdentity.value.symlink
+  ) {
+    return forwardFailure(context, "pre_commit_revalidation", "CANDIDATE_ARTIFACT_MISMATCH", "prepared canonical temp changed before commit");
+  }
+  if (
+    finalCanonical.kind !== "known"
+    || !sameCanonicalDefinition(finalCanonical.value, initial.canonical)
+    || finalLock.kind !== "known"
+    || finalLock.value !== "owned"
+  ) {
+    return forwardFailure(context, "pre_commit_revalidation", "LIVE_STATE_CAS_MISMATCH", "canonical identity or lock changed before commit");
+  }
   try {
     await adapters.atomicReplaceCanonical(prepared.path);
   } catch (error) {
@@ -1128,7 +1170,10 @@ async function observeRecoveryState(input: {
       processValue = processState.value;
       if (sameProcessIdentity(processState.value, input.initial.process)) {
         runtimeRole = input.expectedCanonical === "old" ? "old" : "drift";
-      } else if (processState.value.entrypointRealpath === input.request.candidateEntrypoint) {
+      } else if (
+        isExpectedCandidateProcess(processState.value, input.initial, input.request.candidateEntrypoint)
+        && sameArgv(launchd.value.normalizedArgv, expectedCandidateArgv(input.initial, input.request.candidateEntrypoint))
+      ) {
         runtimeRole = "candidate";
       } else {
         runtimeRole = "drift";
@@ -1186,6 +1231,26 @@ function sameArgv(actual: readonly string[] | undefined, expected: readonly stri
     && actual.length === expected.length
     && actual.every((value, index) => value === expected[index]),
   );
+}
+
+function isExpectedCandidateProcess(
+  process: ProcessIdentity,
+  initial: InitialRolloutState,
+  candidateEntrypoint: string,
+): boolean {
+  return process.entrypointRealpath === candidateEntrypoint
+    && process.executableRealpath === initial.process.executableRealpath
+    && sameArgv(process.normalizedArgv, expectedCandidateArgv(initial, candidateEntrypoint));
+}
+
+function sameCanonicalDefinition(actual: CanonicalPlistSnapshot, expected: CanonicalPlistSnapshot): boolean {
+  return actual.sha256 === expected.sha256
+    && actual.entrypointRealpath === expected.entrypointRealpath
+    && actual.runAtLoad === expected.runAtLoad
+    && actual.keepAlive === expected.keepAlive
+    && sameArgv(actual.programArguments, expected.programArguments)
+    && sameFileIdentity(actual.identity, expected.identity)
+    && sameFileIdentity(actual.parentIdentity, expected.parentIdentity);
 }
 
 async function observeExpectedCanonical(input: {
@@ -1317,6 +1382,8 @@ async function verifyOldRuntime(
   if (
     processState.kind !== "known"
     || (requireExactInitialGeneration && !sameProcessIdentity(processState.value, initial.process))
+    || processState.value.executableRealpath !== initial.process.executableRealpath
+    || !sameArgv(processState.value.normalizedArgv, initial.canonical.programArguments)
   ) return false;
   const stable = await adapters.waitStable(processState.value);
   return stable.kind === "known" && stable.value === "stable";
@@ -1470,13 +1537,17 @@ async function revalidateBeforeOldStop(input: {
   initial: InitialRolloutState;
   request: RolloutRequest;
   adapters: MacosRolloutAdapters;
+  lease: RolloutLockLease;
 }): Promise<{ ok: true } | { ok: false; code: "LIVE_STATE_CAS_MISMATCH"; reason: string }> {
+  const lock = await input.lease.assertOwned();
+  if (lock.kind !== "known" || lock.value !== "owned") {
+    return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: "rollout lock ownership is not proven before old-service stop" };
+  }
   const canonical = await input.adapters.readCanonical();
   if (canonical.kind === "unproven") return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: canonical.reason };
   if (
     canonical.value.sha256 !== input.request.expectedLivePlistSha256
-    || canonical.value.sha256 !== input.initial.canonical.sha256
-    || canonical.value.entrypointRealpath !== input.initial.canonical.entrypointRealpath
+    || !sameCanonicalDefinition(canonical.value, input.initial.canonical)
   ) {
     return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: "canonical state changed before old-service stop" };
   }
@@ -1496,6 +1567,7 @@ async function revalidateBeforeOldStop(input: {
 }
 
 async function verifyCandidateRuntime(input: {
+  initial: InitialRolloutState;
   candidateEntrypoint: string;
   candidatePlistPath: string;
   candidatePlistSha256: string;
@@ -1507,6 +1579,7 @@ async function verifyCandidateRuntime(input: {
   if (stagedHash.value !== input.candidatePlistSha256) return { ok: false, reason: "staged candidate plist hash changed" };
   const qualified = await observeHealthyCandidateRuntime(
     input.candidateEntrypoint,
+    input.initial,
     input.adapters,
     input.onReadyProcess,
   );
@@ -1542,8 +1615,7 @@ async function preCommitRevalidate(input: {
   if (canonical.kind === "unproven") return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: canonical.reason };
   if (
     canonical.value.sha256 !== input.request.expectedLivePlistSha256
-    || canonical.value.sha256 !== input.initial.canonical.sha256
-    || canonical.value.entrypointRealpath !== input.initial.canonical.entrypointRealpath
+    || !sameCanonicalDefinition(canonical.value, input.initial.canonical)
   ) {
     return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: "old canonical changed before commit" };
   }
@@ -1552,6 +1624,7 @@ async function preCommitRevalidate(input: {
   if (stagedHash.value !== input.candidatePlistSha256) return { ok: false, code: "CANDIDATE_ARTIFACT_MISMATCH", reason: "staged candidate plist changed before commit" };
   const qualified = await observeHealthyCandidateRuntime(
     input.request.candidateEntrypoint,
+    input.initial,
     input.adapters,
     input.onReadyProcess,
   );
@@ -1586,6 +1659,7 @@ async function postCommitVerify(input: {
   if (disabled.value === "disabled") return { ok: false, reason: "committed service became persistently disabled" };
   return observeHealthyCandidateRuntime(
     input.candidateEntrypoint,
+    input.initial,
     input.adapters,
     input.onReadyProcess,
   );
@@ -1593,11 +1667,15 @@ async function postCommitVerify(input: {
 
 async function observeHealthyCandidateRuntime(
   candidateEntrypoint: string,
+  initial: InitialRolloutState,
   adapters: MacosRolloutAdapters,
   onReadyProcess?: (process: ProcessIdentity) => void,
 ): Promise<{ ok: true; process: ProcessIdentity } | { ok: false; reason: string }> {
   const processState = await adapters.waitReady(candidateEntrypoint);
   if (processState.kind === "unproven") return { ok: false, reason: processState.reason };
+  if (!isExpectedCandidateProcess(processState.value, initial, candidateEntrypoint)) {
+    return { ok: false, reason: "candidate argv or Node executable differs from the staged candidate contract" };
+  }
   onReadyProcess?.(processState.value);
   const stable = await adapters.waitStable(processState.value);
   if (stable.kind === "unproven") return { ok: false, reason: stable.reason };
@@ -1636,7 +1714,7 @@ function forwardFailure(
     ok: false,
     phase,
     code,
-    committed: extra.committed ?? false,
+    committed: context.committed,
     context,
     ...(extra.initial ? { initial: extra.initial } : {}),
     ...(extra.candidateProcess ? { candidateProcess: extra.candidateProcess } : {}),

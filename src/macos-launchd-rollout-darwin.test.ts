@@ -27,6 +27,7 @@ import {
   buildQualificationFixture,
   type CommandRunner,
   createDarwinRolloutAdapters,
+  createExecFileRunner,
   parseLaunchctlPrint,
   parseListenerLsof,
   parseParentPid,
@@ -140,6 +141,31 @@ test("launchctl print parser preserves arguments and process generation evidence
   );
 });
 
+test("listener success without a valid owner record cannot prove port absence", () => {
+  for (const output of ["", "garbled", "pnot-a-pid\n", "p0\n"]) {
+    assert.equal(parseListenerLsof(output, 0).kind, "unproven", JSON.stringify(output));
+  }
+  assert.deepEqual(parseListenerLsof("", 1), { kind: "known", value: { state: "unowned" } });
+});
+
+posixFsTest("canonical temp collision preserves an existing file owned by another operation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-temp-collision-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const existing = join(root, ".service.rollout-collision.tmp");
+  await writeFile(existing, "preserve-existing\n", { mode: 0o600 });
+  const bytes = Buffer.from("candidate\n");
+  await assert.rejects(prepareCanonicalTempFile({
+    canonicalPath: join(root, "service.plist"),
+    transactionNonce: "collision",
+    bytes,
+    expectedSha256: createHash("sha256").update(bytes).digest("hex"),
+    uid: process.getuid!(),
+    gid: process.getgid!(),
+    mode: 0o600,
+  }), { code: "EEXIST" });
+  assert.equal(await readFile(existing, "utf8"), "preserve-existing\n");
+});
+
 test("disabled-service parser is exact and fails closed on unknown output", async () => {
   const enabled = '\tdisabled services = {\n\t\t"com.ethan.devspace" => enabled\n\t}\n';
   const disabled = '\tdisabled services = {\n\t\t"com.ethan.devspace" => disabled\n\t}\n';
@@ -211,6 +237,10 @@ posixFsTest("process and listener parsers preserve exact identity without whites
     value: { state: "unowned" },
   });
   assert.equal(parseListenerLsof("p1\np2\n", 0).kind, "unproven");
+  assert.equal(parseListenerLsof("p123\npbroken\n", 0).kind, "unproven");
+  assert.deepEqual(parseListenerLsof("p78407\nf19\n", 0), {
+    kind: "known", value: { state: "owned", ownerPid: 78407 },
+  }, "Darwin -Fp output includes a numeric file-descriptor field");
   assert.deepEqual(parseParentPid("  42\n"), { kind: "known", value: 42 });
   assert.equal(parseParentPid("not-a-pid").kind, "unproven");
 
@@ -837,6 +867,60 @@ darwinTest("normal stop treats malformed ps start identity as unproven rather th
   assert.equal(result.kind, "unproven");
   assert.match(result.kind === "unproven" ? result.reason : "", /process start identity is malformed/);
   assert.equal(bootoutCalls, 0);
+});
+
+test("stability gate cancels a hanging probe and a hanging sleep at its deadline", async () => {
+  for (const hang of ["probe", "sleep"] as const) {
+    let receivedSignal: AbortSignal | undefined;
+    const result = await waitForStableState(processIdentity(), {
+      observeProcess: async (_pid, signal) => {
+        receivedSignal = signal;
+        return hang === "probe" ? new Promise(() => {}) : { kind: "known", value: processIdentity() };
+      },
+      observeListener: async () => ({ kind: "known", value: { state: "owned", ownerPid: 123 } }),
+      checkHealth: async () => ({ kind: "known", value: "healthy" }),
+    }, {
+      observationMs: 0,
+      timeoutMs: 15,
+      sleep: hang === "sleep" ? async () => new Promise(() => {}) : async () => undefined,
+    });
+    assert.equal(result.kind, "unproven", hang);
+    if (hang === "probe") assert.equal(receivedSignal?.aborted, true);
+  }
+});
+
+test("default command runner terminates an unresponsive subprocess within its budget", async () => {
+  const started = Date.now();
+  await assert.rejects(createExecFileRunner(50).run(process.execPath, [
+    "-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)",
+  ]));
+  assert.ok(Date.now() - started < 2_000);
+});
+
+darwinTest("process-generation matrix never treats malformed observations as disappearance or reuse", async () => {
+  const cases = [
+    [0, "Thu Sep 17 10:00:00 2026", "alive"],
+    [0, "Thu Sep 17 10:00:01 2026", "reused"],
+    [1, "", "gone"],
+    [2, "", "unproven"],
+    [0, "", "unproven"],
+    [0, "garbled", "unproven"],
+    [0, "Bad Sep 17 10:00:00 2026", "unproven"],
+    [0, "Thu Bad 17 10:00:00 2026", "unproven"],
+    [0, "Thu Sep 00 10:00:00 2026", "unproven"],
+    [0, "Thu Sep 17 25:00:00 2026", "unproven"],
+    [0, "Thu Feb 30 10:00:00 2026", "unproven"],
+    [0, "Fri Sep 17 10:00:00 2026", "unproven"],
+    [1, "Thu Sep 17 10:00:00 2026", "unproven"],
+  ] as const;
+  for (const [exitCode, stdout, expected] of cases) {
+    const adapters = createDarwinRolloutAdapters({
+      uid: 501,
+      commandRunner: { run: async () => ({ exitCode, stdout, stderr: "" }) },
+    });
+    const observed = await adapters.observeExpectedProcess(processIdentity());
+    assert.equal(observed.kind === "known" ? observed.value : observed.kind, expected, stdout);
+  }
 });
 
 test("stability gate requires the same process generation, listener owner, and health after the observation window", async () => {

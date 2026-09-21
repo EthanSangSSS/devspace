@@ -238,6 +238,35 @@ Unexpected adapter/probe exceptions after the transaction lock has been acquired
 
 ## Recovery rules
 
+### Global-review hardening (2026-09-21)
+
+Active candidate readiness and recovery require both the exact staged argv and
+the Node executable realpath established by the initial live process. A matching
+entrypoint alone cannot authorize stopping a foreign process. Readiness records
+a candidate generation only after that ownership check succeeds.
+
+The transaction rechecks its lease before the first old-runtime stop. Immediately
+before canonical publication it also checks the prepared file's digest and
+device/inode/ownership/mode, the old canonical and parent identities, and the
+lease. Exclusive temporary-file creation failure never authorizes deleting an
+existing file at that pathname. Unexpected recovery-observation exceptions produce
+an explicit `ROLLBACK_REFUSED_UNPROVEN_STATE`, preserving the forward failure and
+committed truth; they cannot report a successful restore.
+
+Default external commands have a 5-second subprocess deadline with forced
+termination of that command on timeout. The stability observation has one deadline
+covering its sleep and all probes, and forwards cancellation to the subprocess and
+health probes. Readiness timers remain referenced while a result is pending.
+Filesystem hashing, traversal, atomic rename and fsync are **not cancellable**:
+the utility must await their actual result rather than race a late mutation against
+rollback. The advisory lock and path checks are not an OS sandbox against another
+arbitrary process running as the same user.
+
+Regression coverage includes foreign active candidates, pre-stop lock loss,
+same-byte canonical replacement, prepared-temp replacement, exclusive-create
+collision, post-rename fsync failure, recovery exceptions, hanging stability
+observations, and the process-start timestamp classification matrix.
+
 Every recovery starts by fresh-reading:
 
 ```text

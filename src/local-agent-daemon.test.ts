@@ -23,7 +23,9 @@ import {
 import type { RunOverrides, StartLocalAgentInput } from "./local-agent-manager.js";
 import type { LocalAgentRecord } from "./local-agent-store.js";
 
-const root = await mkdtemp(join(tmpdir(), "devspace-agentd-test-"));
+// Keep the longest nested Unix socket below macOS's 103-byte pathname limit
+// in the default /var/folders temporary directory, without overriding TMPDIR.
+const root = await mkdtemp(join(tmpdir(), "dsa-"));
 const record: LocalAgentRecord = {
   id: "agt_test",
   workspaceId: "ws_test",
@@ -480,7 +482,10 @@ socketManager.activeTurnCount = 0;
 const socketDaemon = new LocalAgentDaemon({
   stateDir: socketStateDir,
   manager: socketManager,
-  requestReadTimeoutMs: 30,
+  // The same fixture also transfers a 512-KiB frame. A 30-ms deadline can
+  // legitimately expire during that transfer and test timeout instead of the
+  // size limit. Keep timeout coverage, with headroom for the data cases.
+  requestReadTimeoutMs: 500,
   shutdownTimeoutMs: 100,
   idleShutdownMs: 60_000,
 });
@@ -512,6 +517,7 @@ try {
   const oversized = await sendRawRequest(socketDaemon.paths.endpoint, "x".repeat(512 * 1024 + 1));
   assert.equal(oversized.ok, false);
   if (!oversized.ok) assert.equal(oversized.error.code, "DAEMON_INVALID_REQUEST");
+  await waitFor(() => socketDaemon.status().clientConnections === 0);
 
   shutdownSocket = createConnection(socketDaemon.paths.endpoint);
   await onceSocket(shutdownSocket, "connect");
@@ -547,7 +553,6 @@ async function sendRawRequest(
     const cleanup = () => {
       clearTimeout(timeout);
       socket.off("data", onData);
-      socket.off("error", onError);
       socket.off("close", onClose);
       socket.off("end", onEnd);
     };
@@ -581,7 +586,12 @@ async function sendRawRequest(
     timeout.unref();
 
     socket.on("data", onData);
-    socket.once("error", onError);
+    // A server may reject an oversized request before the client's buffered
+    // write completes. Keep the error handler until close: a late EPIPE after
+    // a valid response must not become an uncaught exception in the fixture.
+    // Errors before a response still reject through the normal settle path.
+    socket.on("error", onError);
+    socket.once("close", () => socket.off("error", onError));
     socket.once("close", onClose);
     socket.once("end", onEnd);
   });

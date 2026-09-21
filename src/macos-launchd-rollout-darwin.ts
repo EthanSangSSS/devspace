@@ -66,6 +66,7 @@ const DEFAULT_STABILITY_OBSERVATION_MS = 250;
 const DEFAULT_HEALTH_TIMEOUT_MS = 2_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
 const DEFAULT_STARTUP_POLL_MS = 100;
+const DEFAULT_COMMAND_TIMEOUT_MS = 5_000;
 
 export interface CommandResult {
   stdout: string;
@@ -586,13 +587,20 @@ export function parseListenerLsof(
   if (exitCode !== 0) {
     return { kind: "unproven", reason: `listener lsof exited with code ${exitCode}` };
   }
+  // Darwin lsof also emits numeric file-descriptor records with -Fp.
+  // They do not establish an owner; malformed process records still fail closed.
+  if (output.split(/\r?\n/).some((line) => line.trim() && !/^[pf]\d+$/.test(line.trim()))) {
+    return { kind: "unproven", reason: "listener lsof contains an invalid owner record" };
+  }
   const pids = Array.from(new Set(
     output.split(/\r?\n/)
       .map((line) => /^p(\d+)$/.exec(line.trim())?.[1])
       .filter((value): value is string => value !== undefined)
       .map(Number),
   ));
-  if (pids.length === 0) return { kind: "known", value: { state: "unowned" } };
+  if (pids.length === 0) {
+    return { kind: "unproven", reason: "successful listener lsof output has no valid owner record" };
+  }
   if (pids.length !== 1 || !Number.isSafeInteger(pids[0]) || pids[0]! <= 0) {
     return { kind: "unproven", reason: "listener owner PID output is ambiguous" };
   }
@@ -772,6 +780,7 @@ export async function prepareCanonicalTempFile(input: {
   const tempPath = join(parent, `.${base}.rollout-${input.transactionNonce}.tmp`);
   if (tempPath.endsWith(".plist")) throw new Error("canonical temp must not use a .plist suffix");
   let handle: Awaited<ReturnType<typeof open>> | undefined;
+  let createdIdentity: { dev: number; ino: number } | undefined;
   try {
     const noFollow = fsConstants.O_NOFOLLOW ?? 0;
     handle = await open(
@@ -779,6 +788,7 @@ export async function prepareCanonicalTempFile(input: {
       fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_RDWR | noFollow,
       0o600,
     );
+    createdIdentity = await handle.stat();
     await handle.writeFile(input.bytes);
     await handle.chmod(input.mode);
     if (process.platform !== "win32") await handle.chown(input.uid, input.gid);
@@ -804,7 +814,14 @@ export async function prepareCanonicalTempFile(input: {
     return { path: tempPath, sha256, identity };
   } catch (error) {
     if (handle) await handle.close().catch(() => undefined);
-    await rm(tempPath, { force: true }).catch(() => undefined);
+    // O_EXCL failure does not give this operation ownership of the pathname.
+    // Nor may cleanup remove a replacement published after our own create.
+    if (createdIdentity) {
+      const current = await lstat(tempPath).catch(() => undefined);
+      if (current?.dev === createdIdentity.dev && current.ino === createdIdentity.ino) {
+        await rm(tempPath, { force: true }).catch(() => undefined);
+      }
+    }
     throw error;
   }
 }
@@ -849,19 +866,23 @@ export async function rewriteCandidatePlistBytes(
   const plistPath = join(root, "candidate.plist");
   try {
     await writeFile(plistPath, oldBytes, { mode: 0o600 });
-    await execFileAsync("/usr/bin/plutil", [
+    const runner = createExecFileRunner();
+    const remove = await runner.run("/usr/bin/plutil", [
       "-remove",
       "ProgramArguments.1",
       plistPath,
     ]);
-    await execFileAsync("/usr/bin/plutil", [
+    if (remove.exitCode !== 0) throw new Error("unable to remove old plist entrypoint");
+    const insert = await runner.run("/usr/bin/plutil", [
       "-insert",
       "ProgramArguments.1",
       "-string",
       candidateEntrypoint,
       plistPath,
     ]);
-    await execFileAsync("/usr/bin/plutil", ["-lint", plistPath]);
+    if (insert.exitCode !== 0) throw new Error("unable to insert candidate plist entrypoint");
+    const lint = await runner.run("/usr/bin/plutil", ["-lint", plistPath]);
+    if (lint.exitCode !== 0) throw new Error("rewritten candidate plist failed lint");
     return await readFile(plistPath);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -961,35 +982,51 @@ export async function waitForStoppedState(
 export async function waitForStableState(
   expected: ProcessIdentity,
   probe: {
-    observeProcess(pid: number): Promise<ObservedState<ProcessIdentity>>;
-    observeListener(): Promise<ObservedState<ListenerObservation>>;
-    checkHealth(): Promise<ObservedState<"healthy" | "unhealthy">>;
+    observeProcess(pid: number, signal?: AbortSignal): Promise<ObservedState<ProcessIdentity>>;
+    observeListener(signal?: AbortSignal): Promise<ObservedState<ListenerObservation>>;
+    checkHealth(signal?: AbortSignal): Promise<ObservedState<"healthy" | "unhealthy">>;
   },
   options: {
     observationMs: number;
+    timeoutMs?: number;
     sleep?: (ms: number) => Promise<void>;
   },
 ): Promise<ObservedState<"stable">> {
   const sleep = options.sleep ?? delay;
-  await sleep(options.observationMs);
-  const [processState, listener, health] = await Promise.all([
-    probe.observeProcess(expected.pid),
-    probe.observeListener(),
-    probe.checkHealth(),
-  ]);
-  if (processState.kind === "unproven") return processState;
-  if (listener.kind === "unproven") return listener;
-  if (health.kind === "unproven") return health;
-  if (!sameProcessIdentity(processState.value, expected)) {
-    return { kind: "unproven", reason: "process generation changed during stability observation" };
+  const budget = options.timeoutMs ?? options.observationMs + DEFAULT_COMMAND_TIMEOUT_MS;
+  const deadline = Date.now() + budget;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), budget);
+  try {
+    const observation = await awaitDeadlineStep(async (signal) => {
+      await sleep(options.observationMs);
+      if (signal.aborted) throw new Error("stability deadline expired");
+      return Promise.all([
+        probe.observeProcess(expected.pid, signal),
+        probe.observeListener(signal),
+        probe.checkHealth(signal),
+      ]);
+    }, controller.signal);
+    if (observation.timedOut || Date.now() >= deadline) {
+      return { kind: "unproven", reason: "stability observation timed out" };
+    }
+    const [processState, listener, health] = observation.value;
+    if (processState.kind === "unproven") return processState;
+    if (listener.kind === "unproven") return listener;
+    if (health.kind === "unproven") return health;
+    if (!sameProcessIdentity(processState.value, expected)) {
+      return { kind: "unproven", reason: "process generation changed during stability observation" };
+    }
+    if (listener.value.state !== "owned" || listener.value.ownerPid !== expected.pid) {
+      return { kind: "unproven", reason: "listener ownership changed during stability observation" };
+    }
+    if (health.value !== "healthy") {
+      return { kind: "unproven", reason: "health became unhealthy during stability observation" };
+    }
+    return { kind: "known", value: "stable" };
+  } finally {
+    clearTimeout(timer);
   }
-  if (listener.value.state !== "owned" || listener.value.ownerPid !== expected.pid) {
-    return { kind: "unproven", reason: "listener ownership changed during stability observation" };
-  }
-  if (health.value !== "healthy") {
-    return { kind: "unproven", reason: "health became unhealthy during stability observation" };
-  }
-  return { kind: "known", value: "stable" };
 }
 
 export async function waitForRuntimeReadyState(
@@ -1009,7 +1046,6 @@ export async function waitForRuntimeReadyState(
   const controller = new AbortController();
   const timeoutMs = Math.max(0, deadline - now());
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  timer.unref?.();
 
   const timedOut = (): ObservedState<ProcessIdentity> => ({
     kind: "unproven",
@@ -1657,7 +1693,7 @@ export function createDarwinRolloutAdapters(
       return waitForStableState(expected, {
         observeProcess,
         observeListener,
-        checkHealth: adapters.checkHealth,
+        checkHealth,
       }, {
         observationMs: stabilityObservationMs,
         sleep,
@@ -1699,7 +1735,8 @@ const defaultDurabilityPrimitives: DurabilityPrimitives = {
   fsyncDirectory: fsyncSync,
 };
 
-function createExecFileRunner(): CommandRunner {
+export function createExecFileRunner(timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): CommandRunner {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("command timeout must be positive");
   return {
     async run(executable, args, options) {
       try {
@@ -1709,6 +1746,8 @@ function createExecFileRunner(): CommandRunner {
           signal: options?.signal,
           cwd: options?.cwd,
           env: options?.env,
+          timeout: timeoutMs,
+          killSignal: "SIGKILL",
         });
         return { stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
       } catch (error) {

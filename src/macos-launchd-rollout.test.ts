@@ -618,12 +618,12 @@ async function createForwardFixture(
         return known(canonicalCommitted ? candidateCanonical.identity : canonicalIdentity);
       }
       if (path === parentIdentity.path) return known(parentIdentity);
-      if (path === preparedTempPath && preparedTempKind === "old") {
+      if (path === preparedTempPath && preparedTempKind) {
         return known({
           ...canonicalIdentity,
           path,
-          inode: 30,
-          ...(options.rollbackOldTempDrift ? { mode: 0o600 } : {}),
+          inode: preparedTempKind === "old" ? 30 : 20,
+          ...(preparedTempKind === "old" && options.rollbackOldTempDrift ? { mode: 0o600 } : {}),
         });
       }
       return known(canonicalIdentity);
@@ -654,6 +654,129 @@ function forwardProcess(pid: number, entrypoint: string, generation: string): Pr
     entrypointRealpath: entrypoint,
   };
 }
+
+rolloutTest("active candidate qualification rejects a matching entrypoint with foreign argv or Node", async (t) => {
+  for (const drift of ["argv", "executable"] as const) {
+    const fixture = await createForwardFixture(t);
+    const observe = fixture.adapters.observeProcess;
+    fixture.adapters.observeProcess = async (pid) => {
+      const result = await observe(pid);
+      if (result.kind !== "known" || pid < 200) return result;
+      return known({
+        ...result.value,
+        ...(drift === "argv"
+          ? { normalizedArgv: [...result.value.normalizedArgv.slice(0, 2), "--foreign", "serve"] }
+          : { executableRealpath: "/foreign/node" }),
+      });
+    };
+    const result = await runMacosLaunchdForwardPath(fixture.request, fixture.adapters);
+    assert.equal(result.ok, false, drift);
+    assert.equal(result.context.candidateProcess, undefined, "foreign generation must never become recovery identity");
+    assert.equal(fixture.calls.includes("CANDIDATE_STOP_REQUESTED"), false);
+    assert.equal(fixture.calls.includes("COMMITTED"), false);
+    await fixture.lease.release();
+  }
+});
+
+rolloutTest("recovery refuses an active foreign candidate even when its entrypoint matches", async (t) => {
+  const fixture = await createForwardFixture(t, { firstCandidateHealthy: false });
+  const observe = fixture.adapters.observeProcess;
+  fixture.adapters.observeProcess = async (pid) => {
+    const result = await observe(pid);
+    return result.kind === "known" && pid === 201
+      ? known({ ...result.value, normalizedArgv: ["/foreign/node", fixture.request.candidateEntrypoint, "serve"] })
+      : result;
+  };
+  const result = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+  assert.equal(result.code, "ROLLBACK_REFUSED_CONCURRENT_DRIFT");
+  assert.equal(fixture.calls.includes("CANDIDATE_STOP_REQUESTED"), false);
+  assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), false);
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+rolloutTest("forward path refuses lock loss before the first production mutation", async (t) => {
+  const fixture = await createForwardFixture(t);
+  fixture.lease.assertOwned = async () => known("drift");
+  const result = await runMacosLaunchdForwardPath(fixture.request, fixture.adapters);
+  assert.equal(result.ok, false);
+  assert.equal(fixture.calls.includes("OLD_STOP_REQUESTED"), false);
+  await fixture.lease.release();
+});
+
+rolloutTest("pre-commit CAS rejects same-byte canonical identity replacement", async (t) => {
+  const fixture = await createForwardFixture(t);
+  const read = fixture.adapters.readCanonical;
+  fixture.adapters.readCanonical = async () => {
+    const result = await read();
+    return result.kind === "known" && fixture.calls.includes("CONTROLLED_RELOAD_STARTED")
+      ? known({ ...result.value, identity: { ...result.value.identity, inode: 777 } })
+      : result;
+  };
+  const result = await runMacosLaunchdForwardPath(fixture.request, fixture.adapters);
+  assert.equal(result.ok, false);
+  assert.equal(fixture.calls.includes("COMMITTED"), false);
+  await fixture.lease.release();
+});
+
+rolloutTest("pre-commit CAS rechecks the prepared candidate bytes and file identity", async (t) => {
+  for (const drift of ["hash", "identity"] as const) {
+    const fixture = await createForwardFixture(t);
+    const hash = fixture.adapters.readFileSha256;
+    const identify = fixture.adapters.observeFileIdentity;
+    fixture.adapters.readFileSha256 = async (path) => path === "/tmp/candidate.tmp" && drift === "hash"
+      ? known("0".repeat(64))
+      : hash(path);
+    fixture.adapters.observeFileIdentity = async (path) => {
+      const result = await identify(path);
+      return result.kind === "known" && path === "/tmp/candidate.tmp" && drift === "identity"
+        ? known({ ...result.value, inode: 888 })
+        : result;
+    };
+    const result = await runMacosLaunchdForwardPath(fixture.request, fixture.adapters);
+    assert.equal(result.ok, false, drift);
+    assert.equal(fixture.calls.includes("COMMITTED"), false, drift);
+    await fixture.lease.release();
+  }
+});
+
+rolloutTest("post-rename sync failure is committed and enters compensation under the same lease", async (t) => {
+  const fixture = await createForwardFixture(t, { leaseOwnershipTracksRelease: true });
+  const sync = fixture.adapters.syncCanonicalParent;
+  let syncs = 0;
+  fixture.adapters.syncCanonicalParent = async () => {
+    if (++syncs === 1) throw new Error("post-rename fsync failure");
+    await sync();
+  };
+  // The fixture uses this flag to classify a later bootstrap as recovery.
+  const bootstrap = fixture.adapters.bootstrap;
+  fixture.adapters.bootstrap = async (path) => {
+    if (fixture.calls.includes("ROLLBACK_RESTORED_CANONICAL")) {
+      fixture.calls.push("ROLLBACK_BOOTSTRAP_OLD");
+      return;
+    }
+    await bootstrap(path);
+  };
+  const result = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+  assert.equal(result.committed, true);
+  assert.equal(result.evidence.forwardPhase, "post_commit_verification");
+  assert.match(String(result.evidence.forwardReason), /fsync failure/);
+  assert.ok(fixture.calls.includes("ROLLBACK_RESTORED_CANONICAL"));
+  assert.ok(fixture.calls.indexOf("ROLLBACK_RESTORED_CANONICAL") < fixture.calls.indexOf("lock.release"));
+});
+
+rolloutTest("an unexpected recovery observation exception returns an explicit unproven outcome", async (t) => {
+  const fixture = await createForwardFixture(t, { firstCandidateHealthy: false });
+  const observe = fixture.adapters.observeLaunchd;
+  fixture.adapters.observeLaunchd = async () => {
+    if (fixture.calls.includes("health:candidate-first")) throw new Error("recovery observation failed");
+    return observe();
+  };
+  const result = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+  assert.equal(result.code, "ROLLBACK_REFUSED_UNPROVEN_STATE");
+  assert.match(String(result.evidence.reason), /recovery observation failed/);
+  assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), false);
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
 
 rolloutTest("forward rollout verifies twice and commits only after pre-commit revalidation", async (t) => {
   const fixture = await createForwardFixture(t);
