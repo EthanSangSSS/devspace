@@ -3,9 +3,11 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   lstat,
+  mkdir,
   mkdtemp,
   readFile,
   readdir,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -25,6 +27,7 @@ import {
   buildQualificationFixture,
   type CommandRunner,
   createDarwinRolloutAdapters,
+  createExecFileRunner,
   parseLaunchctlPrint,
   parseListenerLsof,
   parseParentPid,
@@ -44,25 +47,33 @@ import {
   waitForStableState,
   waitForRuntimeReadyState,
   waitForStoppedState,
+  ROLLOUT_STOP_TIMEOUT_MS,
 } from "./macos-launchd-rollout-darwin.js";
+import { MCP_SESSION_DRAIN_TIMEOUT_MS } from "./mcp-sessions.js";
 
 const posixFsTest = process.platform === "win32" ? test.skip : test;
 const darwinTest = process.platform === "darwin" ? test : test.skip;
 
 const execFileAsync = promisify(execFile);
 
-function launchctlFixture(input: { pid?: number; runs?: number; entrypoint?: string } = {}): string {
+function launchctlFixture(input: {
+  pid?: number;
+  runs?: number;
+  entrypoint?: string;
+  nodeExecutable?: string;
+} = {}): string {
   const pid = input.pid ?? 32479;
   const runs = input.runs ?? 2;
   const entrypoint = input.entrypoint
     ?? "/Users/ethan/Slot With Space/node_modules/@waishnav/devspace/dist/cli.js";
+  const nodeExecutable = input.nodeExecutable ?? "/opt/homebrew/opt/node@24/bin/node";
   return [
     "gui/501/com.ethan.devspace = {",
     "\tactive count = 1",
     "\tstate = running",
     "",
     "\targuments = {",
-    "\t\t/opt/homebrew/opt/node@24/bin/node",
+    `\t\t${nodeExecutable}`,
     `\t\t${entrypoint}`,
     "\t\tserve",
     "\t}",
@@ -128,6 +139,31 @@ test("launchctl print parser preserves arguments and process generation evidence
     "unproven",
     "a present but malformed runs field must fail closed",
   );
+});
+
+test("listener success without a valid owner record cannot prove port absence", () => {
+  for (const output of ["", "garbled", "pnot-a-pid\n", "p0\n"]) {
+    assert.equal(parseListenerLsof(output, 0).kind, "unproven", JSON.stringify(output));
+  }
+  assert.deepEqual(parseListenerLsof("", 1), { kind: "known", value: { state: "unowned" } });
+});
+
+posixFsTest("canonical temp collision preserves an existing file owned by another operation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-temp-collision-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const existing = join(root, ".service.rollout-collision.tmp");
+  await writeFile(existing, "preserve-existing\n", { mode: 0o600 });
+  const bytes = Buffer.from("candidate\n");
+  await assert.rejects(prepareCanonicalTempFile({
+    canonicalPath: join(root, "service.plist"),
+    transactionNonce: "collision",
+    bytes,
+    expectedSha256: createHash("sha256").update(bytes).digest("hex"),
+    uid: process.getuid!(),
+    gid: process.getgid!(),
+    mode: 0o600,
+  }), { code: "EEXIST" });
+  assert.equal(await readFile(existing, "utf8"), "preserve-existing\n");
 });
 
 test("disabled-service parser is exact and fails closed on unknown output", async () => {
@@ -201,6 +237,10 @@ posixFsTest("process and listener parsers preserve exact identity without whites
     value: { state: "unowned" },
   });
   assert.equal(parseListenerLsof("p1\np2\n", 0).kind, "unproven");
+  assert.equal(parseListenerLsof("p123\npbroken\n", 0).kind, "unproven");
+  assert.deepEqual(parseListenerLsof("p78407\nf19\n", 0), {
+    kind: "known", value: { state: "owned", ownerPid: 78407 },
+  }, "Darwin -Fp output includes a numeric file-descriptor field");
   assert.deepEqual(parseParentPid("  42\n"), { kind: "known", value: 42 });
   assert.equal(parseParentPid("not-a-pid").kind, "unproven");
 
@@ -625,14 +665,14 @@ test("stop barrier accepts only a fully stopped service and rejects incompatible
     observeExpectedProcess: async () => known("gone" as const),
     observeLaunchd: async () => known({ loaded: false }),
     observeListener: async () => known({ state: "unowned" as const }),
-  }, { timeoutMs: 0, pollIntervalMs: 0 });
+  }, { timeoutMs: 100, pollIntervalMs: 0 });
   assert.deepEqual(stopped, { kind: "known", value: "stopped" });
 
   const unrelatedListener = await waitForStoppedState(expected, {
     observeExpectedProcess: async () => known("gone" as const),
     observeLaunchd: async () => known({ loaded: false }),
     observeListener: async () => known({ state: "owned" as const, ownerPid: 999 }),
-  }, { timeoutMs: 0, pollIntervalMs: 0 });
+  }, { timeoutMs: 100, pollIntervalMs: 0 });
   assert.equal(unrelatedListener.kind, "unproven");
   assert.match(unrelatedListener.kind === "unproven" ? unrelatedListener.reason : "", /unrelated listener owner/);
 
@@ -640,9 +680,247 @@ test("stop barrier accepts only a fully stopped service and rejects incompatible
     observeExpectedProcess: async () => known("gone" as const),
     observeLaunchd: async () => known({ loaded: true, pid: 999, runCount: 1, normalizedArgv: [] }),
     observeListener: async () => known({ state: "unowned" as const }),
-  }, { timeoutMs: 0, pollIntervalMs: 0 });
+  }, { timeoutMs: 100, pollIntervalMs: 0 });
   assert.equal(incompatibleService.kind, "unproven");
   assert.match(incompatibleService.kind === "unproven" ? incompatibleService.reason : "", /incompatible same-label runtime/);
+});
+
+test("default rollout stop budget covers the MCP drain contract plus margin", () => {
+  assert.equal(ROLLOUT_STOP_TIMEOUT_MS, MCP_SESSION_DRAIN_TIMEOUT_MS + 5_000);
+  assert.ok(ROLLOUT_STOP_TIMEOUT_MS > MCP_SESSION_DRAIN_TIMEOUT_MS);
+});
+
+test("normal stop barrier aborts a pending probe at its shared deadline", async () => {
+  const expected = processIdentity();
+  let aborted = false;
+  const result = await Promise.race([
+    waitForStoppedState(expected, {
+      async observeExpectedProcess(signal) {
+        signal?.addEventListener("abort", () => { aborted = true; }, { once: true });
+        return await new Promise<ObservedState<"alive" | "gone" | "reused">>(() => undefined);
+      },
+      async observeLaunchd() {
+        throw new Error("launchd probe must not run");
+      },
+      async observeListener() {
+        throw new Error("listener probe must not run");
+      },
+    }, {
+      timeoutMs: 15,
+      pollIntervalMs: 1,
+    }),
+    new Promise<"guard">((resolve) => setTimeout(() => resolve("guard"), 200)),
+  ]);
+  assert.notEqual(result, "guard");
+  assert.equal(aborted, true);
+  if (result !== "guard") {
+    assert.equal(result.kind, "unproven");
+    assert.match(result.kind === "unproven" ? result.reason : "", /timed out/);
+  }
+});
+
+darwinTest("normal stop adapter preserves one absolute deadline across ownership, bootout, and barrier", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-normal-stop-deadline-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const candidateEntrypoint = join(
+    root,
+    "node_modules",
+    "@waishnav",
+    "devspace",
+    "dist",
+    "cli.js",
+  );
+  await mkdir(dirname(candidateEntrypoint), { recursive: true });
+  await writeFile(candidateEntrypoint, "export {};\n");
+  const nodeExecutable = process.execPath;
+  const nodeRealpath = await realpath(nodeExecutable);
+  const expected = processIdentity({
+    pid: 777,
+    processStartIdentity: "1:Mon Sep 21 07:30:00 2026",
+    executableRealpath: nodeRealpath,
+    normalizedArgv: [
+      nodeExecutable,
+      candidateEntrypoint,
+      "serve",
+    ],
+    entrypointRealpath: await realpath(candidateEntrypoint),
+  });
+  let stopped = false;
+  let bootoutCompleted = false;
+  let postBootoutNowReads = 0;
+  let bootoutCalls = 0;
+  const now = () => {
+    if (!bootoutCompleted) return 0;
+    postBootoutNowReads += 1;
+    return postBootoutNowReads <= 2 ? 999 : 1_001;
+  };
+  const runner: CommandRunner = {
+    async run(executable, args) {
+      if (executable === "/bin/launchctl" && args[0] === "print") {
+        if (stopped) return { stdout: "", stderr: "Could not find service", exitCode: 113 };
+        return {
+          stdout: launchctlFixture({
+            pid: expected.pid,
+            runs: 1,
+            entrypoint: candidateEntrypoint,
+            nodeExecutable,
+          }),
+          stderr: "",
+          exitCode: 0,
+        };
+      }
+      if (executable === "/bin/ps" && args.includes("lstart=")) {
+        return { stdout: "Mon Sep 21 07:30:00 2026\n", stderr: "", exitCode: stopped ? 1 : 0 };
+      }
+      if (executable === "/bin/ps" && args.includes("comm=")) {
+        return { stdout: `${nodeExecutable}\n`, stderr: "", exitCode: 0 };
+      }
+      if (executable === "/usr/sbin/lsof" && args.includes("-d")) {
+        return {
+          stdout: `p777\nftxt\nn${nodeRealpath}\n`,
+          stderr: "",
+          exitCode: 0,
+        };
+      }
+      if (executable === "/usr/sbin/lsof") {
+        return { stdout: stopped ? "" : "p777\n", stderr: "", exitCode: stopped ? 1 : 0 };
+      }
+      if (executable === "/bin/launchctl" && args[0] === "bootout") {
+        bootoutCalls += 1;
+        stopped = true;
+        bootoutCompleted = true;
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      throw new Error(`unexpected command ${executable} ${args.join(" ")}`);
+    },
+  };
+  const adapters = createDarwinRolloutAdapters({
+    uid: 501,
+    commandRunner: runner,
+    stopTimeoutMs: 1_000,
+    stopPollIntervalMs: 1,
+    now,
+    sleep: async () => undefined,
+  });
+  const observedBeforeStop = await adapters.observeProcess(expected.pid);
+  assert.deepEqual(observedBeforeStop, { kind: "known", value: expected });
+  const result = await adapters.stopExpected(expected);
+  assert.equal(result.kind, "unproven");
+  assert.match(result.kind === "unproven" ? result.reason : "", /deadline expired|timed out/);
+  assert.equal(bootoutCalls, 1);
+  assert.ok(postBootoutNowReads >= 3, "test must cross the original absolute deadline after bootout");
+});
+
+darwinTest("normal stop treats ps observation failure as unproven rather than process absence", async () => {
+  let bootoutCalls = 0;
+  const runner: CommandRunner = {
+    async run(executable, args) {
+      if (executable === "/bin/launchctl" && args[0] === "print") {
+        return { stdout: "", stderr: "Could not find service", exitCode: 113 };
+      }
+      if (executable === "/bin/ps" && args.includes("lstart=")) {
+        return { stdout: "", stderr: "ps observation failed", exitCode: 2 };
+      }
+      if (executable === "/bin/launchctl" && args[0] === "bootout") {
+        bootoutCalls += 1;
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      throw new Error(`unexpected command ${executable} ${args.join(" ")}`);
+    },
+  };
+  const adapters = createDarwinRolloutAdapters({
+    uid: 501,
+    commandRunner: runner,
+    stopTimeoutMs: 1_000,
+  });
+
+  const result = await adapters.stopExpected(processIdentity());
+  assert.equal(result.kind, "unproven");
+  assert.match(result.kind === "unproven" ? result.reason : "", /ps process-generation probe exited with code 2/);
+  assert.equal(bootoutCalls, 0);
+});
+
+darwinTest("normal stop treats malformed ps start identity as unproven rather than PID reuse", async () => {
+  let bootoutCalls = 0;
+  const runner: CommandRunner = {
+    async run(executable, args) {
+      if (executable === "/bin/launchctl" && args[0] === "print") {
+        return { stdout: "", stderr: "Could not find service", exitCode: 113 };
+      }
+      if (executable === "/bin/ps" && args.includes("lstart=")) {
+        return { stdout: "truncated-or-invalid-row\n", stderr: "", exitCode: 0 };
+      }
+      if (executable === "/bin/launchctl" && args[0] === "bootout") {
+        bootoutCalls += 1;
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      throw new Error(`unexpected command ${executable} ${args.join(" ")}`);
+    },
+  };
+  const adapters = createDarwinRolloutAdapters({
+    uid: 501,
+    commandRunner: runner,
+    stopTimeoutMs: 1_000,
+  });
+
+  const result = await adapters.stopExpected(processIdentity());
+  assert.equal(result.kind, "unproven");
+  assert.match(result.kind === "unproven" ? result.reason : "", /process start identity is malformed/);
+  assert.equal(bootoutCalls, 0);
+});
+
+test("stability gate cancels a hanging probe and a hanging sleep at its deadline", async () => {
+  for (const hang of ["probe", "sleep"] as const) {
+    let receivedSignal: AbortSignal | undefined;
+    const result = await waitForStableState(processIdentity(), {
+      observeProcess: async (_pid, signal) => {
+        receivedSignal = signal;
+        return hang === "probe" ? new Promise(() => {}) : { kind: "known", value: processIdentity() };
+      },
+      observeListener: async () => ({ kind: "known", value: { state: "owned", ownerPid: 123 } }),
+      checkHealth: async () => ({ kind: "known", value: "healthy" }),
+    }, {
+      observationMs: 0,
+      timeoutMs: 15,
+      sleep: hang === "sleep" ? async () => new Promise(() => {}) : async () => undefined,
+    });
+    assert.equal(result.kind, "unproven", hang);
+    if (hang === "probe") assert.equal(receivedSignal?.aborted, true);
+  }
+});
+
+test("default command runner terminates an unresponsive subprocess within its budget", async () => {
+  const started = Date.now();
+  await assert.rejects(createExecFileRunner(50).run(process.execPath, [
+    "-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)",
+  ]));
+  assert.ok(Date.now() - started < 2_000);
+});
+
+darwinTest("process-generation matrix never treats malformed observations as disappearance or reuse", async () => {
+  const cases = [
+    [0, "Thu Sep 17 10:00:00 2026", "alive"],
+    [0, "Thu Sep 17 10:00:01 2026", "reused"],
+    [1, "", "gone"],
+    [2, "", "unproven"],
+    [0, "", "unproven"],
+    [0, "garbled", "unproven"],
+    [0, "Bad Sep 17 10:00:00 2026", "unproven"],
+    [0, "Thu Bad 17 10:00:00 2026", "unproven"],
+    [0, "Thu Sep 00 10:00:00 2026", "unproven"],
+    [0, "Thu Sep 17 25:00:00 2026", "unproven"],
+    [0, "Thu Feb 30 10:00:00 2026", "unproven"],
+    [0, "Fri Sep 17 10:00:00 2026", "unproven"],
+    [1, "Thu Sep 17 10:00:00 2026", "unproven"],
+  ] as const;
+  for (const [exitCode, stdout, expected] of cases) {
+    const adapters = createDarwinRolloutAdapters({
+      uid: 501,
+      commandRunner: { run: async () => ({ exitCode, stdout, stderr: "" }) },
+    });
+    const observed = await adapters.observeExpectedProcess(processIdentity());
+    assert.equal(observed.kind === "known" ? observed.value : observed.kind, expected, stdout);
+  }
 });
 
 test("stability gate requires the same process generation, listener owner, and health after the observation window", async () => {

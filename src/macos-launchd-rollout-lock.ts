@@ -127,10 +127,21 @@ function createDarwinLockfRunner(): LockfRunner {
         const child = spawn("/usr/bin/lockf", ["-s", "-t", "0", "3"], {
           stdio: ["ignore", "ignore", "ignore", fd],
         });
+        let timedOut = false;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          child.kill("SIGKILL");
+        }, 5_000);
         child.once("error", (cause) => {
+          clearTimeout(timer);
           reject(new RolloutLockError("LOCK_AMBIGUOUS", "Unable to execute /usr/bin/lockf.", { cause }));
         });
         child.once("exit", (code, signal) => {
+          clearTimeout(timer);
+          if (timedOut) {
+            reject(new RolloutLockError("LOCK_AMBIGUOUS", "lockf exceeded its execution deadline."));
+            return;
+          }
           if (code === 0) {
             resolve("acquired");
             return;

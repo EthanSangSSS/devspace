@@ -217,6 +217,12 @@ REBOOT_RECOVERY             = PASS | UNVERIFIED | FAIL
 
 `CONTROLLED_RELOAD=PASS` requires the candidate to have been booted out after its first successful verification, bootstrapped again from the exact same staged plist bytes, and to have passed the strong process-identity, listener-owner, and liveness gates again. Only after this second verification may those exact staged bytes be atomically published to the canonical path. A successful V1 rollout cannot report `ROLLOUT_OK` unless this controlled reload passes.
 
+The normal stop used for the old runtime, the first verified candidate generation, and an active candidate during recovery is one bounded operation: exact process ownership revalidation -> `launchctl bootout` -> stopped-state proof. All three stages share one absolute deadline and cancellation signal. The default deadline budget must be at least the application's configured MCP session drain timeout plus a fixed rollout margin; V1 uses `MCP_SESSION_DRAIN_TIMEOUT_MS + 5 seconds` (currently 40 seconds). It is invalid for the rollout stop barrier to expire before the application's own normal shutdown/drain contract.
+
+Service-definition absence is weaker than process-generation absence. Whenever the transaction has previously recorded a strong old/candidate process identity, rollback must re-observe that exact PID/start identity before promoting `launchd absent + listener unowned` to runtime absence. An explicit no-match process observation may prove that generation gone; observation errors remain unproven. A still-alive detached generation must finish stopping before any old-runtime bootstrap.
+
+Candidate generation memory is monotonic with respect to successful readiness observations: each newly observed ready generation becomes the recovery target immediately, before stability or later verification can fail. Failure construction may preserve that identity but must never replace it with an older candidate generation. Process-start output must also satisfy the expected `ps lstart` structure before a mismatch can count as PID reuse; malformed non-empty output remains unproven.
+
 `REBOOT_RECOVERY=PASS` requires one explicitly authorized real Mac restart followed by evidence that, after the user login session is established:
 
 1. no manual DevSpace `bootstrap` was used;
@@ -572,7 +578,9 @@ LOCKED
 
 - final pre-stop CAS has been repeated successfully;
 - the consequential-stop ownership invariant still identifies the exact expected old process generation;
-- `bootout` has been requested for `gui/<uid>/com.ethan.devspace`.
+- the normal-stop adapter establishes one absolute stop deadline before its final fresh ownership observation;
+- the same deadline and cancellation signal cover the final ownership proof, `launchctl bootout`, and the stopped-state barrier;
+- `bootout` has been requested for `gui/<uid>/com.ethan.devspace` only while that shared deadline is still live.
 
 ### 13.6 `OLD_STOPPED_VERIFIED`
 
@@ -581,6 +589,8 @@ LOCKED
 - `127.0.0.1:7676` is no longer owned by the stopped PID;
 - the port is not owned by an unrelated process;
 - the bounded stop barrier completed before candidate bootstrap.
+
+The production default normal-stop budget is `MCP_SESSION_DRAIN_TIMEOUT_MS + 5 seconds` (currently `35s + 5s = 40s`). This ensures the rollout stop budget cannot expire before DevSpace's own MCP session drain contract. The bound remains fail-closed: it does not authorize forced termination merely because a pathological HTTP connection exceeds the budget.
 
 ### 13.7 `CANDIDATE_STARTED`
 
@@ -599,7 +609,8 @@ LOCKED
 ### 13.9 `CANDIDATE_STOP_REQUESTED`
 
 - a fresh ownership read proves the loaded service is the exact verified candidate process generation or a same-slot KeepAlive replacement that independently passes strong identity;
-- `bootout` is requested only after that ownership proof.
+- one absolute normal-stop deadline covers the ownership proof, `bootout`, and the subsequent stopped-state barrier;
+- `bootout` is requested only after that ownership proof and before the shared deadline expires.
 
 ### 13.10 `CANDIDATE_STOPPED_VERIFIED`
 
@@ -705,6 +716,10 @@ Success returns:
 ```text
 SWITCH_FAILED_ROLLBACK_OK
 ```
+
+The returned outcome must still preserve the original forward failure phase, code, and reason. A successful rollback changes the recovery result, not the historical cause of the failed switch.
+
+Once the rollout lock is acquired, an unexpected exception from a forward adapter/probe does not bypass recovery. The transaction context tracks the current forward phase, last strongly observed candidate process, and whether the canonical atomic rename has crossed the commit point. The public rollout path then performs pre-commit recovery or post-commit compensation as appropriate and releases the lease only afterward.
 
 The helper does not rewrite the canonical plist in this path because it never changed it. Concrete incompatible state and unproven state are distinct terminal classifications; inability to prove ownership is not, by itself, evidence of concurrent drift.
 

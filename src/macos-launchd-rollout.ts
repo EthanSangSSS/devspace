@@ -97,15 +97,15 @@ export interface MacosRolloutAdapters {
   syncCanonicalParent(): Promise<void>;
   observeLaunchd(): Promise<ObservedState<LaunchdObservation>>;
   observeProcess(pid: number): Promise<ObservedState<ProcessIdentity>>;
+  observeExpectedProcess(expected: ProcessIdentity): Promise<ObservedState<"alive" | "gone" | "reused">>;
   observeListener(): Promise<ObservedState<ListenerObservation>>;
   checkHealth(): Promise<ObservedState<"healthy" | "unhealthy">>;
   waitReady(expectedEntrypoint: string): Promise<ObservedState<ProcessIdentity>>;
-  bootoutExpected(expected: ProcessIdentity): Promise<void>;
+  stopExpected(expected: ProcessIdentity): Promise<ObservedState<"stopped">>;
   bootoutInactiveCandidate(expectedArgv: readonly string[]): Promise<void>;
   bootstrap(plistPath: string): Promise<void>;
   observeDisabledOverride(): Promise<ObservedState<"enabled" | "disabled">>;
   observeAncestors(pid: number): Promise<ObservedState<number[]>>;
-  waitStopped(expected: ProcessIdentity): Promise<ObservedState<"stopped">>;
   waitStable(expected: ProcessIdentity): Promise<ObservedState<"stable">>;
   readFileSha256(path: string): Promise<ObservedState<string>>;
   observeFileIdentity(path: string): Promise<ObservedState<FileIdentity>>;
@@ -159,11 +159,15 @@ export interface ForwardTransactionContext {
   transactionDir: string;
   candidatePlistPath: string;
   lease: RolloutLockLease;
+  phase: ForwardRolloutFailurePhase;
+  committed: boolean;
   liveMutationStarted: boolean;
   controlledReloadVerified: boolean;
   initial?: InitialRolloutState;
+  candidateProcess?: ProcessIdentity;
   candidatePlistBytes?: Buffer;
   candidatePlistSha256?: string;
+  candidateCanonicalSha256?: string;
   preparedCanonicalTemp?: PreparedCanonicalTemp;
 }
 
@@ -291,9 +295,32 @@ export async function runMacosLaunchdRollout(
         forward.reason,
       );
     }
-    return forward.committed
-      ? await compensateCommittedCandidate(request, forward, adapters)
-      : await recoverPreCommitFailure(request, forward, adapters);
+    let recovery: RolloutOutcome;
+    try {
+      recovery = forward.committed
+        ? await compensateCommittedCandidate(request, forward, adapters)
+        : await recoverPreCommitFailure(request, forward, adapters);
+    } catch (error) {
+      // A failed observation must never be reported as a completed rollback.
+      // Keep the lease until this terminal, explicitly unproven result exists.
+      recovery = rolloutOutcome(
+        "ROLLBACK_REFUSED_UNPROVEN_STATE",
+        context,
+        context.committed,
+        controlledReloadStatus(context),
+        "FAIL",
+        `recovery could not prove a terminal state: ${errorMessage(error)}`,
+      );
+    }
+    return {
+      ...recovery,
+      evidence: {
+        forwardPhase: forward.phase,
+        forwardCode: forward.code,
+        forwardReason: forward.reason,
+        ...recovery.evidence,
+      },
+    };
   } finally {
     await context.lease.release();
   }
@@ -317,9 +344,13 @@ export async function runMacosLaunchdForwardPath(
     transactionDir,
     candidatePlistPath,
     lease,
+    phase: "precheck",
+    committed: false,
     liveMutationStarted: false,
     controlledReloadVerified: false,
   };
+
+  try {
 
   const initialResult = await readAndValidateInitialState({ request, adapters });
   if (!initialResult.ok) {
@@ -404,19 +435,15 @@ export async function runMacosLaunchdForwardPath(
     return forwardFailure(context, "precheck", "CANDIDATE_ARTIFACT_MISMATCH", errorMessage(error), { initial });
   }
 
-  const beforeStop = await revalidateBeforeOldStop({ initial, request, adapters });
+  const beforeStop = await revalidateBeforeOldStop({ initial, request, adapters, lease });
   if (!beforeStop.ok) {
     return forwardFailure(context, "old_stop", beforeStop.code, beforeStop.reason, { initial });
   }
+  context.phase = "old_stop";
   context.liveMutationStarted = true;
-  try {
-    await adapters.bootoutExpected(initial.process);
-  } catch (error) {
-    return forwardFailure(context, "old_stop", "LIVE_STATE_CAS_MISMATCH", errorMessage(error), { initial });
-  }
   let oldStopped: ObservedState<"stopped">;
   try {
-    oldStopped = await adapters.waitStopped(initial.process);
+    oldStopped = await adapters.stopExpected(initial.process);
   } catch (error) {
     return forwardFailure(context, "old_stop", "PRECONDITION_FAILED", errorMessage(error), { initial });
   }
@@ -425,34 +452,29 @@ export async function runMacosLaunchdForwardPath(
   }
 
   try {
+    context.phase = "candidate_first_start";
     await adapters.bootstrap(candidatePlistPath);
   } catch (error) {
     return forwardFailure(context, "candidate_first_start", "PRECONDITION_FAILED", errorMessage(error), { initial });
   }
+  context.phase = "candidate_first_verify";
   const firstCandidate = await verifyCandidateRuntime({
+    initial,
     candidateEntrypoint: request.candidateEntrypoint,
     candidatePlistPath,
     candidatePlistSha256,
     adapters,
+    onReadyProcess: (process) => rememberCandidateProcess(context, process),
   });
   if (!firstCandidate.ok) {
     return forwardFailure(context, "candidate_first_verify", "PRECONDITION_FAILED", firstCandidate.reason, { initial });
   }
+  rememberCandidateProcess(context, firstCandidate.process);
 
-  try {
-    await adapters.bootoutExpected(firstCandidate.process);
-  } catch (error) {
-    return forwardFailure(
-      context,
-      "candidate_controlled_stop",
-      "PRECONDITION_FAILED",
-      errorMessage(error),
-      { initial, candidateProcess: firstCandidate.process },
-    );
-  }
   let candidateStopped: ObservedState<"stopped">;
   try {
-    candidateStopped = await adapters.waitStopped(firstCandidate.process);
+    context.phase = "candidate_controlled_stop";
+    candidateStopped = await adapters.stopExpected(firstCandidate.process);
   } catch (error) {
     return forwardFailure(
       context,
@@ -472,6 +494,7 @@ export async function runMacosLaunchdForwardPath(
     );
   }
 
+  context.phase = "candidate_reload";
   const stagedBeforeReload = await adapters.readFileSha256(candidatePlistPath);
   if (stagedBeforeReload.kind === "unproven" || stagedBeforeReload.value !== candidatePlistSha256) {
     return forwardFailure(
@@ -494,10 +517,12 @@ export async function runMacosLaunchdForwardPath(
     );
   }
   const reloadedCandidate = await verifyCandidateRuntime({
+    initial,
     candidateEntrypoint: request.candidateEntrypoint,
     candidatePlistPath,
     candidatePlistSha256,
     adapters,
+    onReadyProcess: (process) => rememberCandidateProcess(context, process),
   });
   if (!reloadedCandidate.ok) {
     return forwardFailure(
@@ -508,8 +533,10 @@ export async function runMacosLaunchdForwardPath(
       { initial, candidateProcess: firstCandidate.process },
     );
   }
+  rememberCandidateProcess(context, reloadedCandidate.process);
   context.controlledReloadVerified = true;
 
+  context.phase = "pre_commit_revalidation";
   const preCommit = await preCommitRevalidate({
     request,
     initial,
@@ -517,6 +544,7 @@ export async function runMacosLaunchdForwardPath(
     candidatePlistSha256,
     lease,
     adapters,
+    onReadyProcess: (process) => rememberCandidateProcess(context, process),
   });
   if (!preCommit.ok) {
     return forwardFailure(
@@ -528,6 +556,7 @@ export async function runMacosLaunchdForwardPath(
     );
   }
   let candidateForCommit = preCommit.process;
+  rememberCandidateProcess(context, candidateForCommit);
 
   let prepared: PreparedCanonicalTemp;
   try {
@@ -566,6 +595,7 @@ export async function runMacosLaunchdForwardPath(
     candidatePlistSha256,
     lease,
     adapters,
+    onReadyProcess: (process) => rememberCandidateProcess(context, process),
   });
   if (!immediatelyBeforeCommit.ok) {
     return forwardFailure(
@@ -577,6 +607,33 @@ export async function runMacosLaunchdForwardPath(
     );
   }
   candidateForCommit = immediatelyBeforeCommit.process;
+  rememberCandidateProcess(context, candidateForCommit);
+  // Readiness/stability awaits above must not leave the final filesystem CAS
+  // bound to observations made before those awaits.
+  const [tempHash, tempIdentity, finalCanonical, finalLock] = await Promise.all([
+    adapters.readFileSha256(prepared.path),
+    adapters.observeFileIdentity(prepared.path),
+    adapters.readCanonical(),
+    lease.assertOwned(),
+  ]);
+  if (
+    tempHash.kind !== "known"
+    || tempHash.value !== candidatePlistSha256
+    || tempIdentity.kind !== "known"
+    || !sameFileIdentity(tempIdentity.value, prepared.identity)
+    || tempIdentity.value.kind !== "file"
+    || tempIdentity.value.symlink
+  ) {
+    return forwardFailure(context, "pre_commit_revalidation", "CANDIDATE_ARTIFACT_MISMATCH", "prepared canonical temp changed before commit");
+  }
+  if (
+    finalCanonical.kind !== "known"
+    || !sameCanonicalDefinition(finalCanonical.value, initial.canonical)
+    || finalLock.kind !== "known"
+    || finalLock.value !== "owned"
+  ) {
+    return forwardFailure(context, "pre_commit_revalidation", "LIVE_STATE_CAS_MISMATCH", "canonical identity or lock changed before commit");
+  }
   try {
     await adapters.atomicReplaceCanonical(prepared.path);
   } catch (error) {
@@ -588,6 +645,9 @@ export async function runMacosLaunchdForwardPath(
       { initial, candidateProcess: reloadedCandidate.process },
     );
   }
+  context.committed = true;
+  context.candidateCanonicalSha256 = candidatePlistSha256;
+  context.phase = "post_commit_verification";
 
   try {
     await adapters.syncCanonicalParent();
@@ -610,6 +670,7 @@ export async function runMacosLaunchdForwardPath(
     candidateCanonicalSha256: candidatePlistSha256,
     initial,
     adapters,
+    onReadyProcess: (process) => rememberCandidateProcess(context, process),
   });
   if (!postCommit.ok) {
     return forwardFailure(
@@ -625,6 +686,7 @@ export async function runMacosLaunchdForwardPath(
       },
     );
   }
+  rememberCandidateProcess(context, postCommit.process);
 
   return {
     ok: true,
@@ -633,6 +695,22 @@ export async function runMacosLaunchdForwardPath(
     candidateProcess: postCommit.process,
     candidateCanonicalSha256: candidatePlistSha256,
   };
+  } catch (error) {
+    return forwardFailure(
+      context,
+      context.phase,
+      "PRECONDITION_FAILED",
+      errorMessage(error),
+      {
+        ...(context.initial ? { initial: context.initial } : {}),
+        ...(context.candidateProcess ? { candidateProcess: context.candidateProcess } : {}),
+        ...(context.candidateCanonicalSha256
+          ? { candidateCanonicalSha256: context.candidateCanonicalSha256 }
+          : {}),
+        committed: context.committed,
+      },
+    );
+  }
 }
 
 async function recoverPreCommitFailure(
@@ -665,14 +743,38 @@ async function recoverPreCommitFailure(
   }
 
   if (observed.runtimeRole === "old") {
-    const healthy = await verifyOldRuntime(request, initial, adapters, true);
-    return rolloutOutcome(
-      healthy ? "SWITCH_FAILED_ROLLBACK_OK" : "SWITCH_FAILED_ROLLBACK_FAILED",
-      context,
-      false,
-      controlledReloadStatus(context),
-      healthy ? "PASS" : "FAIL",
-    );
+    if (isKnownUnowned(observed.listener) && observed.process) {
+      const stopped = await adapters.stopExpected(observed.process);
+      if (stopped.kind === "unproven") {
+        return rolloutOutcome(
+          "ROLLBACK_REFUSED_UNPROVEN_STATE",
+          context,
+          false,
+          controlledReloadStatus(context),
+          "FAIL",
+          stopped.reason,
+        );
+      }
+      observed = await observeRecoveryState({
+        expectedCanonical: "old",
+        request,
+        context,
+        initial,
+        adapters,
+      });
+      if (observed.refusal) {
+        return rolloutOutcome(observed.refusal, context, false, controlledReloadStatus(context), "FAIL");
+      }
+    } else {
+      const healthy = await verifyOldRuntime(request, initial, adapters, true);
+      return rolloutOutcome(
+        healthy ? "SWITCH_FAILED_ROLLBACK_OK" : "SWITCH_FAILED_ROLLBACK_FAILED",
+        context,
+        false,
+        controlledReloadStatus(context),
+        healthy ? "PASS" : "FAIL",
+      );
+    }
   }
 
   if (observed.runtimeRole === "candidate" || observed.runtimeRole === "candidate-inactive") {
@@ -931,8 +1033,9 @@ async function stopRecoveryCandidate(input: {
     );
   }
 
+  let stopped: ObservedState<"stopped">;
   try {
-    await input.adapters.bootoutExpected(fresh.process);
+    stopped = await input.adapters.stopExpected(fresh.process);
   } catch (error) {
     const afterFailure = await observeRecoveryState(input);
     if (afterFailure.refusal) {
@@ -953,8 +1056,6 @@ async function stopRecoveryCandidate(input: {
       errorMessage(error),
     );
   }
-
-  const stopped = await input.adapters.waitStopped(fresh.process).catch((error) => unproven<"stopped">(errorMessage(error)));
   if (stopped.kind === "unproven") {
     const afterFailure = await observeRecoveryState(input);
     if (afterFailure.refusal) {
@@ -994,7 +1095,10 @@ async function observeRecoveryState(input: {
 
   const launchd = await input.adapters.observeLaunchd();
   const listenerRaw = await input.adapters.observeListener();
-  let runtime: ObservedState<"expected" | "absent" | "drift">;
+  let runtime: ObservedState<"expected" | "absent" | "drift"> = {
+    kind: "unproven",
+    reason: "runtime state has not been classified",
+  };
   let listener: ObservedState<"expected" | "unowned" | "drift">;
   let runtimeRole: RecoveryObservation["runtimeRole"] = "unproven";
   let processValue: ProcessIdentity | undefined;
@@ -1003,8 +1107,51 @@ async function observeRecoveryState(input: {
   if (launchd.kind === "unproven") {
     runtime = { kind: "unproven", reason: launchd.reason };
   } else if (!launchd.value.loaded) {
-    runtimeRole = "absent";
-    runtime = { kind: "known", value: "absent" };
+    const knownProcesses: Array<{ role: "old" | "candidate"; process: ProcessIdentity }> = [];
+    if (input.context.candidateProcess) {
+      knownProcesses.push({ role: "candidate", process: input.context.candidateProcess });
+    }
+    if (!knownProcesses.some(({ process }) => sameProcessIdentity(process, input.initial.process))) {
+      knownProcesses.push({ role: "old", process: input.initial.process });
+    }
+
+    let liveKnown: { role: "old" | "candidate"; process: ProcessIdentity } | undefined;
+    let detachedFailure: string | undefined;
+    for (const knownProcess of knownProcesses) {
+      const generation = await input.adapters.observeExpectedProcess(knownProcess.process);
+      if (generation.kind === "unproven") {
+        detachedFailure = generation.reason;
+        break;
+      }
+      if (generation.value !== "alive") continue;
+      if (liveKnown) {
+        runtimeRole = "drift";
+        runtime = { kind: "known", value: "drift" };
+        detachedFailure = "multiple previously known runtime generations remain alive after launchd unload";
+        break;
+      }
+      liveKnown = knownProcess;
+    }
+
+    if (runtimeRole === "drift") {
+      // Preserve the concrete drift classification above.
+    } else if (detachedFailure) {
+      runtimeRole = "unproven";
+      runtime = { kind: "unproven", reason: detachedFailure };
+    } else if (liveKnown) {
+      processValue = liveKnown.process;
+      observedRuntimePid = liveKnown.process.pid;
+      runtimeRole = liveKnown.role === "old"
+        ? input.expectedCanonical === "old" ? "old" : "drift"
+        : "candidate";
+      runtime = {
+        kind: "known",
+        value: runtimeRole === "drift" ? "drift" : "expected",
+      };
+    } else {
+      runtimeRole = "absent";
+      runtime = { kind: "known", value: "absent" };
+    }
   } else if (!launchd.value.pid) {
     const expectedArgv = expectedCandidateArgv(input.initial, input.request.candidateEntrypoint);
     if (sameArgv(launchd.value.normalizedArgv, expectedArgv)) {
@@ -1023,7 +1170,10 @@ async function observeRecoveryState(input: {
       processValue = processState.value;
       if (sameProcessIdentity(processState.value, input.initial.process)) {
         runtimeRole = input.expectedCanonical === "old" ? "old" : "drift";
-      } else if (processState.value.entrypointRealpath === input.request.candidateEntrypoint) {
+      } else if (
+        isExpectedCandidateProcess(processState.value, input.initial, input.request.candidateEntrypoint)
+        && sameArgv(launchd.value.normalizedArgv, expectedCandidateArgv(input.initial, input.request.candidateEntrypoint))
+      ) {
         runtimeRole = "candidate";
       } else {
         runtimeRole = "drift";
@@ -1081,6 +1231,26 @@ function sameArgv(actual: readonly string[] | undefined, expected: readonly stri
     && actual.length === expected.length
     && actual.every((value, index) => value === expected[index]),
   );
+}
+
+function isExpectedCandidateProcess(
+  process: ProcessIdentity,
+  initial: InitialRolloutState,
+  candidateEntrypoint: string,
+): boolean {
+  return process.entrypointRealpath === candidateEntrypoint
+    && process.executableRealpath === initial.process.executableRealpath
+    && sameArgv(process.normalizedArgv, expectedCandidateArgv(initial, candidateEntrypoint));
+}
+
+function sameCanonicalDefinition(actual: CanonicalPlistSnapshot, expected: CanonicalPlistSnapshot): boolean {
+  return actual.sha256 === expected.sha256
+    && actual.entrypointRealpath === expected.entrypointRealpath
+    && actual.runAtLoad === expected.runAtLoad
+    && actual.keepAlive === expected.keepAlive
+    && sameArgv(actual.programArguments, expected.programArguments)
+    && sameFileIdentity(actual.identity, expected.identity)
+    && sameFileIdentity(actual.parentIdentity, expected.parentIdentity);
 }
 
 async function observeExpectedCanonical(input: {
@@ -1212,6 +1382,8 @@ async function verifyOldRuntime(
   if (
     processState.kind !== "known"
     || (requireExactInitialGeneration && !sameProcessIdentity(processState.value, initial.process))
+    || processState.value.executableRealpath !== initial.process.executableRealpath
+    || !sameArgv(processState.value.normalizedArgv, initial.canonical.programArguments)
   ) return false;
   const stable = await adapters.waitStable(processState.value);
   return stable.kind === "known" && stable.value === "stable";
@@ -1365,13 +1537,17 @@ async function revalidateBeforeOldStop(input: {
   initial: InitialRolloutState;
   request: RolloutRequest;
   adapters: MacosRolloutAdapters;
+  lease: RolloutLockLease;
 }): Promise<{ ok: true } | { ok: false; code: "LIVE_STATE_CAS_MISMATCH"; reason: string }> {
+  const lock = await input.lease.assertOwned();
+  if (lock.kind !== "known" || lock.value !== "owned") {
+    return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: "rollout lock ownership is not proven before old-service stop" };
+  }
   const canonical = await input.adapters.readCanonical();
   if (canonical.kind === "unproven") return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: canonical.reason };
   if (
     canonical.value.sha256 !== input.request.expectedLivePlistSha256
-    || canonical.value.sha256 !== input.initial.canonical.sha256
-    || canonical.value.entrypointRealpath !== input.initial.canonical.entrypointRealpath
+    || !sameCanonicalDefinition(canonical.value, input.initial.canonical)
   ) {
     return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: "canonical state changed before old-service stop" };
   }
@@ -1391,15 +1567,22 @@ async function revalidateBeforeOldStop(input: {
 }
 
 async function verifyCandidateRuntime(input: {
+  initial: InitialRolloutState;
   candidateEntrypoint: string;
   candidatePlistPath: string;
   candidatePlistSha256: string;
   adapters: MacosRolloutAdapters;
+  onReadyProcess?: (process: ProcessIdentity) => void;
 }): Promise<{ ok: true; process: ProcessIdentity } | { ok: false; reason: string }> {
   const stagedHash = await input.adapters.readFileSha256(input.candidatePlistPath);
   if (stagedHash.kind === "unproven") return { ok: false, reason: stagedHash.reason };
   if (stagedHash.value !== input.candidatePlistSha256) return { ok: false, reason: "staged candidate plist hash changed" };
-  const qualified = await observeHealthyCandidateRuntime(input.candidateEntrypoint, input.adapters);
+  const qualified = await observeHealthyCandidateRuntime(
+    input.candidateEntrypoint,
+    input.initial,
+    input.adapters,
+    input.onReadyProcess,
+  );
   if (!qualified.ok) return qualified;
   const hashAfterStability = await input.adapters.readFileSha256(input.candidatePlistPath);
   if (hashAfterStability.kind === "unproven") return { ok: false, reason: hashAfterStability.reason };
@@ -1416,6 +1599,7 @@ async function preCommitRevalidate(input: {
   candidatePlistSha256: string;
   lease: RolloutLockLease;
   adapters: MacosRolloutAdapters;
+  onReadyProcess?: (process: ProcessIdentity) => void;
 }): Promise<
   | { ok: true; process: ProcessIdentity }
   | { ok: false; code: "LIVE_STATE_CAS_MISMATCH" | "CANDIDATE_ARTIFACT_MISMATCH" | "PRECONDITION_FAILED"; reason: string }
@@ -1431,15 +1615,19 @@ async function preCommitRevalidate(input: {
   if (canonical.kind === "unproven") return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: canonical.reason };
   if (
     canonical.value.sha256 !== input.request.expectedLivePlistSha256
-    || canonical.value.sha256 !== input.initial.canonical.sha256
-    || canonical.value.entrypointRealpath !== input.initial.canonical.entrypointRealpath
+    || !sameCanonicalDefinition(canonical.value, input.initial.canonical)
   ) {
     return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: "old canonical changed before commit" };
   }
   const stagedHash = await input.adapters.readFileSha256(input.candidatePlistPath);
   if (stagedHash.kind === "unproven") return { ok: false, code: "CANDIDATE_ARTIFACT_MISMATCH", reason: stagedHash.reason };
   if (stagedHash.value !== input.candidatePlistSha256) return { ok: false, code: "CANDIDATE_ARTIFACT_MISMATCH", reason: "staged candidate plist changed before commit" };
-  const qualified = await observeHealthyCandidateRuntime(input.request.candidateEntrypoint, input.adapters);
+  const qualified = await observeHealthyCandidateRuntime(
+    input.request.candidateEntrypoint,
+    input.initial,
+    input.adapters,
+    input.onReadyProcess,
+  );
   if (!qualified.ok) {
     return { ok: false, code: "LIVE_STATE_CAS_MISMATCH", reason: qualified.reason };
   }
@@ -1451,6 +1639,7 @@ async function postCommitVerify(input: {
   candidateCanonicalSha256: string;
   initial: InitialRolloutState;
   adapters: MacosRolloutAdapters;
+  onReadyProcess?: (process: ProcessIdentity) => void;
 }): Promise<{ ok: true; process: ProcessIdentity } | { ok: false; reason: string }> {
   const canonical = await input.adapters.readCanonical();
   if (canonical.kind === "unproven") return { ok: false, reason: canonical.reason };
@@ -1468,18 +1657,36 @@ async function postCommitVerify(input: {
   const disabled = await input.adapters.observeDisabledOverride();
   if (disabled.kind === "unproven") return { ok: false, reason: disabled.reason };
   if (disabled.value === "disabled") return { ok: false, reason: "committed service became persistently disabled" };
-  return observeHealthyCandidateRuntime(input.candidateEntrypoint, input.adapters);
+  return observeHealthyCandidateRuntime(
+    input.candidateEntrypoint,
+    input.initial,
+    input.adapters,
+    input.onReadyProcess,
+  );
 }
 
 async function observeHealthyCandidateRuntime(
   candidateEntrypoint: string,
+  initial: InitialRolloutState,
   adapters: MacosRolloutAdapters,
+  onReadyProcess?: (process: ProcessIdentity) => void,
 ): Promise<{ ok: true; process: ProcessIdentity } | { ok: false; reason: string }> {
   const processState = await adapters.waitReady(candidateEntrypoint);
   if (processState.kind === "unproven") return { ok: false, reason: processState.reason };
+  if (!isExpectedCandidateProcess(processState.value, initial, candidateEntrypoint)) {
+    return { ok: false, reason: "candidate argv or Node executable differs from the staged candidate contract" };
+  }
+  onReadyProcess?.(processState.value);
   const stable = await adapters.waitStable(processState.value);
   if (stable.kind === "unproven") return { ok: false, reason: stable.reason };
   return { ok: true, process: processState.value };
+}
+
+function rememberCandidateProcess(
+  context: ForwardTransactionContext,
+  process: ProcessIdentity,
+): void {
+  context.candidateProcess = process;
 }
 
 function forwardFailure(
@@ -1494,11 +1701,20 @@ function forwardFailure(
     committed?: boolean;
   } = {},
 ): ForwardRolloutFailure {
+  context.phase = phase;
+  if (extra.initial) context.initial = extra.initial;
+  if (extra.candidateProcess && !context.candidateProcess) {
+    rememberCandidateProcess(context, extra.candidateProcess);
+  }
+  if (extra.candidateCanonicalSha256) {
+    context.candidateCanonicalSha256 = extra.candidateCanonicalSha256;
+  }
+  if (extra.committed === true) context.committed = true;
   return {
     ok: false,
     phase,
     code,
-    committed: extra.committed ?? false,
+    committed: context.committed,
     context,
     ...(extra.initial ? { initial: extra.initial } : {}),
     ...(extra.candidateProcess ? { candidateProcess: extra.candidateProcess } : {}),

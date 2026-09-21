@@ -222,7 +222,6 @@ export class LocalAgentDaemon {
         retryable: true,
         operation: "request",
       })));
-      socket.destroy();
     }, this.requestReadTimeoutMs);
     requestTimer.unref();
     socket.on("data", (chunk: string | Buffer) => {
@@ -230,6 +229,7 @@ export class LocalAgentDaemon {
       buffer += chunk.toString();
       if (Buffer.byteLength(buffer, "utf8") > MAX_REQUEST_BYTES) {
         handled = true;
+        clearTimeout(requestTimer);
         this.writeError(socket, "", toAgentErrorPayload(new AgentDaemonInvalidRequestError({
           code: "DAEMON_INVALID_REQUEST",
           message: "Daemon request is too large.",
@@ -246,7 +246,10 @@ export class LocalAgentDaemon {
       void this.handleLine(socket, line);
     });
     socket.on("error", () => undefined);
-    socket.on("close", () => this.sockets.delete(socket));
+    socket.on("close", () => {
+      clearTimeout(requestTimer);
+      this.sockets.delete(socket);
+    });
     socket.on("error", () => clearTimeout(requestTimer));
   }
 
@@ -319,12 +322,19 @@ export class LocalAgentDaemon {
   }
 
   private writeError(socket: Socket, requestId: string, error: LocalAgentDaemonErrorPayload): void {
+    // Half-close after the error frame, allowing a peer with buffered request
+    // bytes to receive the rejection. Immediate destroy can race those writes
+    // and replace a valid protocol error with EPIPE. A non-cooperating peer
+    // still cannot keep this rejected connection open indefinitely.
+    const closeTimer = setTimeout(() => socket.destroy(), 1_000);
+    closeTimer.unref();
+    socket.once("close", () => clearTimeout(closeTimer));
     socket.end(encodeLocalAgentDaemonResponse({
       requestId,
       protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
       ok: false,
       error,
-    }), () => socket.destroy());
+    }));
   }
 
   private assertAuthenticated(authToken: string): void {

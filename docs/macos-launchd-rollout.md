@@ -168,6 +168,24 @@ first candidate start + verification
 
 `ROLLOUT_OK` therefore requires `CONTROLLED_RELOAD=PASS`.
 
+Normal runtime stops are one bounded operation, not an unbounded `bootout` followed by a separately restarted timeout. The Darwin adapter establishes one absolute deadline before the final ownership read, and that same deadline covers:
+
+```text
+fresh process/listener ownership proof
+-> launchctl bootout
+-> process / launchd / listener absence barrier
+```
+
+All stop-barrier probes receive the shared cancellation signal, and success observed after the absolute deadline is rejected. The default production stop budget is derived from DevSpace's MCP shutdown contract:
+
+```text
+MCP_SESSION_DRAIN_TIMEOUT_MS + 5 seconds
+= 35 seconds + 5 seconds
+= 40 seconds currently
+```
+
+This prevents rollout from declaring a normal graceful shutdown failed before DevSpace's own MCP session drain window can complete. It is still a finite rollout safety bound, not a claim that every possible malformed or indefinitely-held HTTP connection must complete within 40 seconds. If the runtime does not disappear before the deadline, the switch fails closed and recovery runs; the rollout helper does not force-kill an unproven runtime.
+
 ## Post-rollout qualification
 
 After a separately authorized production switch returns `ROLLOUT_OK`, record a fresh read of:
@@ -188,6 +206,12 @@ Local DevSpace qualification and public connector/tunnel qualification are separ
 
 Runtime startup readiness is also bounded. After each candidate bootstrap and after an old-runtime recovery bootstrap, the production Darwin adapter waits up to 15 seconds, polling every 100 ms for the expected same-label process identity, listener ownership, and healthy `/healthz`. Transient `launchd` PID availability, listener absence, or unhealthy startup responses are retried inside that window. A same-label process with a different entrypoint or an unrelated owner of port `7676` fails closed immediately rather than being treated as startup delay. The normal stability observation still runs after readiness succeeds.
 
+Normal runtime shutdown is bounded by the server's own MCP drain contract, not by a shorter independent timeout. The default rollout stop budget is `MCP_SESSION_DRAIN_TIMEOUT_MS + 5 seconds` (currently 40 seconds). Ownership revalidation, `launchctl bootout`, and the stopped-state barrier share one absolute deadline and one cancellation signal; no phase receives a fresh timeout budget. A late success after that deadline is rejected. This is required because an otherwise healthy candidate may have active ChatGPT/MCP traffic during the controlled-reload stop.
+
+`launchd job absent` and `listener unowned` are not, by themselves, proof that a previously observed process generation has exited. Recovery remembers the last strongly observed candidate generation and the initial old generation. Before classifying the runtime as absent, it rechecks those known PID/start-identity pairs. Only an explicit `ps` no-match result is treated as gone; malformed output or other `ps` failures remain unproven. If a known generation is still alive after the launchd job disappears, recovery waits for that exact generation to exit before bootstrapping the old definition.
+
+Every successful candidate readiness observation immediately advances the transaction's recovery identity, including controlled reload, pre-commit revalidation, and post-commit verification. Packaging a later failure must not overwrite that identity with an older generation. This keeps returned-`unproven` and thrown-exception paths recovery-equivalent.
+
 ## Result codes
 
 | Result code | Operator meaning |
@@ -206,7 +230,42 @@ Runtime startup readiness is also bounded. After each candidate bootstrap and af
 | `ROLLBACK_REFUSED_CONCURRENT_DRIFT` | Concrete incompatible state was observed. Do not stop or overwrite the unknown state. |
 | `ROLLBACK_REFUSED_UNPROVEN_STATE` | Required state cannot be reliably classified. Unknown is not silently promoted to drift or absence. |
 
+When a forward switch has already mutated live state and then recovery returns a rollback result, the outcome evidence must preserve the original forward failure phase, result code, and reason. A successful rollback must not erase the reason the switch failed.
+
+When a live mutation fails and recovery returns a terminal outcome, `evidence` preserves the original forward failure as `forwardPhase`, `forwardCode`, and `forwardReason`, even when rollback succeeds. Operators should use those fields to diagnose the switch failure rather than treating a successful rollback as loss of the original cause.
+
+Unexpected adapter/probe exceptions after the transaction lock has been acquired are converted into a phase-aware forward failure while the same transaction context and kernel lease remain available. If live mutation has started, the public rollout path must run recovery or post-commit compensation before releasing that lease. If the canonical rename has already succeeded, the context records `committed=true` before any post-commit operation can run.
+
 ## Recovery rules
+
+### Global-review hardening (2026-09-21)
+
+Active candidate readiness and recovery require both the exact staged argv and
+the Node executable realpath established by the initial live process. A matching
+entrypoint alone cannot authorize stopping a foreign process. Readiness records
+a candidate generation only after that ownership check succeeds.
+
+The transaction rechecks its lease before the first old-runtime stop. Immediately
+before canonical publication it also checks the prepared file's digest and
+device/inode/ownership/mode, the old canonical and parent identities, and the
+lease. Exclusive temporary-file creation failure never authorizes deleting an
+existing file at that pathname. Unexpected recovery-observation exceptions produce
+an explicit `ROLLBACK_REFUSED_UNPROVEN_STATE`, preserving the forward failure and
+committed truth; they cannot report a successful restore.
+
+Default external commands have a 5-second subprocess deadline with forced
+termination of that command on timeout. The stability observation has one deadline
+covering its sleep and all probes, and forwards cancellation to the subprocess and
+health probes. Readiness timers remain referenced while a result is pending.
+Filesystem hashing, traversal, atomic rename and fsync are **not cancellable**:
+the utility must await their actual result rather than race a late mutation against
+rollback. The advisory lock and path checks are not an OS sandbox against another
+arbitrary process running as the same user.
+
+Regression coverage includes foreign active candidates, pre-stop lock loss,
+same-byte canonical replacement, prepared-temp replacement, exclusive-create
+collision, post-rename fsync failure, recovery exceptions, hanging stability
+observations, and the process-start timestamp classification matrix.
 
 Every recovery starts by fresh-reading:
 
