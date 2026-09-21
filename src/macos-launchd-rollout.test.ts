@@ -81,18 +81,26 @@ interface ForwardFixtureOptions {
   candidatePreflightFails?: boolean;
   canonicalArgvDrift?: boolean;
   oldRuntimeDriftsBeforeStop?: boolean;
+  candidateStopBarrierUnproven?: boolean;
+  candidateDetachedDrainBeforeRecovery?: boolean;
   firstCandidateListenerPid?: number;
   firstCandidateHealthy?: boolean;
+  firstCandidateStabilityThrows?: boolean;
   candidateCrashBackoffBeforeRecovery?: boolean;
   candidateCrashBackoffArgvDrift?: boolean;
   reloadCandidateHealthy?: boolean;
+  reloadCandidateStabilityUnproven?: boolean;
   preCommitCanonicalDrift?: boolean;
   keepAliveReplacementBeforeCommit?: boolean;
+  preCommitReplacementStabilityThrows?: boolean;
   oldStopBarrierThrows?: boolean;
   oldBootoutLeavesRuntime?: boolean;
   recoveryCanonicalDrift?: "hash" | "identity" | "unproven";
   recoveryRuntimeUnproven?: boolean;
   postCommitHealthFailure?: boolean;
+  postCommitStabilityThrows?: boolean;
+  postCommitReplacementBeforeVerify?: boolean;
+  postCommitReplacementStabilityThrows?: boolean;
   postCommitCandidateCrashBackoff?: boolean;
   postCommitRuntimeDrift?: boolean;
   postCommitRuntimeAbsent?: boolean;
@@ -153,6 +161,7 @@ async function createForwardFixture(
     | "old"
     | "stopped"
     | "candidate-first"
+    | "candidate-detached"
     | "candidate-crash-backoff"
     | "candidate-first-stopped"
     | "candidate-reload"
@@ -261,6 +270,7 @@ async function createForwardFixture(
           ? { loaded: true, pid: candidateReplacement.pid, runCount: 3, normalizedArgv: candidateReplacement.normalizedArgv }
           : { loaded: true, pid: candidateReload.pid, runCount: 2, normalizedArgv: candidateReload.normalizedArgv };
       case "stopped":
+      case "candidate-detached":
       case "candidate-first-stopped":
       case "rollback-candidate-stopped":
         return { loaded: false };
@@ -278,6 +288,7 @@ async function createForwardFixture(
       return oldProcess;
     }
     if (phase === "candidate-first" && pid === candidateFirst.pid) return candidateFirst;
+    if (phase === "candidate-detached" && pid === candidateFirst.pid) return candidateFirst;
     if (phase === "candidate-reload" && !replacementActive && pid === candidateReload.pid) return candidateReload;
     if (phase === "candidate-reload" && replacementActive && pid === candidateReplacement.pid) return candidateReplacement;
     if (phase === "candidate-reload" && forwardFailed && options.postCommitRuntimeDrift && pid === foreignRuntime.pid) {
@@ -300,6 +311,7 @@ async function createForwardFixture(
         })(),
       };
       case "candidate-crash-backoff": return { state: "unowned" };
+      case "candidate-detached": return { state: "unowned" };
       case "candidate-reload": return {
         state: "owned",
         ownerPid: forwardFailed && options.postCommitUnrelatedListener
@@ -347,6 +359,9 @@ async function createForwardFixture(
         return known({ ...oldCanonical, sha256: "f".repeat(64) });
       }
       if (options.keepAliveReplacementBeforeCommit && phase === "candidate-reload" && !canonicalCommitted) {
+        replacementActive = true;
+      }
+      if (options.postCommitReplacementBeforeVerify && phase === "candidate-reload" && canonicalCommitted) {
         replacementActive = true;
       }
       return known(canonicalCommitted ? candidateCanonical : oldCanonical);
@@ -401,6 +416,14 @@ async function createForwardFixture(
       const processValue = currentProcess(pid);
       return processValue ? known(processValue) : unproven(`PID ${pid} is not current`);
     },
+    async observeExpectedProcess(expected) {
+      calls.push(`process-generation:${expected.pid}`);
+      const processValue = currentProcess(expected.pid);
+      if (!processValue) return known("gone");
+      return processValue.processStartIdentity === expected.processStartIdentity
+        ? known("alive")
+        : known("reused");
+    },
     async observeListener() {
       calls.push(`listener:${phase}`);
       return known(currentListener());
@@ -449,12 +472,25 @@ async function createForwardFixture(
       }
       return known(processState.value);
     },
-    async bootoutExpected(expected) {
+    async stopExpected(expected) {
       calls.push(expected.pid === oldProcess.pid ? "OLD_STOP_REQUESTED" : "CANDIDATE_STOP_REQUESTED");
+      calls.push(`STOP_EXPECTED:${expected.pid}`);
+      let detachedDrainStarted = false;
       if (expected.pid === oldProcess.pid && phase === "old") {
         if (!options.oldBootoutLeavesRuntime) phase = "stopped";
       }
-      else if (expected.pid === candidateFirst.pid && phase === "candidate-first") phase = "candidate-first-stopped";
+      else if (expected.pid === candidateFirst.pid && phase === "candidate-first") {
+        if (options.candidateDetachedDrainBeforeRecovery) {
+          phase = "candidate-detached";
+          forwardFailed = true;
+          detachedDrainStarted = true;
+        } else {
+          phase = "candidate-first-stopped";
+        }
+      }
+      else if (expected.pid === candidateFirst.pid && phase === "candidate-detached") {
+        phase = "rollback-candidate-stopped";
+      }
       else if (
         phase === "candidate-reload"
         && (expected.pid === candidateReload.pid || expected.pid === candidateReplacement.pid)
@@ -462,6 +498,23 @@ async function createForwardFixture(
         phase = "rollback-candidate-stopped";
       }
       else throw new Error("unexpected bootout target");
+      calls.push(expected.pid === oldProcess.pid ? "OLD_STOPPED_VERIFIED" : "CANDIDATE_STOPPED_VERIFIED");
+      if (expected.pid === oldProcess.pid && options.oldStopBarrierThrows) {
+        forwardFailed = true;
+        throw new Error("stop barrier observation failed");
+      }
+      if (expected.pid === oldProcess.pid && options.oldBootoutLeavesRuntime) {
+        forwardFailed = true;
+        return unproven("old runtime remained active after bootout request");
+      }
+      if (detachedDrainStarted) {
+        return unproven("stop barrier timed out while detached candidate generation was still draining");
+      }
+      if (expected.pid === candidateFirst.pid && options.candidateStopBarrierUnproven) {
+        forwardFailed = true;
+        return unproven("stop barrier timed out before expected runtime fully disappeared");
+      }
+      return known("stopped");
     },
     async bootoutInactiveCandidate(expectedArgv) {
       calls.push("INACTIVE_CANDIDATE_STOP_REQUESTED");
@@ -500,20 +553,44 @@ async function createForwardFixture(
       calls.push("ancestors");
       return known(options.selfHosted ? [oldProcess.pid, 1] : [1]);
     },
-    async waitStopped(expected) {
-      calls.push(expected.pid === oldProcess.pid ? "OLD_STOPPED_VERIFIED" : "CANDIDATE_STOPPED_VERIFIED");
-      if (expected.pid === oldProcess.pid && options.oldStopBarrierThrows) {
-        forwardFailed = true;
-        throw new Error("stop barrier observation failed");
-      }
-      if (expected.pid === oldProcess.pid && options.oldBootoutLeavesRuntime) {
-        forwardFailed = true;
-        return unproven("old runtime remained active after bootout request");
-      }
-      return known("stopped");
-    },
     async waitStable(expected) {
       calls.push(`stable:${expected.pid}`);
+      if (expected.pid === candidateFirst.pid && options.firstCandidateStabilityThrows) {
+        forwardFailed = true;
+        throw new Error("candidate stability observation threw unexpectedly");
+      }
+      if (
+        canonicalCommitted
+        && options.postCommitStabilityThrows
+        && (expected.pid === candidateReload.pid || expected.pid === candidateReplacement.pid)
+      ) {
+        forwardFailed = true;
+        throw new Error("post-commit stability observation threw unexpectedly");
+      }
+      if (
+        expected.pid === candidateReload.pid
+        && !canonicalCommitted
+        && options.reloadCandidateStabilityUnproven
+      ) {
+        forwardFailed = true;
+        return unproven("candidate reload stability observation failed");
+      }
+      if (
+        expected.pid === candidateReplacement.pid
+        && !canonicalCommitted
+        && options.preCommitReplacementStabilityThrows
+      ) {
+        forwardFailed = true;
+        throw new Error("pre-commit replacement stability observation threw");
+      }
+      if (
+        expected.pid === candidateReplacement.pid
+        && canonicalCommitted
+        && options.postCommitReplacementStabilityThrows
+      ) {
+        forwardFailed = true;
+        throw new Error("post-commit replacement stability observation threw");
+      }
       return known("stable");
     },
     async readFileSha256(path) {
@@ -713,13 +790,129 @@ rolloutTest("forward rollout preserves the lease when an adapter throws after ol
   assert.equal(fixture.getReleaseCalls(), 0);
 });
 
+rolloutTest("unexpected first-candidate verification exceptions enter recovery and release the lease", async (t) => {
+  const fixture = await createForwardFixture(t, { firstCandidateStabilityThrows: true });
+  const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+
+  assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
+  assert.equal(outcome.committed, false);
+  assert.equal(outcome.evidence.forwardPhase, "candidate_first_verify");
+  assert.equal(outcome.evidence.forwardCode, "PRECONDITION_FAILED");
+  assert.match(String(outcome.evidence.forwardReason), /stability observation threw unexpectedly/);
+  assert.equal(fixture.calls.includes("CANDIDATE_STOP_REQUESTED"), true);
+  assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), true);
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+rolloutTest("unexpected post-commit verification exceptions compensate the committed candidate", async (t) => {
+  const fixture = await createForwardFixture(t, { postCommitStabilityThrows: true });
+  const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+
+  assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
+  assert.equal(outcome.committed, true);
+  assert.equal(outcome.evidence.forwardPhase, "post_commit_verification");
+  assert.equal(outcome.evidence.forwardCode, "PRECONDITION_FAILED");
+  assert.match(String(outcome.evidence.forwardReason), /post-commit stability observation threw unexpectedly/);
+  assert.equal(fixture.calls.includes("ROLLBACK_RESTORED_CANONICAL"), true);
+  assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), true);
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+rolloutTest("reload stability failure keeps the newest ready candidate generation for recovery", async (t) => {
+  const fixture = await createForwardFixture(t, { reloadCandidateStabilityUnproven: true });
+  const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+
+  assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
+  assert.equal(outcome.committed, false);
+  assert.equal(outcome.evidence.forwardPhase, "candidate_reload");
+  assert.match(String(outcome.evidence.forwardReason), /reload stability observation failed/);
+  assert.ok(fixture.calls.includes("STOP_EXPECTED:202"), "latest reload generation must be stopped");
+  assert.ok(
+    fixture.calls.indexOf("STOP_EXPECTED:202") < fixture.calls.indexOf("ROLLBACK_BOOTSTRAP_OLD"),
+    "old bootstrap must occur only after latest reload generation stop",
+  );
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+rolloutTest("pre-commit replacement failure preserves the replacement generation for recovery", async (t) => {
+  const fixture = await createForwardFixture(t, {
+    keepAliveReplacementBeforeCommit: true,
+    preCommitReplacementStabilityThrows: true,
+  });
+  const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+
+  assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
+  assert.equal(outcome.committed, false);
+  assert.equal(outcome.evidence.forwardPhase, "pre_commit_revalidation");
+  assert.match(String(outcome.evidence.forwardReason), /pre-commit replacement stability observation threw/);
+  assert.ok(fixture.calls.includes("STOP_EXPECTED:203"), "pre-commit replacement generation must be stopped");
+  assert.ok(
+    fixture.calls.indexOf("STOP_EXPECTED:203") < fixture.calls.indexOf("ROLLBACK_BOOTSTRAP_OLD"),
+    "old bootstrap must wait for pre-commit replacement generation stop",
+  );
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+rolloutTest("post-commit replacement failure preserves the replacement generation for compensation", async (t) => {
+  const fixture = await createForwardFixture(t, {
+    postCommitReplacementBeforeVerify: true,
+    postCommitReplacementStabilityThrows: true,
+  });
+  const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+
+  assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
+  assert.equal(outcome.committed, true);
+  assert.equal(outcome.evidence.forwardPhase, "post_commit_verification");
+  assert.match(String(outcome.evidence.forwardReason), /post-commit replacement stability observation threw/);
+  assert.ok(fixture.calls.includes("STOP_EXPECTED:203"), "post-commit replacement generation must be stopped");
+  assert.ok(
+    fixture.calls.indexOf("STOP_EXPECTED:203") < fixture.calls.indexOf("ROLLBACK_BOOTSTRAP_OLD"),
+    "old bootstrap must wait for post-commit replacement generation stop",
+  );
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+rolloutTest("recovery proves a detached known candidate generation is gone before bootstrapping old", async (t) => {
+  const fixture = await createForwardFixture(t, { candidateDetachedDrainBeforeRecovery: true });
+  const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+
+  assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
+  assert.equal(outcome.committed, false);
+  assert.equal(outcome.evidence.forwardPhase, "candidate_controlled_stop");
+  assert.match(String(outcome.evidence.forwardReason), /detached candidate generation was still draining/);
+  assert.ok(fixture.calls.filter((call) => call === "CANDIDATE_STOP_REQUESTED").length >= 2);
+  assert.ok(fixture.calls.includes("process-generation:201"));
+  assert.ok(
+    fixture.calls.lastIndexOf("CANDIDATE_STOPPED_VERIFIED")
+      < fixture.calls.indexOf("ROLLBACK_BOOTSTRAP_OLD"),
+  );
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
 rolloutTest("pre-commit recovery reuses an exact old runtime that survived the stop request", async (t) => {
   const fixture = await createForwardFixture(t, { oldBootoutLeavesRuntime: true });
   const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
 
   assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
   assert.equal(outcome.committed, false);
+  assert.equal(outcome.evidence.forwardPhase, "old_stop");
+  assert.equal(outcome.evidence.forwardCode, "LIVE_STATE_CAS_MISMATCH");
+  assert.match(String(outcome.evidence.forwardReason), /old runtime remained active/);
   assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), false);
+  assert.equal(fixture.getReleaseCalls(), 1);
+});
+
+rolloutTest("rollback outcome preserves the original candidate controlled-stop failure evidence", async (t) => {
+  const fixture = await createForwardFixture(t, { candidateStopBarrierUnproven: true });
+  const outcome = await runMacosLaunchdRollout(fixture.request, fixture.adapters);
+
+  assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
+  assert.equal(outcome.committed, false);
+  assert.equal(outcome.controlledReload, "FAIL");
+  assert.equal(outcome.evidence.forwardPhase, "candidate_controlled_stop");
+  assert.equal(outcome.evidence.forwardCode, "PRECONDITION_FAILED");
+  assert.match(String(outcome.evidence.forwardReason), /stop barrier timed out/);
+  assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), true);
   assert.equal(fixture.getReleaseCalls(), 1);
 });
 
@@ -729,6 +922,9 @@ rolloutTest("pre-commit recovery stops an owned candidate then bootstraps the un
 
   assert.equal(outcome.code, "SWITCH_FAILED_ROLLBACK_OK");
   assert.equal(outcome.committed, false);
+  assert.equal(outcome.evidence.forwardPhase, "candidate_first_verify");
+  assert.equal(outcome.evidence.forwardCode, "PRECONDITION_FAILED");
+  assert.match(String(outcome.evidence.forwardReason), /runtime health is not ready/);
   assert.equal(fixture.calls.includes("CANDIDATE_STOP_REQUESTED"), true);
   assert.equal(fixture.calls.includes("ROLLBACK_BOOTSTRAP_OLD"), true);
   assert.equal(fixture.calls.includes("ready:old-restored"), true);

@@ -36,6 +36,7 @@ import {
   type RolloutLockOwnerRecord,
 } from "./macos-launchd-rollout-lock.js";
 import { resolveCandidateSlotRoot } from "./macos-launchd-rollout-manifest.js";
+import { MCP_SESSION_DRAIN_TIMEOUT_MS } from "./mcp-sessions.js";
 import type {
   CanonicalPlistSnapshot,
   FileIdentity,
@@ -59,7 +60,7 @@ const DEFAULT_LABEL = "com.ethan.devspace";
 const DEFAULT_PORT = 7676;
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_HEALTH_PATH = "/healthz";
-const DEFAULT_STOP_TIMEOUT_MS = 5_000;
+export const ROLLOUT_STOP_TIMEOUT_MS = MCP_SESSION_DRAIN_TIMEOUT_MS + 5_000;
 const DEFAULT_STOP_POLL_MS = 50;
 const DEFAULT_STABILITY_OBSERVATION_MS = 250;
 const DEFAULT_HEALTH_TIMEOUT_MS = 2_000;
@@ -86,9 +87,9 @@ export interface DurabilityPrimitives {
 }
 
 export interface StopBarrierProbe {
-  observeExpectedProcess(): Promise<ObservedState<"alive" | "gone" | "reused">>;
-  observeLaunchd(): Promise<ObservedState<LaunchdObservation>>;
-  observeListener(): Promise<ObservedState<ListenerObservation>>;
+  observeExpectedProcess(signal?: AbortSignal): Promise<ObservedState<"alive" | "gone" | "reused">>;
+  observeLaunchd(signal?: AbortSignal): Promise<ObservedState<LaunchdObservation>>;
+  observeListener(signal?: AbortSignal): Promise<ObservedState<ListenerObservation>>;
 }
 
 export interface RuntimeReadinessProbe {
@@ -461,8 +462,7 @@ export async function qualifyDarwinRolloutEnvironment(): Promise<DarwinQualifica
     },
     async verifyStopBarrier() {
       if (!qualifiedProcess) throw new Error("qualification process identity is unavailable");
-      await adapters.bootoutExpected(qualifiedProcess);
-      const stopped = await adapters.waitStopped(qualifiedProcess);
+      const stopped = await adapters.stopExpected(qualifiedProcess);
       if (stopped.kind !== "known" || stopped.value !== "stopped") {
         throw new Error(stopped.kind === "unproven" ? stopped.reason : "qualification stop barrier failed");
       }
@@ -610,6 +610,55 @@ export function parseParentPid(output: string): ObservedState<number> {
     : { kind: "unproven", reason: "parent PID is outside the supported range" };
 }
 
+function parsePsStartTimestamp(output: string): ObservedState<string> {
+  const parts = output.trim().split(/\s+/);
+  if (parts.length !== 5) {
+    return { kind: "unproven", reason: "process start identity is malformed" };
+  }
+  const [weekday, month, dayText, timeText, yearText] = parts as [string, string, string, string, string];
+  const weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] as const;
+  const weekdayIndex = weekdays.indexOf(weekday as (typeof weekdays)[number]);
+  const monthIndex = months.indexOf(month as (typeof months)[number]);
+  const timeMatch = /^(\d{2}):(\d{2}):(\d{2})$/.exec(timeText);
+  if (
+    weekdayIndex < 0
+    || monthIndex < 0
+    || !/^\d{1,2}$/.test(dayText)
+    || !/^\d{4}$/.test(yearText)
+    || !timeMatch
+  ) {
+    return { kind: "unproven", reason: "process start identity is malformed" };
+  }
+  const day = Number(dayText);
+  const year = Number(yearText);
+  const hour = Number(timeMatch[1]);
+  const minute = Number(timeMatch[2]);
+  const second = Number(timeMatch[3]);
+  if (
+    day < 1
+    || day > 31
+    || hour > 23
+    || minute > 59
+    || second > 59
+  ) {
+    return { kind: "unproven", reason: "process start identity is malformed" };
+  }
+  const date = new Date(Date.UTC(year, monthIndex, day));
+  if (
+    date.getUTCFullYear() !== year
+    || date.getUTCMonth() !== monthIndex
+    || date.getUTCDate() !== day
+    || date.getUTCDay() !== weekdayIndex
+  ) {
+    return { kind: "unproven", reason: "process start identity is malformed" };
+  }
+  return {
+    kind: "known",
+    value: `${weekday} ${month} ${day} ${timeText} ${yearText}`,
+  };
+}
+
 export async function buildProcessIdentityFromObservations(input: {
   pid: number;
   launchd: LaunchdObservation;
@@ -633,8 +682,8 @@ export async function buildProcessIdentityFromObservations(input: {
   if (entrypointIndexes.length !== 1 || entrypointIndexes[0] !== 1 || argv.at(-1) !== "serve") {
     return { kind: "unproven", reason: "launchd arguments do not match the V1 DevSpace topology" };
   }
-  const psStart = input.psStartOutput.trim();
-  if (!psStart) return { kind: "unproven", reason: "process start identity is missing" };
+  const psStart = parsePsStartTimestamp(input.psStartOutput);
+  if (psStart.kind === "unproven") return psStart;
   const psCommand = parsePsCommand(input.psCommandOutput);
   if (psCommand.kind === "unproven") return psCommand;
   const textPaths = parseTxtLsof(input.lsofTextOutput);
@@ -667,7 +716,7 @@ export async function buildProcessIdentityFromObservations(input: {
       kind: "known",
       value: {
         pid: input.pid,
-        processStartIdentity: `${input.launchd.runCount}:${psStart}`,
+        processStartIdentity: `${input.launchd.runCount}:${psStart.value}`,
         executableRealpath,
         normalizedArgv: [...argv],
         entrypointRealpath,
@@ -823,7 +872,9 @@ export async function waitForStoppedState(
   expected: ProcessIdentity,
   probe: StopBarrierProbe,
   options: {
-    timeoutMs: number;
+    timeoutMs?: number;
+    deadline?: number;
+    signal?: AbortSignal;
     pollIntervalMs: number;
     now?: () => number;
     sleep?: (ms: number) => Promise<void>;
@@ -831,36 +882,79 @@ export async function waitForStoppedState(
 ): Promise<ObservedState<"stopped">> {
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? delay;
-  const deadline = now() + options.timeoutMs;
-  while (true) {
-    const [processState, launchd, listener] = await Promise.all([
-      probe.observeExpectedProcess(),
-      probe.observeLaunchd(),
-      probe.observeListener(),
-    ]);
-    if (processState.kind === "unproven") return processState;
-    if (launchd.kind === "unproven") return launchd;
-    if (listener.kind === "unproven") return listener;
+  if (options.deadline === undefined && options.timeoutMs === undefined) {
+    throw new Error("stop barrier requires a timeout or absolute deadline");
+  }
+  const deadline = options.deadline ?? (now() + options.timeoutMs!);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(0, deadline - now()));
+  const signal = options.signal
+    ? AbortSignal.any([options.signal, controller.signal])
+    : controller.signal;
+  const expired = () => signal.aborted || now() >= deadline;
+  const timedOut = (): ObservedState<"stopped"> => ({
+    kind: "unproven",
+    reason: "stop barrier timed out before expected runtime fully disappeared",
+  });
 
-    if (launchd.value.loaded) {
-      if (launchd.value.pid !== expected.pid) {
+  try {
+    while (true) {
+      const processStep = await awaitDeadlineStep(
+        (stepSignal) => probe.observeExpectedProcess(stepSignal),
+        signal,
+      );
+      if (processStep.timedOut || expired()) return timedOut();
+      const processState = processStep.value;
+      if (processState.kind === "unproven") return processState;
+
+      const launchdStep = await awaitDeadlineStep(
+        (stepSignal) => probe.observeLaunchd(stepSignal),
+        signal,
+      );
+      if (launchdStep.timedOut || expired()) return timedOut();
+      const launchd = launchdStep.value;
+      if (launchd.kind === "unproven") return launchd;
+      if (processState.value === "reused" && launchd.value.loaded) {
+        return { kind: "unproven", reason: "expected PID was reused while launchd still reported the service loaded" };
+      }
+      if (launchd.value.loaded && launchd.value.pid !== expected.pid) {
         return { kind: "unproven", reason: "incompatible same-label runtime appeared during stop barrier" };
       }
-    }
-    if (listener.value.state === "owned" && listener.value.ownerPid !== expected.pid) {
-      return { kind: "unproven", reason: "unrelated listener owner appeared during stop barrier" };
-    }
 
-    const processGone = processState.value !== "alive";
-    const serviceGone = !launchd.value.loaded;
-    const listenerGone = listener.value.state === "unowned";
-    if (processGone && serviceGone && listenerGone) {
-      return { kind: "known", value: "stopped" };
+      const listenerStep = await awaitDeadlineStep(
+        (stepSignal) => probe.observeListener(stepSignal),
+        signal,
+      );
+      if (listenerStep.timedOut || expired()) return timedOut();
+      const listener = listenerStep.value;
+      if (listener.kind === "unproven") return listener;
+      if (
+        processState.value === "reused"
+        && listener.value.state === "owned"
+        && listener.value.ownerPid === expected.pid
+      ) {
+        return { kind: "unproven", reason: "reused PID owns the listener during stop barrier" };
+      }
+      if (listener.value.state === "owned" && listener.value.ownerPid !== expected.pid) {
+        return { kind: "unproven", reason: "unrelated listener owner appeared during stop barrier" };
+      }
+
+      const processGone = processState.value !== "alive";
+      const serviceGone = !launchd.value.loaded;
+      const listenerGone = listener.value.state === "unowned";
+      if (processGone && serviceGone && listenerGone) {
+        return expired() ? timedOut() : { kind: "known", value: "stopped" };
+      }
+
+      const remainingMs = Math.max(0, deadline - now());
+      const sleepStep = await awaitDeadlineStep(
+        () => sleep(Math.min(options.pollIntervalMs, remainingMs)),
+        signal,
+      );
+      if (sleepStep.timedOut || expired()) return timedOut();
     }
-    if (now() >= deadline) {
-      return { kind: "unproven", reason: "stop barrier timed out before expected runtime fully disappeared" };
-    }
-    await sleep(options.pollIntervalMs);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -1114,7 +1208,7 @@ export function createDarwinRolloutAdapters(
   const durability = options.durability ?? defaultDurabilityPrimitives;
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? delay;
-  const stopTimeoutMs = options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
+  const stopTimeoutMs = options.stopTimeoutMs ?? ROLLOUT_STOP_TIMEOUT_MS;
   const stopPollIntervalMs = options.stopPollIntervalMs ?? DEFAULT_STOP_POLL_MS;
   const stabilityObservationMs = options.stabilityObservationMs ?? DEFAULT_STABILITY_OBSERVATION_MS;
   const healthTimeoutMs = options.healthTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS;
@@ -1167,6 +1261,36 @@ export function createDarwinRolloutAdapters(
       psCommandOutput: command.stdout,
       lsofTextOutput: executable.stdout,
     });
+  };
+
+  const observeExpectedProcess = async (
+    expected: ProcessIdentity,
+    signal?: AbortSignal,
+  ): Promise<ObservedState<"alive" | "gone" | "reused">> => {
+    const result = await runner.run(
+      "/bin/ps",
+      ["-p", String(expected.pid), "-o", "lstart="],
+      { signal },
+    );
+    const output = result.stdout.trim();
+    if (result.exitCode === 1 && !output) {
+      return { kind: "known", value: "gone" };
+    }
+    if (result.exitCode !== 0) {
+      return { kind: "unproven", reason: `ps process-generation probe exited with code ${result.exitCode}` };
+    }
+    if (!output) {
+      return { kind: "unproven", reason: "ps process-generation probe returned no start identity" };
+    }
+    const observedStart = parsePsStartTimestamp(output);
+    if (observedStart.kind === "unproven") return observedStart;
+    const expectedStart = parsePsStartTimestamp(startIdentityTimestamp(expected.processStartIdentity));
+    if (expectedStart.kind === "unproven") {
+      return { kind: "unproven", reason: "expected process start identity is malformed" };
+    }
+    return observedStart.value === expectedStart.value
+      ? { kind: "known", value: "alive" }
+      : { kind: "known", value: "reused" };
   };
 
   const checkHealth = async (signal?: AbortSignal): Promise<ObservedState<"healthy" | "unhealthy">> => {
@@ -1324,6 +1448,7 @@ export function createDarwinRolloutAdapters(
 
     observeLaunchd,
     observeProcess,
+    observeExpectedProcess,
     observeListener,
 
     async checkHealth() {
@@ -1344,13 +1469,97 @@ export function createDarwinRolloutAdapters(
       });
     },
 
-    async bootoutExpected(expected) {
-      const observed = await observeProcess(expected.pid);
-      if (observed.kind !== "known" || !sameProcessIdentity(observed.value, expected)) {
-        throw new Error("refusing bootout because expected process ownership is not proven");
+    async stopExpected(expected) {
+      const deadline = now() + stopTimeoutMs;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), Math.max(0, deadline - now()));
+      const expired = () => controller.signal.aborted || now() >= deadline;
+      const timedOut = (): ObservedState<"stopped"> => ({
+        kind: "unproven",
+        reason: "stop deadline expired before expected runtime fully disappeared",
+      });
+      try {
+        const launchdStep = await awaitDeadlineStep(
+          (signal) => observeLaunchd(signal),
+          controller.signal,
+        );
+        if (launchdStep.timedOut || expired()) return timedOut();
+        const launchd = launchdStep.value;
+        if (launchd.kind === "unproven") return launchd;
+
+        let generation: "alive" | "gone" | "reused";
+        let shouldBootout = false;
+        if (launchd.value.loaded) {
+          if (launchd.value.pid !== expected.pid) {
+            return { kind: "unproven", reason: "refusing stop because launchd no longer owns the expected PID" };
+          }
+          const observedStep = await awaitDeadlineStep(
+            (signal) => observeProcess(expected.pid, signal),
+            controller.signal,
+          );
+          if (observedStep.timedOut || expired()) return timedOut();
+          const observed = observedStep.value;
+          if (observed.kind !== "known" || !sameProcessIdentity(observed.value, expected)) {
+            return {
+              kind: "unproven",
+              reason: observed.kind === "unproven"
+                ? observed.reason
+                : "refusing stop because expected process ownership is not proven",
+            };
+          }
+          generation = "alive";
+          shouldBootout = true;
+        } else {
+          const generationStep = await awaitDeadlineStep(
+            (signal) => observeExpectedProcess(expected, signal),
+            controller.signal,
+          );
+          if (generationStep.timedOut || expired()) return timedOut();
+          const generationState = generationStep.value;
+          if (generationState.kind === "unproven") return generationState;
+          generation = generationState.value;
+        }
+
+        const listenerStep = await awaitDeadlineStep(
+          (signal) => observeListener(signal),
+          controller.signal,
+        );
+        if (listenerStep.timedOut || expired()) return timedOut();
+        const listener = listenerStep.value;
+        if (listener.kind === "unproven") return listener;
+        if (
+          listener.value.state === "owned"
+          && (generation !== "alive" || listener.value.ownerPid !== expected.pid)
+        ) {
+          return { kind: "unproven", reason: "unrelated listener owner appeared before expected runtime stop" };
+        }
+
+        if (shouldBootout) {
+          const bootoutStep = await awaitDeadlineStep(
+            (signal) => runner.run("/bin/launchctl", ["bootout", serviceTarget], { signal }),
+            controller.signal,
+          );
+          if (bootoutStep.timedOut || expired()) return timedOut();
+          if (bootoutStep.value.exitCode !== 0) {
+            return { kind: "unproven", reason: `launchctl bootout failed with code ${bootoutStep.value.exitCode}` };
+          }
+        }
+
+        const stopped = await waitForStoppedState(expected, {
+          observeExpectedProcess: (signal) => observeExpectedProcess(expected, signal),
+          observeLaunchd,
+          observeListener,
+        }, {
+          deadline,
+          signal: controller.signal,
+          pollIntervalMs: stopPollIntervalMs,
+          now,
+          sleep,
+        });
+        return stopped.kind === "known" && expired() ? timedOut() : stopped;
+      } finally {
+        clearTimeout(timer);
       }
-      const result = await runner.run("/bin/launchctl", ["bootout", serviceTarget]);
-      if (result.exitCode !== 0) throw new Error(`launchctl bootout failed with code ${result.exitCode}`);
     },
 
     async bootoutInactiveCandidate(expectedArgv) {
@@ -1442,26 +1651,6 @@ export function createDarwinRolloutAdapters(
         current = parent.value;
       }
       return { kind: "unproven", reason: "ancestor process chain exceeded depth limit" };
-    },
-
-    waitStopped(expected) {
-      const expectedPsStart = startIdentityTimestamp(expected.processStartIdentity);
-      return waitForStoppedState(expected, {
-        async observeExpectedProcess() {
-          const result = await runner.run("/bin/ps", ["-p", String(expected.pid), "-o", "lstart="]);
-          if (result.exitCode !== 0 || !result.stdout.trim()) return { kind: "known", value: "gone" };
-          return result.stdout.trim() === expectedPsStart
-            ? { kind: "known", value: "alive" }
-            : { kind: "known", value: "reused" };
-        },
-        observeLaunchd,
-        observeListener,
-      }, {
-        timeoutMs: stopTimeoutMs,
-        pollIntervalMs: stopPollIntervalMs,
-        now,
-        sleep,
-      });
     },
 
     waitStable(expected) {
