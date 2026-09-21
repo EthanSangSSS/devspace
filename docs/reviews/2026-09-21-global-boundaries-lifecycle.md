@@ -41,6 +41,13 @@ validation receipt immediately before commit. This documentation-only update
 does not change that tested runtime tree; its own exact remote HEAD still
 requires CI and Secret Scan before merge.
 
+Cross-platform CI subsequently found that an unavailable configured Windows
+volume produced ENOENT instead of a denied grant. The root policy now ignores
+only ENOENT while resolving configured grants; target-path failures and other
+observation errors still propagate. A disposable dangling-grant regression
+reproduces the same branch on macOS. The original Windows roots assertion is
+retained and must pass on the next exact-head CI.
+
 `scripts/devspace-shutdown-canary.mjs` runs the actual built CLI in a private
 fixture, with synthetic test authentication and an allocated non-7676 loopback
 port. It never loads production configuration or starts a delegated agent.

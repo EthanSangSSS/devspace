@@ -22,6 +22,9 @@ test("file tools reject physical escapes and dangling parent links", { skip: pro
   await symlink(join(outside, "missing"), join(workspace, "dangling"));
   await symlink(workspace, join(root, "alias"));
   const context = { cwd: workspace, root: workspace };
+  const unavailableRoot = join(workspace, "dangling");
+  assert.throws(() => assertAllowedPath(workspace, [unavailableRoot]), /Path is outside allowed roots/);
+  assert.equal(assertAllowedPath(workspace, [unavailableRoot, workspace]), workspace);
   assert.throws(() => assertAllowedPath(join(workspace, "escape", "sentinel"), [workspace]));
   await assert.rejects(readFileTool({ path: "escape/sentinel" }, context));
   await assert.rejects(writeFileTool({ path: "escape/new", content: "bad" }, context));
