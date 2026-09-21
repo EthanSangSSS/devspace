@@ -204,18 +204,20 @@ async function resolveConfinedPath(root: string, input: string): Promise<string>
   let existing = target;
   while (true) {
     try {
-      const resolved = await realpath(existing);
-      if (!isInside(rootPath, resolved)) {
-        throw patchError(`path resolves outside the workspace: ${input}`);
-      }
-      break;
+      await lstat(existing);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "ENOENT") throw error;
       const parent = dirname(existing);
       if (parent === existing) throw error;
       existing = parent;
+      continue;
     }
+    const resolved = await realpath(existing);
+    if (!isInside(rootPath, resolved)) {
+      throw patchError(`path resolves outside the workspace: ${input}`);
+    }
+    break;
   }
 
   return target;

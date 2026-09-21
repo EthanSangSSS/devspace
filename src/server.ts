@@ -49,7 +49,7 @@ import {
 import { ProcessSessionManager } from "./process-sessions.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { openAiConversationScopeId } from "./request-meta.js";
-import { shutdownHttpServer } from "./server-shutdown.js";
+import { shutdownHttpServer, trackHttpConnections } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
@@ -1304,12 +1304,22 @@ export function createServer(
       closePromise ??= (async () => {
         clearInterval(sessionCleanupTimer);
         clearInterval(runtimeSnapshotTimer);
-        await transports.closeAll({
-          drainTimeoutMs: MCP_SESSION_DRAIN_TIMEOUT_MS,
-        });
-        processSessions.shutdown();
-        oauthProvider.close();
-        workspaceStore.close?.();
+        let transportResults: Awaited<ReturnType<typeof transports.closeAll>> = [];
+        try {
+          transportResults = await transports.closeAll({
+            drainTimeoutMs: MCP_SESSION_DRAIN_TIMEOUT_MS,
+          });
+        } finally {
+          try {
+            await processSessions.shutdown();
+          } finally {
+            try { oauthProvider.close(); }
+            finally { workspaceStore.close?.(); }
+          }
+        }
+        if (transportResults.some((result) => result.error)) {
+          throw new Error("One or more MCP transport closures could not be proven");
+        }
       })();
       return closePromise;
     },
@@ -1345,6 +1355,7 @@ if (await isMainModule()) {
     console.log(`subagent providers: ${formatLocalAgentProviderStatusSummary(localAgentProviders)}`);
   });
 
+  trackHttpConnections(httpServer);
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;

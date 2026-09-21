@@ -12,7 +12,8 @@ import {
   ensureLocalAgentDaemonSecret,
 } from "./local-agent-daemon-lifecycle.js";
 
-const root = await mkdtemp(join(tmpdir(), "devspace-agentd-lifecycle-test-"));
+// Leave room for the socket basename in macOS's default temporary directory.
+const root = await mkdtemp(join(tmpdir(), "dsal-"));
 try {
   const paths = localAgentDaemonPaths(join(root, "state"));
   ensureLocalAgentDaemonStateDir(paths.stateDir);

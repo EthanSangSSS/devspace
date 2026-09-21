@@ -81,6 +81,7 @@ export interface McpSessionRegistryOptions {
   maxSessions?: number;
   waitForTimeout?: (ms: number) => Promise<void>;
   onEvent?: (event: McpSessionLifecycleEvent) => void;
+  transportCloseTimeoutMs?: number;
 }
 
 export const MCP_SESSION_DRAIN_TIMEOUT_MS = 35_000;
@@ -91,7 +92,9 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   private readonly leases = new Map<number, string>();
   private readonly now: () => number;
   private readonly maxSessions: number;
-  private readonly waitForTimeout: (ms: number) => Promise<void>;
+  private readonly waitForTimeout?: (ms: number) => Promise<void>;
+  private readonly transportCloseTimeoutMs: number;
+  private closePromise?: Promise<McpSessionCloseResult[]>;
   private readonly onEvent?: (event: McpSessionLifecycleEvent) => void;
   private readonly drainWaiters = new Set<() => void>();
   private state: McpSessionRegistryState = "running";
@@ -106,9 +109,11 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   constructor(options: McpSessionRegistryOptions = {}) {
     this.now = options.now ?? Date.now;
     this.maxSessions = options.maxSessions ?? 64;
-    this.waitForTimeout =
-      options.waitForTimeout ??
-      ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    this.waitForTimeout = options.waitForTimeout;
+    this.transportCloseTimeoutMs = options.transportCloseTimeoutMs ?? 1_000;
+    if (!Number.isFinite(this.transportCloseTimeoutMs) || this.transportCloseTimeoutMs <= 0) {
+      throw new Error("MCP transport close timeout must be positive");
+    }
     this.onEvent = options.onEvent;
     if (!Number.isInteger(this.maxSessions) || this.maxSessions < 1) {
       throw new Error("MCP session max must be a positive integer");
@@ -305,19 +310,38 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   async closeAll(
     options: { drainTimeoutMs?: number } = {},
   ): Promise<McpSessionCloseResult[]> {
+    if (this.closePromise) return this.closePromise;
     if (this.state === "closed") return [];
+    const drainTimeoutMs = options.drainTimeoutMs ?? MCP_SESSION_DRAIN_TIMEOUT_MS;
+    if (!Number.isFinite(drainTimeoutMs) || drainTimeoutMs < 0) throw new Error("MCP drain timeout must be non-negative");
     if (this.state === "running") {
       this.state = "closing";
       this.reservations.clear();
     }
 
-    const drainTimeoutMs =
-      options.drainTimeoutMs ?? MCP_SESSION_DRAIN_TIMEOUT_MS;
+    this.closePromise = this.closeAllAfterFence(drainTimeoutMs);
+    return this.closePromise;
+  }
+
+  private async closeAllAfterFence(drainTimeoutMs: number): Promise<McpSessionCloseResult[]> {
     if (this.activeCount() > 0) {
-      await Promise.race([
-        this.waitForActiveDrain(),
-        this.waitForTimeout(drainTimeoutMs),
-      ]);
+      let timer: NodeJS.Timeout | undefined;
+      let drainWaiter: (() => void) | undefined;
+      const drained = new Promise<void>((resolve) => {
+        drainWaiter = resolve;
+        this.drainWaiters.add(resolve);
+      });
+      try {
+        await Promise.race([
+          drained,
+          this.waitForTimeout?.(drainTimeoutMs) ?? new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, drainTimeoutMs);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+        if (drainWaiter) this.drainWaiters.delete(drainWaiter);
+      }
     }
 
     const detached: DetachedSession<TTransport>[] = [];
@@ -381,6 +405,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     if (!entry || entry.disposing) return undefined;
     entry.disposing = true;
     this.sessions.delete(sessionId);
+    this.notifyDrainWaitersIfIdle();
     for (const [leaseToken, leasedSessionId] of this.leases) {
       if (leasedSessionId === sessionId) this.leases.delete(leaseToken);
     }
@@ -396,7 +421,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     context: McpSessionOperationContext = {},
   ): Promise<McpSessionCloseResult> {
     try {
-      await detached.transport.close();
+      await this.closeTransport(detached.transport);
       this.closedTotal += 1;
       this.emit({
         type: "closed",
@@ -422,7 +447,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     context: McpSessionOperationContext,
   ): Promise<void> {
     try {
-      await transport.close();
+      await this.closeTransport(transport);
     } catch {
       this.closeErrorTotal += 1;
       this.emit({
@@ -436,5 +461,19 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     event: Omit<McpSessionLifecycleEvent, "snapshot">,
   ): void {
     this.onEvent?.({ ...event, snapshot: this.snapshot() });
+  }
+
+  private async closeTransport(transport: TTransport): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        transport.close(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("MCP transport close deadline exceeded; closure unproven")), this.transportCloseTimeoutMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }

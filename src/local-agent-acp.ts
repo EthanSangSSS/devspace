@@ -10,6 +10,7 @@ import {
   isProgrammerDefect,
 } from "./local-agent-errors.js";
 import { terminateProcessTree } from "./process-platform.js";
+import { gitEnvironment } from "./git-environment.js";
 import {
   GrokPromptCompletionRegistry,
   GROK_DEFAULT_MODEL,
@@ -450,7 +451,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
         const args = acpCommandArgs(this.provider, context, this.env);
         const child = spawn(command, args, {
           cwd: resolve(context.workspaceRoot),
-          env: this.env,
+          env: gitEnvironment(this.env),
           stdio: ["pipe", "pipe", "pipe"],
           detached: process.platform !== "win32",
           windowsHide: true,
