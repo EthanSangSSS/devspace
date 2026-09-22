@@ -35,20 +35,25 @@ export function logEvent(
 ): void {
   if (!shouldLog(config, level)) return;
 
-  const entry = {
-    ts: new Date().toISOString(),
-    level,
-    event,
-    ...fields,
-  };
+  try {
+    const entry = {
+      ts: new Date().toISOString(),
+      level,
+      event,
+      ...fields,
+    };
 
-  const line = config.format === "pretty" ? formatPretty(entry) : JSON.stringify(entry);
-  if (level === "error") {
-    console.error(line);
-  } else if (level === "warn") {
-    console.warn(line);
-  } else {
-    console.log(line);
+    const line = config.format === "pretty" ? formatPretty(entry) : JSON.stringify(entry);
+    if (level === "error") {
+      console.error(line);
+    } else if (level === "warn") {
+      console.warn(line);
+    } else {
+      console.log(line);
+    }
+  } catch {
+    // Logging is best effort; a failed sink must not fail or repeat an operation.
+    // Do not log the logging error (it may contain the original payload).
   }
 }
 
