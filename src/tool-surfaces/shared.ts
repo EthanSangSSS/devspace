@@ -1,5 +1,6 @@
 import * as z from "zod/v4";
-import { logEvent, commandPreview } from "../logger.js";
+import { logEvent } from "../logger.js";
+import { toolLifecycleObserved } from "../mcp-observability.js";
 import type { ServerConfig } from "../config.js";
 import {
   WORKSPACE_APP_URI,
@@ -34,15 +35,16 @@ export function workspaceAppDescriptorMeta(config: ServerConfig): ToolWidgetDesc
 }
 
 export function logToolCall(config: ServerConfig, fields: ToolLogFields): void {
-  if (!config.logging.toolCalls) return;
+  if (!config.logging.toolCalls || toolLifecycleObserved()) return;
 
-  const { command, ...safeFields } = fields;
+  // Legacy surfaces keep a completion record, but never emit caller-controlled
+  // paths, command text, error messages or arbitrary extra properties.
   logEvent(config.logging, fields.success ? "info" : "warn", "tool_call", {
-    ...safeFields,
-    commandPreview:
-      config.logging.shellCommands && command
-        ? commandPreview(command)
-        : undefined,
+    tool: ["open_workspace", "read", "apply_patch", "exec_command", "write_stdin",
+      "show_changes", "get_agy_runtime", "delegate_to_agy", "write", "edit", "bash"]
+      .includes(fields.tool) ? fields.tool : "other",
+    success: fields.success === true,
+    durationMs: Number.isFinite(fields.durationMs) ? fields.durationMs : undefined,
   });
 }
 
@@ -65,7 +67,6 @@ export async function runLoggedToolOperation<T>(
       ...fields,
       success: false,
       durationMs: Math.round(performance.now() - startedAt),
-      error: error instanceof Error ? error.message : String(error),
     });
     throw error;
   }
@@ -80,23 +81,16 @@ export function contentText(content: ToolContent[]): string {
     .join("\n");
 }
 
-function toolErrorPreview(content: ToolContent[]): string | undefined {
-  const text = contentText(content).replace(/\s+/g, " ").trim();
-  if (!text) return undefined;
-  return text.length > 240 ? `${text.slice(0, 237)}...` : text;
-}
-
 export function logFailedToolResponse(
   config: ServerConfig,
   fields: Omit<ToolLogFields, "success" | "durationMs" | "error">,
-  content: ToolContent[],
+  _content: ToolContent[],
   startedAt: number,
 ): void {
   logToolCall(config, {
     ...fields,
     success: false,
     durationMs: Math.round(performance.now() - startedAt),
-    error: toolErrorPreview(content),
   });
 }
 
