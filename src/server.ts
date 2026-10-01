@@ -475,7 +475,7 @@ function registerAgyDelegationTools(
           profile: input.profile,
           task: input.task,
           dryRun,
-          repositoryRoot: workspace.root,
+          repositoryRoot: workspace.canonicalRoot,
           expectedSourceHead: input.expected_source_head,
           allowedReadPaths: input.allowed_read_paths,
           ...(input.validation_commands
@@ -895,8 +895,8 @@ export function createMcpServer(
       const response = await readFileTool(
         { ...input, path: readPath.absolutePath },
         {
-          cwd: workspace.root,
-          root: workspace.root,
+          cwd: workspace.canonicalRoot,
+          root: workspace.canonicalRoot,
           readRoots: readPath.readRoots,
         },
       );

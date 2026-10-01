@@ -112,7 +112,7 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
         startedAt,
         async () => {
           const workspace = workspaces.getWorkspace(workspaceId);
-          return applyPatch(workspace.root, patch);
+          return applyPatch(workspace.canonicalRoot, patch);
         },
       );
       const paths = applied.files.map((file) => file.path).join(", ");
@@ -221,7 +221,7 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
             workspaceId,
             command: cmd,
             cwd,
-            workspaceRoot: workspace.root,
+            workspaceRoot: workspace.canonicalRoot,
             tty,
             columns,
             rows,

@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import type { Stats } from "node:fs";
+import { realpathSync, type Stats } from "node:fs";
 import type {
   WorkspaceConversationBinding,
   WorkspaceMode,
@@ -15,6 +15,7 @@ import {
   assertAllowedPath,
   isPathInsideRoot,
   resolveAllowedPath,
+  resolvePhysicalPath,
 } from "./roots.js";
 import {
   loadWorkspaceSkills,
@@ -49,6 +50,7 @@ export interface WorkspaceWorktree {
 export interface Workspace {
   id: string;
   root: string;
+  canonicalRoot: string;
   mode: WorkspaceMode;
   sourceRoot?: string;
   worktree?: WorkspaceWorktree;
@@ -248,6 +250,7 @@ export class WorkspaceRegistry {
       // A cached ID is not a permanent filesystem authorization. Recheck the
       // configured roots before using a checkout that may have been replaced.
       this.assertWorkspaceRootAllowed(workspace.root, workspace.mode, workspace.sourceRoot);
+      this.assertWorkspaceRootUnchanged(workspace);
       this.store?.touchSession(workspaceId);
       return workspace;
     }
@@ -260,9 +263,15 @@ export class WorkspaceRegistry {
     }
 
     const root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
+    const canonicalRoot = this.resolveCanonicalWorkspaceRoot(
+      root,
+      session.mode,
+      session.sourceRoot,
+    );
     const restoredWorkspace: Workspace = {
       id: session.id,
       root,
+      canonicalRoot,
       mode: session.mode,
       sourceRoot: session.sourceRoot,
       worktree:
@@ -288,18 +297,19 @@ export class WorkspaceRegistry {
 
   resolvePath(workspace: Workspace, inputPath: string): string {
     const absolutePath = resolveAllowedPath(inputPath, workspace.root, [workspace.root]);
-    if (!isPathInsideRoot(absolutePath, workspace.root)) {
-      throw new Error(`Path is outside workspace root: ${inputPath}`);
+    const canonicalPath = resolvePhysicalPath(absolutePath);
+    if (!isPathInsideRoot(canonicalPath, workspace.canonicalRoot)) {
+      throw new AccessDeniedError(`Path is outside workspace root: ${inputPath}`);
     }
 
-    return absolutePath;
+    return canonicalPath;
   }
 
   resolveReadPath(workspace: Workspace, inputPath: string): WorkspaceReadPath {
     try {
       return {
         absolutePath: this.resolvePath(workspace, inputPath),
-        readRoots: [workspace.root],
+        readRoots: [workspace.canonicalRoot],
       };
     } catch (workspaceError) {
       const skillRead = resolveSkillReadPath(
@@ -310,8 +320,13 @@ export class WorkspaceRegistry {
       if (!skillRead) throw workspaceError;
 
       return {
-        absolutePath: skillRead.absolutePath,
-        readRoots: [workspace.root, skillRead.skill.baseDir],
+        absolutePath: resolvePhysicalPath(
+          assertAllowedPath(skillRead.absolutePath, [skillRead.skill.baseDir]),
+        ),
+        readRoots: [
+          workspace.canonicalRoot,
+          resolvePhysicalPath(skillRead.skill.baseDir),
+        ],
         skillRead,
       };
     }
@@ -324,8 +339,9 @@ export class WorkspaceRegistry {
   }
 
   resolveWorkingDirectory(workspace: Workspace, workingDirectory: string | undefined): string {
-    const directory = workingDirectory ? this.resolvePath(workspace, workingDirectory) : workspace.root;
-    return assertAllowedPath(directory, [workspace.root]);
+    return workingDirectory
+      ? this.resolvePath(workspace, workingDirectory)
+      : workspace.canonicalRoot;
   }
 
   private async openCheckoutWorkspace(path: string): Promise<WorkspaceContext> {
@@ -335,7 +351,11 @@ export class WorkspaceRegistry {
       throw new Error(`Workspace root must be a directory: ${path}`);
     }
 
-    return this.createWorkspaceContext({ root, mode: "checkout" });
+    return this.createWorkspaceContext({
+      root,
+      canonicalRoot: realpathSync(root),
+      mode: "checkout",
+    });
   }
 
   private async openWorktreeWorkspace(path: string, baseRef: string | undefined): Promise<WorkspaceContext> {
@@ -347,6 +367,7 @@ export class WorkspaceRegistry {
 
     return this.createWorkspaceContext({
       root: worktree.path,
+      canonicalRoot: realpathSync(worktree.path),
       mode: "worktree",
       sourceRoot: worktree.sourceRoot,
       worktree,
@@ -355,6 +376,7 @@ export class WorkspaceRegistry {
 
   private async createWorkspaceContext(input: {
     root: string;
+    canonicalRoot: string;
     mode: WorkspaceMode;
     sourceRoot?: string;
     worktree?: WorkspaceWorktree;
@@ -362,6 +384,7 @@ export class WorkspaceRegistry {
     const workspace: Workspace = {
       id: `ws_${randomBytes(5).toString("hex")}`,
       root: input.root,
+      canonicalRoot: input.canonicalRoot,
       mode: input.mode,
       sourceRoot: input.sourceRoot,
       worktree: input.worktree,
@@ -410,6 +433,42 @@ export class WorkspaceRegistry {
     }
 
     return assertAllowedPath(root, this.config.allowedRoots);
+  }
+
+  private resolveCanonicalWorkspaceRoot(
+    root: string,
+    mode: WorkspaceMode,
+    sourceRoot: string | undefined,
+  ): string {
+    if (mode === "worktree") {
+      if (!sourceRoot) {
+        throw new Error(`Stored worktree workspace is missing sourceRoot: ${root}`);
+      }
+      assertAllowedPath(sourceRoot, this.config.allowedRoots);
+      assertAllowedPath(root, [this.config.worktreeRoot]);
+    }
+
+    try {
+      return realpathSync(root);
+    } catch {
+      throw new AccessDeniedError(`Workspace root is no longer accessible: ${root}`);
+    }
+  }
+
+  private assertWorkspaceRootUnchanged(workspace: Workspace): void {
+    let currentRoot: string;
+    try {
+      currentRoot = realpathSync(workspace.root);
+    } catch {
+      throw new AccessDeniedError(
+        `Workspace root is no longer accessible: ${workspace.root}`,
+      );
+    }
+    if (currentRoot !== workspace.canonicalRoot) {
+      throw new AccessDeniedError(
+        `Workspace root changed after it was opened: ${workspace.root}`,
+      );
+    }
   }
 
   private async loadInitialAgentsFiles(root: string): Promise<LoadedAgentsFile[]> {

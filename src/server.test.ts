@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -293,7 +293,7 @@ test("delegate_to_agy dry-run resolves the workspace and does not start a worker
   const request = fake.requests[0];
   assert.equal(request?.profile, "repo-read");
   if (request?.profile === "repo-read") {
-    assert.equal(request.repositoryRoot, context.project);
+    assert.equal(request.repositoryRoot, await realpath(context.project));
     assert.equal(request.expectedSourceHead, head);
     assert.equal(request.dryRun, true);
   }
