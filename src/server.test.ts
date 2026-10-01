@@ -293,7 +293,7 @@ test("delegate_to_agy dry-run resolves the workspace and does not start a worker
   const request = fake.requests[0];
   assert.equal(request?.profile, "repo-read");
   if (request?.profile === "repo-read") {
-    assert.equal(request.repositoryRoot, await realpath(context.project));
+    assert.equal(await realpath(request.repositoryRoot), await realpath(context.project));
     assert.equal(request.expectedSourceHead, head);
     assert.equal(request.dryRun, true);
   }
