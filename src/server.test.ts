@@ -103,17 +103,32 @@ test("open_workspace tells fresh hosts to use DevSpace first and preserves the r
   assert.match(openTool.description ?? "", /do not bypass it with shell or delegation/);
 });
 
-test("UI metadata is limited to workspace and aggregate review", async (t) => {
+test("open_workspace stays model-only without a widget while show_changes keeps its widget", async (t) => {
   for (const uiEnabled of [true, false]) {
     await t.test(uiEnabled ? "enabled" : "disabled", async (nested) => {
       const context = await fixture(nested, { toolMode: "claude", uiEnabled });
       const tools = await context.client.listTools();
-      const toolsWithUi = tools.tools
-        .filter((tool) => Boolean((tool._meta as { ui?: unknown } | undefined)?.ui))
-        .map((tool) => tool.name)
-        .sort();
+      const openTool = tools.tools.find((tool) => tool.name === "open_workspace");
+      const showChangesTool = tools.tools.find((tool) => tool.name === "show_changes");
+      assert.ok(openTool);
+      assert.ok(showChangesTool);
 
-      assert.deepEqual(toolsWithUi, uiEnabled ? ["open_workspace", "show_changes"] : []);
+      const openUi = (openTool._meta as {
+        ui?: { resourceUri?: unknown; visibility?: unknown };
+      } | undefined)?.ui;
+      const showChangesUi = (showChangesTool._meta as {
+        ui?: { resourceUri?: unknown; visibility?: unknown };
+      } | undefined)?.ui;
+
+      if (uiEnabled) {
+        assert.deepEqual(openUi?.visibility, ["model"]);
+        assert.equal(openUi?.resourceUri, undefined);
+        assert.deepEqual(showChangesUi?.visibility, ["model"]);
+        assert.equal(typeof showChangesUi?.resourceUri, "string");
+      } else {
+        assert.equal(openUi, undefined);
+        assert.equal(showChangesUi, undefined);
+      }
     });
   }
 });
@@ -336,7 +351,7 @@ test("delegate_to_agy ignores legacy model and effort fields as migration-only e
   assert.equal(structuredContent(result).requested_effort, "high");
 });
 
-test("open_workspace keeps lifecycle flags out of model output and preserves complete card metadata", async (t) => {
+test("open_workspace keeps lifecycle flags out of model output and omits unused card metadata", async (t) => {
   const providerNote = "available";
   const context = await fixture(t, {
     localAgentProviders: [{ name: "codex", available: true, note: providerNote }],
@@ -385,18 +400,8 @@ test("open_workspace keeps lifecycle flags out of model output and preserves com
   assert.equal("workspaceReused" in repeatedStructured, false);
   assert.equal("includeBootstrapContext" in repeatedStructured, false);
 
-  const card = responseCard(repeated);
-  assert.equal(card.workspaceReused, true);
-  assert.equal(card.includeBootstrapContext, false);
-  assert.ok(Array.isArray(card.agentsFiles));
-  assert.ok(Array.isArray(card.availableAgentsFiles));
-  assert.ok(Array.isArray(card.skills));
-  assert.ok(Array.isArray(card.agentProviders));
-  assert.equal(
-    (card.agentProviders as Array<Record<string, unknown>>)[0]?.note,
-    providerNote,
-  );
-  assert.ok(Array.isArray(card.agents));
+  assert.equal((first._meta as { card?: unknown } | undefined)?.card, undefined);
+  assert.equal((repeated._meta as { card?: unknown } | undefined)?.card, undefined);
 });
 
 test("open_workspace refreshes provider availability for each catalog", async (t) => {

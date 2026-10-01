@@ -28,6 +28,7 @@ import {
   toolResultFromChatGptGlobals,
   type ChatGptToolGlobals,
 } from "./tool-result.js";
+import { ToolResultWaitTimer } from "./tool-result-wait.js";
 import "./workspace-app.css";
 
 interface CardDisplay {
@@ -62,6 +63,18 @@ let showAvailableWorkspaceInstructions = false;
 let pendingToolResult: CallToolResult | null = null;
 let pendingReviewKey: string | null = null;
 
+const TOOL_RESULT_DELIVERY_WARNING_MS = 30_000;
+const TOOL_RESULT_DELIVERY_WARNING =
+  "The host has not delivered this tool result to the card yet. Check the conversation status before retrying.";
+const toolResultWaitTimer = new ToolResultWaitTimer(
+  TOOL_RESULT_DELIVERY_WARNING_MS,
+  () => {
+    if (!connected || card || errorMessage || pendingReviewKey) return;
+    errorMessage = TOOL_RESULT_DELIVERY_WARNING;
+    render();
+  },
+);
+
 const maybeAppRoot = document.querySelector<HTMLElement>("#app");
 
 if (!maybeAppRoot) {
@@ -85,6 +98,7 @@ async function boot(): Promise<void> {
       pendingToolResult = result;
       return;
     }
+    toolResultWaitTimer.clear();
     void applyToolResult(result);
   };
 
@@ -107,6 +121,7 @@ async function boot(): Promise<void> {
   };
 
   app.onteardown = async () => {
+    toolResultWaitTimer.clear();
     window.removeEventListener("openai:set_globals", handleChatGptGlobalsChanged);
     unmountPayload();
     return {};
@@ -131,10 +146,12 @@ async function boot(): Promise<void> {
     await applyToolResult(initialResult);
   } else {
     render();
+    toolResultWaitTimer.start();
   }
 }
 
 async function applyToolResult(result: CallToolResult): Promise<void> {
+  toolResultWaitTimer.clear();
   const decoded = decodeToolResult(result);
   if (decoded.kind === "card") {
     setCard(decoded.card);
