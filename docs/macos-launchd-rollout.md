@@ -253,7 +253,7 @@ existing file at that pathname. Unexpected recovery-observation exceptions produ
 an explicit `ROLLBACK_REFUSED_UNPROVEN_STATE`, preserving the forward failure and
 committed truth; they cannot report a successful restore.
 
-Default external commands have a 5-second subprocess deadline with forced
+Default external commands have a 10-second subprocess deadline with forced
 termination of that command on timeout. The stability observation has one deadline
 covering its sleep and all probes, and forwards cancellation to the subprocess and
 health probes. Readiness timers remain referenced while a result is pending.
