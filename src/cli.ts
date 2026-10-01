@@ -364,6 +364,9 @@ async function runDoctor(): Promise<void> {
     console.log(`Public MCP URL: ${new URL("/mcp", config.publicBaseUrl).toString()}`);
     console.log(`Allowed roots: ${config.allowedRoots.join(", ")}`);
     console.log(`Allowed hosts: ${config.allowedHosts.join(", ")}`);
+    console.log(`MCP max sessions: ${config.mcpMaxSessions}`);
+    console.log(`MCP session idle timeout: ${config.mcpSessionIdleTimeoutMs} ms`);
+    console.log(`MCP session cleanup interval: ${config.mcpSessionCleanupIntervalMs} ms`);
     const providers = buildLocalAgentProviderStatuses(
       config.subagents,
       getLocalAgentProviderAvailabilitySnapshot(),

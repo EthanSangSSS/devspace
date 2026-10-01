@@ -84,11 +84,6 @@ import {
 } from "./tool-surfaces/types.js";
 
 type Transport = StreamableHTTPServerTransport;
-// MCP clients can reconnect without closing the previous transport. Bound stale
-// session retention so abandoned MCP servers do not accumulate for the life of the process.
-const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
-const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
-const MCP_MAX_SESSIONS = 64;
 const MCP_RUNTIME_SNAPSHOT_INTERVAL_MS = 60_000;
 const MCP_SESSION_MISS_DETAIL_LIMIT = 8;
 const MCP_SESSION_MISS_DETAIL_WINDOW_MS = 60_000;
@@ -1164,7 +1159,7 @@ export function createServer(
   }
 
   const transports = new McpSessionRegistry<Transport>({
-    maxSessions: options.mcpMaxSessions ?? MCP_MAX_SESSIONS,
+    maxSessions: options.mcpMaxSessions ?? config.mcpMaxSessions,
     onEvent: (event) => {
       options.mcpSessionLifecycleObserver?.(event);
       const names = {
@@ -1236,9 +1231,9 @@ export function createServer(
 
   const sessionCleanupTimer = setInterval(() => {
     void transports.closeIdle(
-      options.mcpSessionIdleTimeoutMs ?? MCP_SESSION_IDLE_TIMEOUT_MS,
+      options.mcpSessionIdleTimeoutMs ?? config.mcpSessionIdleTimeoutMs,
     );
-  }, options.mcpSessionCleanupIntervalMs ?? MCP_SESSION_CLEANUP_INTERVAL_MS);
+  }, options.mcpSessionCleanupIntervalMs ?? config.mcpSessionCleanupIntervalMs);
   sessionCleanupTimer.unref();
 
   const runtimeSnapshotTimer = setInterval(() => {

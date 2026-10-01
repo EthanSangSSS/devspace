@@ -22,6 +22,9 @@ export interface ServerConfig {
   allowedRoots: string[];
   allowedHosts: string[];
   publicBaseUrl: string;
+  mcpMaxSessions: number;
+  mcpSessionIdleTimeoutMs: number;
+  mcpSessionCleanupIntervalMs: number;
   toolMode: ToolMode;
   uiEnabled: boolean;
   stateDir: string;
@@ -74,6 +77,9 @@ export function loadConfig(
     allowedRoots: normalizePaths(stored.workspaces.allowedRoots, [process.cwd()]),
     allowedHosts: normalizeAllowedHosts(derivedAllowedHosts),
     publicBaseUrl,
+    mcpMaxSessions: stored.server.mcpMaxSessions,
+    mcpSessionIdleTimeoutMs: stored.server.mcpSessionIdleTimeoutMs,
+    mcpSessionCleanupIntervalMs: stored.server.mcpSessionCleanupIntervalMs,
     toolMode: stored.tools.mode,
     uiEnabled: stored.ui.enabled,
     stateDir: normalizePath(stored.storage.stateDir),
