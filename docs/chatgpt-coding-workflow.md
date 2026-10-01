@@ -6,7 +6,10 @@ verification, and show the user what changed.
 
 ## Open One Workspace
 
-ChatGPT should call `open_workspace` once for a project folder:
+For local coding and repository tasks, ChatGPT should treat DevSpace as the
+primary execution path and call `open_workspace` once for a project folder
+before concluding that local execution is unavailable or handing local
+execution to another agent:
 
 ```json
 {
@@ -16,6 +19,13 @@ ChatGPT should call `open_workspace` once for a project folder:
 
 The result includes a `workspaceId`. All later file, search, edit, show-changes,
 and shell calls should reuse that same `workspaceId`.
+
+If `open_workspace` rejects the path as outside allowed roots, that rejection is
+specific to workspace authorization for the requested path. It does not prove
+that DevSpace itself, the machine, or Agy is unavailable. Do not use shell or a
+subagent to bypass the rejected workspace boundary. Update the configured
+allowed roots to an appropriate narrow project/worktree root, restart DevSpace
+when required by the deployment, and retry `open_workspace`.
 
 ChatGPT may support automatic checkout recovery through optional host
 conversation metadata. This is an OpenAI-host adapter detail, not a standard MCP

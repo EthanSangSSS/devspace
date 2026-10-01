@@ -18,6 +18,9 @@ try {
   assert.equal(defaults.publicBaseUrl, "http://127.0.0.1:7676");
   assert.deepEqual(defaults.allowedRoots, [process.cwd()]);
   assert.deepEqual(defaults.allowedHosts, ["localhost", "127.0.0.1", "::1"]);
+  assert.equal(defaults.mcpMaxSessions, 64);
+  assert.equal(defaults.mcpSessionIdleTimeoutMs, 30_000);
+  assert.equal(defaults.mcpSessionCleanupIntervalMs, 5_000);
   assert.equal(defaults.toolMode, "codex");
   assert.equal(defaults.uiEnabled, true);
   assert.equal(defaults.skillsEnabled, true);
@@ -50,6 +53,9 @@ try {
       publicBaseUrl: "https://devspace.example.com/",
       allowedHosts: ["example.internal"],
       trustProxy: true,
+      mcpMaxSessions: 128,
+      mcpSessionIdleTimeoutMs: 30_000,
+      mcpSessionCleanupIntervalMs: 2_000,
     },
     workspaces: {
       allowedRoots: ["~/work"],
@@ -105,6 +111,9 @@ try {
     "devspace.example.com",
     "example.internal",
   ]);
+  assert.equal(configured.mcpMaxSessions, 128);
+  assert.equal(configured.mcpSessionIdleTimeoutMs, 30_000);
+  assert.equal(configured.mcpSessionCleanupIntervalMs, 2_000);
   assert.equal(configured.toolMode, "claude");
   assert.equal(configured.uiEnabled, false);
   assert.equal(configured.stateDir, resolve(homedir(), "state"));

@@ -11,6 +11,9 @@ const serverConfigSchema = z.object({
   publicBaseUrl: z.string().url().nullable().default(null),
   allowedHosts: z.array(z.string().trim().min(1)).default([]),
   trustProxy: z.boolean().default(false),
+  mcpMaxSessions: z.number().int().positive().default(64),
+  mcpSessionIdleTimeoutMs: z.number().int().positive().default(30_000),
+  mcpSessionCleanupIntervalMs: z.number().int().positive().default(5_000),
 }).strict().prefault({});
 
 const workspacesConfigSchema = z.object({

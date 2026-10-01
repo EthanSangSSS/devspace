@@ -84,11 +84,6 @@ import {
 } from "./tool-surfaces/types.js";
 
 type Transport = StreamableHTTPServerTransport;
-// MCP clients can reconnect without closing the previous transport. Bound stale
-// session retention so abandoned MCP servers do not accumulate for the life of the process.
-const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
-const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
-const MCP_MAX_SESSIONS = 64;
 const MCP_RUNTIME_SNAPSHOT_INTERVAL_MS = 60_000;
 const MCP_SESSION_MISS_DETAIL_LIMIT = 8;
 const MCP_SESSION_MISS_DETAIL_WINDOW_MS = 60_000;
@@ -140,7 +135,7 @@ function serverInstructions(
     ? `When ${toolNames.openWorkspace} returns available skills and a task matches a skill, use ${toolNames.read} to read that skill's path before proceeding. Skill paths may be outside the workspace, but ${toolNames.read} only permits advertised SKILL.md files and files under already-loaded skill directories. `
     : "";
   const agents = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
-  const common = `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected.`;
+  const common = `Use DevSpace as the primary local execution path for coding and repository work. When the user names a local project, checkout, or worktree path and no usable workspaceId exists, call ${toolNames.openWorkspace} before treating the task as blocked or handing local execution to another agent. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. An allowed-root rejection is a workspace authorization boundary for that path, not evidence that DevSpace, the local machine, or Agy is unavailable. Do not bypass that boundary with shell commands or delegated agents; restore legitimate workspace authorization and retry ${toolNames.openWorkspace}.`;
 
   return `${common} ${toolSurface.instructions({ agents, skills })}${artifactInstruction}${showChangesInstruction}`;
 }
@@ -384,7 +379,7 @@ function registerAgyDelegationTools(
     {
       title: "Delegate to Agy",
       description:
-        "Start one bounded local Agy agent task under a fixed least-privilege profile. A real run may contact the configured model provider. V1 forbids persistent project writes, external-state actions, hidden executor fallback, and model substitution.",
+        "Start one bounded local Agy agent task under a fixed least-privilege profile. Repository profiles require an already-open DevSpace workspaceId and cannot bypass workspace allowed-root authorization. A real run may contact the configured model provider. V1 forbids persistent project writes, external-state actions, hidden executor fallback, and model substitution.",
       inputSchema: {
         profile: z.enum(["repo-read", "repo-validate", "gui-inspect"]),
         task: z.string().min(1),
@@ -475,7 +470,7 @@ function registerAgyDelegationTools(
           profile: input.profile,
           task: input.task,
           dryRun,
-          repositoryRoot: workspace.root,
+          repositoryRoot: workspace.canonicalRoot,
           expectedSourceHead: input.expected_source_head,
           allowedReadPaths: input.allowed_read_paths,
           ...(input.validation_commands
@@ -645,7 +640,7 @@ export function createMcpServer(
     {
       title: "Open workspace",
       description:
-        "Start work in a project directory or isolated worktree when no usable workspaceId exists for it. During continued work, reuse the existing workspaceId instead of calling this tool again. By default this uses the actual checkout; set mode=\"worktree\" for isolated or parallel work.",
+        "Primary entry point for local coding and repository work. When the user gives a local project, checkout, or worktree path and no usable workspaceId exists, call this before declaring local execution blocked or handing execution to another agent. During continued work, reuse the existing workspaceId instead of calling this tool again. By default this uses the actual checkout; set mode=\"worktree\" for isolated or parallel work. If the path is outside allowed roots, treat that as a path-specific workspace authorization boundary, not as evidence that DevSpace or Agy is unavailable; do not bypass it with shell or delegation.",
       inputSchema: {
         path: z
           .string()
@@ -895,8 +890,8 @@ export function createMcpServer(
       const response = await readFileTool(
         { ...input, path: readPath.absolutePath },
         {
-          cwd: workspace.root,
-          root: workspace.root,
+          cwd: workspace.canonicalRoot,
+          root: workspace.canonicalRoot,
           readRoots: readPath.readRoots,
         },
       );
@@ -1164,7 +1159,7 @@ export function createServer(
   }
 
   const transports = new McpSessionRegistry<Transport>({
-    maxSessions: options.mcpMaxSessions ?? MCP_MAX_SESSIONS,
+    maxSessions: options.mcpMaxSessions ?? config.mcpMaxSessions,
     onEvent: (event) => {
       options.mcpSessionLifecycleObserver?.(event);
       const names = {
@@ -1236,9 +1231,9 @@ export function createServer(
 
   const sessionCleanupTimer = setInterval(() => {
     void transports.closeIdle(
-      options.mcpSessionIdleTimeoutMs ?? MCP_SESSION_IDLE_TIMEOUT_MS,
+      options.mcpSessionIdleTimeoutMs ?? config.mcpSessionIdleTimeoutMs,
     );
-  }, options.mcpSessionCleanupIntervalMs ?? MCP_SESSION_CLEANUP_INTERVAL_MS);
+  }, options.mcpSessionCleanupIntervalMs ?? config.mcpSessionCleanupIntervalMs);
   sessionCleanupTimer.unref();
 
   const runtimeSnapshotTimer = setInterval(() => {

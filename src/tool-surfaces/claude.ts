@@ -59,10 +59,10 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
     async ({ workspaceId, ...input }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
-      workspaces.resolvePath(workspace, input.path);
-      const response = await writeFileTool(input, {
-        cwd: workspace.root,
-        root: workspace.root,
+      const path = workspaces.resolvePath(workspace, input.path);
+      const response = await writeFileTool({ ...input, path }, {
+        cwd: workspace.canonicalRoot,
+        root: workspace.canonicalRoot,
       });
 
       if (response.isError) {
@@ -127,10 +127,10 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
     async ({ workspaceId, ...input }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
-      workspaces.resolvePath(workspace, input.path);
-      const response = await editFileTool(input, {
-        cwd: workspace.root,
-        root: workspace.root,
+      const path = workspaces.resolvePath(workspace, input.path);
+      const response = await editFileTool({ ...input, path }, {
+        cwd: workspace.canonicalRoot,
+        root: workspace.canonicalRoot,
       });
 
       if (response.isError) {
@@ -209,7 +209,7 @@ function registerShellTool(context: ToolRegistrationContext): void {
       );
       const response = await runShellTool(input, {
         cwd,
-        root: workspace.root,
+        root: workspace.canonicalRoot,
       });
 
       if (response.isError) {

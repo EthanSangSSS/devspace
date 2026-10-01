@@ -102,7 +102,7 @@ test("worktree opens require Git and create an isolated managed workspace", asyn
   assert.match(opened.agentsFiles.map((file) => file.content).join("\n"), /git root instructions/);
 
   const resolvedReadme = context.registry.resolvePath(opened.workspace, "README.md");
-  assert.equal(resolvedReadme.startsWith(opened.workspace.root), true);
+  assert.equal(resolvedReadme.startsWith(opened.workspace.canonicalRoot), true);
 });
 
 test("persisted checkout and worktree sessions restore after recreating the registry", async (t) => {
@@ -150,6 +150,25 @@ test("cached workspace access rejects a root replaced with an outside symlink", 
   await rename(project, join(context.root, "original-project"));
   await symlink(context.outsideRoot, project, "dir");
   assert.throws(() => context.registry.getWorkspace(opened.workspace.id), /outside allowed roots/);
+});
+
+test("cached workspace access rejects a root symlink retargeted within the allowed root", { skip: platform() === "win32" }, async (t) => {
+  const context = await fixture(t);
+  const firstTarget = join(context.root, "first-target");
+  const secondTarget = join(context.root, "second-target");
+  const workspaceLink = join(context.root, "workspace-link");
+  await mkdir(firstTarget);
+  await mkdir(secondTarget);
+  await symlink(firstTarget, workspaceLink, "dir");
+
+  const opened = await context.registry.openWorkspace(workspaceLink);
+  await rm(workspaceLink);
+  await symlink(secondTarget, workspaceLink, "dir");
+
+  assert.throws(
+    () => context.registry.getWorkspace(opened.workspace.id),
+    /root changed after it was opened/,
+  );
 });
 
 test("a symlinked allowed root preserves checkout and worktree path behavior", { skip: platform() === "win32" }, async (t) => {

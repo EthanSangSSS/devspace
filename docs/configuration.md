@@ -29,6 +29,9 @@ Run `devspace init` to create both files. `devspace config set publicBaseUrl
     "publicBaseUrl": "https://devspace.example.com",
     "allowedHosts": [],
     "trustProxy": false,
+    "mcpMaxSessions": 64,
+    "mcpSessionIdleTimeoutMs": 30000,
+    "mcpSessionCleanupIntervalMs": 5000,
   },
   "workspaces": {
     "allowedRoots": ["~/personal", "~/work"],
@@ -76,6 +79,11 @@ Run `devspace init` to create both files. `devspace config set publicBaseUrl
 Omitted sections and keys use the defaults shown above. An empty
 `workspaces.allowedRoots` uses the current working directory. Unknown keys are
 rejected so spelling mistakes cannot silently alter behavior.
+
+`server.mcpSessionIdleTimeoutMs` applies only after a session has no in-flight
+requests. The cleanup timer never expires an active tool call or active MCP
+request. Keep `mcpSessionCleanupIntervalMs` substantially smaller than the idle
+timeout so abandoned sessions are reclaimed before `mcpMaxSessions` is reached.
 
 ## Tool modes and UI
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -89,6 +89,18 @@ test("tool modes expose the expected host-facing tool surface", async (t) => {
       );
     });
   }
+});
+
+test("open_workspace tells fresh hosts to use DevSpace first and preserves the root boundary", async (t) => {
+  const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
+  const tools = await context.client.listTools();
+  const openTool = tools.tools.find((tool) => tool.name === "open_workspace");
+
+  assert.ok(openTool);
+  assert.match(openTool.description ?? "", /Primary entry point for local coding and repository work/);
+  assert.match(openTool.description ?? "", /before declaring local execution blocked/);
+  assert.match(openTool.description ?? "", /path-specific workspace authorization boundary/);
+  assert.match(openTool.description ?? "", /do not bypass it with shell or delegation/);
 });
 
 test("UI metadata is limited to workspace and aggregate review", async (t) => {
@@ -225,6 +237,7 @@ test("enabled Agy delegation exposes stable server-policy MCP schemas", async (t
   assert.ok(delegate);
   assert.match(runtime.description ?? "", /without starting an agent/i);
   assert.match(delegate.description ?? "", /bounded local Agy/i);
+  assert.match(delegate.description ?? "", /cannot bypass workspace allowed-root authorization/i);
   assert.match(delegate.description ?? "", /model provider/i);
 
   const input = delegate.inputSchema as {
@@ -280,7 +293,7 @@ test("delegate_to_agy dry-run resolves the workspace and does not start a worker
   const request = fake.requests[0];
   assert.equal(request?.profile, "repo-read");
   if (request?.profile === "repo-read") {
-    assert.equal(request.repositoryRoot, context.project);
+    assert.equal(await realpath(request.repositoryRoot), await realpath(context.project));
     assert.equal(request.expectedSourceHead, head);
     assert.equal(request.dryRun, true);
   }
