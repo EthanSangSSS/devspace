@@ -54,7 +54,11 @@ export function assertAllowedPath(path: string, allowedRoots: string[]): string 
     return resolvedPath;
   }
 
-  throw new AccessDeniedError(`Path is outside allowed roots: ${path}`);
+  throw new AccessDeniedError(
+    `Path is outside allowed roots: ${path}. `
+      + "This is a configured workspace authorization boundary for this path, not evidence that DevSpace is unavailable. "
+      + "Do not bypass it with shell commands or delegated agents; authorize an appropriate dedicated root and retry open_workspace.",
+  );
 }
 
 /** Resolve existing ancestors without treating a dangling link as a missing directory. */

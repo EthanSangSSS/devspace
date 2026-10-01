@@ -31,3 +31,14 @@ if (process.platform === "win32") {
     /Path is outside allowed roots/,
   );
 }
+
+assert.throws(
+  () => assertAllowedPath(resolve(home, "outside-devspace-root"), [resolve(home, "allowed-devspace-root")]),
+  (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /workspace authorization boundary/);
+    assert.match(error.message, /not evidence that DevSpace is unavailable/);
+    assert.match(error.message, /Do not bypass it with shell commands or delegated agents/);
+    return true;
+  },
+);

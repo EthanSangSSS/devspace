@@ -91,6 +91,18 @@ test("tool modes expose the expected host-facing tool surface", async (t) => {
   }
 });
 
+test("open_workspace tells fresh hosts to use DevSpace first and preserves the root boundary", async (t) => {
+  const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
+  const tools = await context.client.listTools();
+  const openTool = tools.tools.find((tool) => tool.name === "open_workspace");
+
+  assert.ok(openTool);
+  assert.match(openTool.description ?? "", /Primary entry point for local coding and repository work/);
+  assert.match(openTool.description ?? "", /before declaring local execution blocked/);
+  assert.match(openTool.description ?? "", /path-specific workspace authorization boundary/);
+  assert.match(openTool.description ?? "", /do not bypass it with shell or delegation/);
+});
+
 test("UI metadata is limited to workspace and aggregate review", async (t) => {
   for (const uiEnabled of [true, false]) {
     await t.test(uiEnabled ? "enabled" : "disabled", async (nested) => {
@@ -225,6 +237,7 @@ test("enabled Agy delegation exposes stable server-policy MCP schemas", async (t
   assert.ok(delegate);
   assert.match(runtime.description ?? "", /without starting an agent/i);
   assert.match(delegate.description ?? "", /bounded local Agy/i);
+  assert.match(delegate.description ?? "", /cannot bypass workspace allowed-root authorization/i);
   assert.match(delegate.description ?? "", /model provider/i);
 
   const input = delegate.inputSchema as {

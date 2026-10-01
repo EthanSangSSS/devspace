@@ -167,6 +167,19 @@ The path passed to `open_workspace` must be inside one of the allowed roots
 configured during ChatGPT setup. Direct `devspace agents` commands instead use
 the current local project and are not gated by MCP allowed roots.
 
+Treat this as a path-specific workspace authorization failure, not as evidence
+that the DevSpace server, local shell, or configured subagents are unavailable.
+Do not route around the boundary by editing the rejected project through an
+unrelated workspace's shell, and do not delegate a repository task to Agy as a
+workaround: repository delegation requires a valid DevSpace `workspaceId`.
+
+For installations that routinely use external coding-agent worktrees, authorize
+the narrow parent directories that own those worktrees rather than adding one
+ephemeral candidate at a time. For example, a personal setup may deliberately
+include dedicated roots such as `~/.codex/worktrees` and
+`~/.devspace/worktrees` while still keeping the rest of the home directory
+outside DevSpace's workspace boundary.
+
 Run:
 
 ```bash
