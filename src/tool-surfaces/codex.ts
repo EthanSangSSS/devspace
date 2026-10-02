@@ -177,7 +177,7 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
           .max(30_000)
           .optional()
           .describe(
-            "Milliseconds to wait before returning a running session. Defaults to 10000.",
+            "Milliseconds to wait before returning a running session. Defaults to 30000 to reduce follow-up polling calls.",
           ),
         maxOutputTokens: z
           .number()
@@ -240,7 +240,7 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
     {
       title: "Write to process",
       description:
-        "Poll or write characters to a process returned by exec_command. Omit chars or pass an empty string to poll. Pass \\u0003 to send Ctrl-C.",
+        "Poll or write characters to a process returned by exec_command. Omit chars or pass an empty string to poll. Pure polls wait for process completion or the wait deadline even when output is already buffered, reducing repeated MCP round-trips; pass yieldTimeMs=0 for an immediate snapshot. Pass \\u0003 to send Ctrl-C.",
       inputSchema: {
         workspaceId: z
           .string()
@@ -280,7 +280,7 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
           .max(30_000)
           .optional()
           .describe(
-            "Milliseconds to wait for process output or completion. Defaults to 10000.",
+            "Milliseconds to wait for process completion. Pure polls default to 30000, including when output is already buffered; use 0 for an immediate snapshot. Interactive writes default to 250.",
           ),
         maxOutputTokens: z
           .number()
