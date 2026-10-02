@@ -634,8 +634,7 @@ export function createMcpServer(
     },
   );
 
-  registerAppTool(
-    server,
+  server.registerTool(
     "open_workspace",
     {
       title: "Open workspace",
@@ -688,7 +687,13 @@ export function createMcpServer(
         ]),
         instruction: z.string(),
       },
-      ...workspaceAppDescriptorMeta(config),
+      _meta: config.uiEnabled
+        ? {
+            ui: {
+              visibility: ["model"],
+            },
+          }
+        : {},
       annotations: { readOnlyHint: true },
     },
     async ({ path, mode, baseRef }, { _meta }) => observeToolOperation(config, "open_workspace", async () => {
@@ -792,33 +797,6 @@ export function createMcpServer(
 
       return {
         content: resultContent,
-        _meta: {
-          card: {
-            workspaceId: workspace.id,
-            root: workspace.root,
-            path: workspace.root,
-            mode: workspace.mode,
-            workspaceReused,
-            includeBootstrapContext,
-            sourceRoot: workspace.sourceRoot,
-            worktree: workspace.worktree,
-            agentsFiles: cardAgentsFiles,
-            availableAgentsFiles: cardAvailableAgentsFiles,
-            skills: cardSkills,
-            agentProviders: cardAgentProviders,
-            agents: cardAgents,
-            review,
-            instruction: cardInstruction,
-            summary: {
-              mode: workspace.mode,
-              agentsFiles: cardAgentsFiles.length,
-              availableAgentsFiles: cardAvailableAgentsFiles.length,
-              skills: cardSkills.length,
-              agentProviders: cardAgentProviders.length,
-              agents: cardAgents.length,
-            },
-          },
-        },
         structuredContent: {
           workspaceId: workspace.id,
           root: workspace.root,
