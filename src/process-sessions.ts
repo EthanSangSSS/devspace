@@ -41,6 +41,10 @@ export interface WriteStdinInput {
   maxOutputTokens?: number;
 }
 
+export interface WriteStdinOptions {
+  signal?: AbortSignal;
+}
+
 export interface ProcessSnapshot {
   sessionId?: number;
   output: string;
@@ -100,6 +104,12 @@ function boundedInteger(value: number | undefined, fallback: number, maximum: nu
     throw new Error("Duration and output limits must be non-negative.");
   }
   return Math.min(Math.floor(value), maximum);
+}
+
+function processPollAbortError(): Error {
+  const error = new Error("Process poll cancelled before a result was consumed.");
+  error.name = "AbortError";
+  return error;
 }
 
 function terminalSize(value: number | undefined, fallback: number): number {
@@ -199,7 +209,7 @@ export class HeadTailBuffer {
     return this.totalCharacters > 0;
   }
 
-  drain(maxCharacters: number): { output: string; truncated: boolean } {
+  read(maxCharacters: number): { output: string; truncated: boolean } {
     if (!Number.isInteger(maxCharacters) || maxCharacters < 1) {
       throw new Error("Output limit must be a positive integer.");
     }
@@ -212,11 +222,17 @@ export class HeadTailBuffer {
     const output = truncateOutput(retained, maxCharacters);
     const truncated = omittedByBuffer > 0 || output.truncated;
 
+    return { output: output.output, truncated };
+  }
+
+  drain(maxCharacters: number): { output: string; truncated: boolean } {
+    const snapshot = this.read(maxCharacters);
+
     this.head = "";
     this.tail = "";
     this.totalCharacters = 0;
 
-    return { output: output.output, truncated };
+    return snapshot;
   }
 }
 
@@ -270,11 +286,15 @@ export class ProcessSessionManager {
     return snapshot;
   }
 
-  async write(input: WriteStdinInput): Promise<ProcessSnapshot> {
+  async write(
+    input: WriteStdinInput,
+    options: WriteStdinOptions = {},
+  ): Promise<ProcessSnapshot> {
     const session = this.getOwnedSession(input.workspaceId, input.sessionId);
     const chars = input.chars ?? "";
     const interactionRequested =
       chars.length > 0 || input.columns !== undefined || input.rows !== undefined;
+    const pollSignal = interactionRequested ? undefined : options.signal;
 
     if (input.columns !== undefined || input.rows !== undefined) {
       session.columns = terminalSize(input.columns, session.columns);
@@ -299,11 +319,20 @@ export class ProcessSessionManager {
       const fallback = interactionRequested ? DEFAULT_INTERACTIVE_YIELD_MS : DEFAULT_POLL_YIELD_MS;
       const maximum = interactionRequested ? MAX_COMMAND_YIELD_MS : MAX_POLL_YIELD_MS;
       const yieldTimeMs = boundedInteger(input.yieldTimeMs, fallback, maximum);
-      await this.waitForExit(session, yieldTimeMs);
+      const waitOutcome = await this.waitForExit(session, yieldTimeMs, pollSignal);
+      if (waitOutcome === "aborted" || pollSignal?.aborted) {
+        throw processPollAbortError();
+      }
     }
 
-    const snapshot = this.consume(session, input.maxOutputTokens);
-    if (!session.running) this.removeSession(session.id);
+    // A pure poll may race process exit with client cancellation. Re-check the
+    // signal immediately before consuming output so a cancelled waiter cannot
+    // drain the buffer or remove a terminal session that a later poll needs.
+    if (pollSignal?.aborted) throw processPollAbortError();
+
+    const snapshot = this.consume(session, input.maxOutputTokens, {
+      preserveTerminalOutput: !session.running,
+    });
     return snapshot;
   }
 
@@ -336,17 +365,30 @@ export class ProcessSessionManager {
     return this.shutdownPromise;
   }
 
-  private async waitForExit(session: ProcessSession, yieldTimeMs: number): Promise<void> {
+  private async waitForExit(
+    session: ProcessSession,
+    yieldTimeMs: number,
+    signal?: AbortSignal,
+  ): Promise<"exit" | "timeout" | "aborted"> {
+    if (signal?.aborted) return "aborted";
     let timer: NodeJS.Timeout | undefined;
+    let onAbort: (() => void) | undefined;
     try {
-      await Promise.race([
-        session.exitPromise,
-        new Promise<void>((resolve) => {
-          timer = setTimeout(resolve, yieldTimeMs);
-        }),
-      ]);
+      const exit = session.exitPromise.then(() => "exit" as const);
+      const timeout = new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), yieldTimeMs);
+      });
+      const waits: Array<Promise<"exit" | "timeout" | "aborted">> = [exit, timeout];
+      if (signal) {
+        waits.push(new Promise<"aborted">((resolve) => {
+          onAbort = () => resolve("aborted");
+          signal.addEventListener("abort", onAbort, { once: true });
+        }));
+      }
+      return await Promise.race(waits);
     } finally {
       if (timer) clearTimeout(timer);
+      if (signal && onAbort) signal.removeEventListener("abort", onAbort);
     }
   }
 
@@ -465,10 +507,16 @@ export class ProcessSessionManager {
     session.buffer.append(output);
   }
 
-  private consume(session: ProcessSession, maxOutputTokens?: number): ProcessSnapshot {
+  private consume(
+    session: ProcessSession,
+    maxOutputTokens?: number,
+    options: { preserveTerminalOutput?: boolean } = {},
+  ): ProcessSnapshot {
     const limit = boundedInteger(maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 100_000);
     const maxCharacters = Math.max(256, limit * 4);
-    const buffered = session.buffer.drain(maxCharacters);
+    const buffered = options.preserveTerminalOutput
+      ? session.buffer.read(maxCharacters)
+      : session.buffer.drain(maxCharacters);
 
     return {
       sessionId: session.running ? session.id : undefined,

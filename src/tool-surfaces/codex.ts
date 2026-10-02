@@ -301,7 +301,7 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
       rows,
       yieldTimeMs,
       maxOutputTokens,
-    }) => observeToolOperation(config, "write_stdin", async () => {
+    }, extra) => observeToolOperation(config, "write_stdin", async () => {
       const startedAt = performance.now();
       const snapshot = await runLoggedToolOperation(
         config,
@@ -309,15 +309,18 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
         startedAt,
         async () => {
           workspaces.getWorkspace(workspaceId);
-          return processSessions.write({
-            workspaceId,
-            sessionId,
-            chars,
-            columns,
-            rows,
-            yieldTimeMs,
-            maxOutputTokens,
-          });
+          return processSessions.write(
+            {
+              workspaceId,
+              sessionId,
+              chars,
+              columns,
+              rows,
+              yieldTimeMs,
+              maxOutputTokens,
+            },
+            { signal: extra.signal },
+          );
         },
       );
 
