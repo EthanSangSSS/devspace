@@ -1067,6 +1067,8 @@ export function createServer(
     res.locals.sessionCorrelation = correlation;
 
     if (path === "/mcp") {
+      const requestAbortController = new AbortController();
+      res.locals.mcpRequestAbortSignal = requestAbortController.signal;
       emitHttpLifecycle({
         type: "request_start",
         requestId,
@@ -1076,6 +1078,7 @@ export function createServer(
       });
 
       req.once("aborted", () => {
+        requestAbortController.abort();
         emitHttpLifecycle({
           type: "request_aborted",
           requestId,
@@ -1103,6 +1106,7 @@ export function createServer(
       });
       res.once("close", () => {
         if (responseFinished) return;
+        requestAbortController.abort();
         emitHttpLifecycle({
           type: "response_closed_before_finish",
           requestId,
@@ -1348,6 +1352,7 @@ export function createServer(
             runtimeGeneration,
             requestId,
             sessionCorrelation: sessionCorrelation(sessionId),
+            requestSignal: res.locals.mcpRequestAbortSignal as AbortSignal | undefined,
           }, () => lease.transport.handleRequest(req, res, req.body));
         } finally {
           if (explicitDelete) {
@@ -1432,7 +1437,11 @@ export function createServer(
           incomingArtifactAdapters,
         );
         await server.connect(transport);
-        await withMcpRequestContext({ runtimeGeneration, requestId },
+        await withMcpRequestContext({
+          runtimeGeneration,
+          requestId,
+          requestSignal: res.locals.mcpRequestAbortSignal as AbortSignal | undefined,
+        },
           () => transport!.handleRequest(req, res, req.body));
         if (!committedSessionId) {
           const canceled = transports.cancel(reservation);

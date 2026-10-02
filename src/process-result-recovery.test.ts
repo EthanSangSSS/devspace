@@ -46,7 +46,7 @@ test("cancelled pure MCP poll preserves buffered output and the process handle",
   const started = await processSessions.start({
     workspaceId: "owner",
     cwd: process.cwd(),
-    command: `${node} -e "setTimeout(() => console.log('early-${marker}'), 10); setTimeout(() => console.log('done-${marker}'), 180)"`,
+    command: `${node} -e "setTimeout(() => console.log('early-${marker}'), 20); setTimeout(() => console.log('done-${marker}'), 1_200)"`,
     yieldTimeMs: 0,
   });
   assert.ok(started.sessionId);
@@ -55,24 +55,34 @@ test("cancelled pure MCP poll preserves buffered output and the process handle",
   try {
     await client.callTool({
       name: "write_stdin",
-      arguments: { workspaceId: "owner", sessionId: started.sessionId, yieldTimeMs: 1_000 },
-    }, undefined, { timeout: 50 });
+      arguments: { workspaceId: "owner", sessionId: started.sessionId, yieldTimeMs: 400 },
+    }, undefined, { timeout: 100 });
   } catch (error) {
     timeoutError = error;
   }
   assert.equal((timeoutError as { name?: string })?.name, "McpError");
   assert.equal((timeoutError as { code?: number })?.code, -32001);
 
-  await new Promise((resolve) => setTimeout(resolve, 250));
-  const recovered = await processSessions.write({
+  // Wait beyond the abandoned poll's original 400 ms deadline while the
+  // child is still running. If MCP cancellation is not propagated, that old
+  // waiter will wake and destructively drain the buffered "early" output.
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const runningRecovery = await processSessions.write({
     workspaceId: "owner",
     sessionId: started.sessionId,
     yieldTimeMs: 0,
   });
-  assert.equal(recovered.running, false);
-  assert.equal(recovered.exitCode, 0);
-  assert.match(recovered.output, new RegExp(`early-${marker}`));
-  assert.match(recovered.output, new RegExp(`done-${marker}`));
+  assert.equal(runningRecovery.running, true);
+  assert.match(runningRecovery.output, new RegExp(`early-${marker}`));
+
+  const terminalRecovery = await processSessions.write({
+    workspaceId: "owner",
+    sessionId: started.sessionId,
+    yieldTimeMs: 2_000,
+  });
+  assert.equal(terminalRecovery.running, false);
+  assert.equal(terminalRecovery.exitCode, 0);
+  assert.match(terminalRecovery.output, new RegExp(`done-${marker}`));
 });
 
 test("already-aborted pure poll does not consume a completed session", async (t) => {

@@ -6,6 +6,7 @@ interface RequestContext {
   runtimeGeneration: string;
   requestId: string;
   sessionCorrelation?: string;
+  requestSignal?: AbortSignal;
 }
 
 interface ObservationContext extends Partial<RequestContext> {
@@ -19,7 +20,12 @@ export function withMcpRequestContext<T>(fields: RequestContext, action: () => T
     runtimeGeneration: fields.runtimeGeneration,
     requestId: fields.requestId,
     sessionCorrelation: fields.sessionCorrelation,
+    requestSignal: fields.requestSignal,
   }, action);
+}
+
+export function mcpRequestAbortSignal(): AbortSignal | undefined {
+  return context.getStore()?.requestSignal;
 }
 
 export function toolLifecycleObserved(): boolean {
@@ -79,7 +85,7 @@ export async function observeToolOperation<T>(
     toolCallId: randomUUID(),
     tool,
   };
-  return context.run(fields, async () => {
+  return context.run({ ...fields, requestSignal: parent?.requestSignal }, async () => {
     const startedAt = performance.now();
     const emit = (phase: "started" | "finished", result?: string): void => {
       if (!config.logging.toolCalls) return;

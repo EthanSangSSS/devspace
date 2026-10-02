@@ -1,5 +1,5 @@
 import * as z from "zod/v4";
-import { observeToolOperation } from "../mcp-observability.js";
+import { mcpRequestAbortSignal, observeToolOperation } from "../mcp-observability.js";
 import { applyPatch } from "../apply-patch.js";
 import type { ProcessSnapshot } from "../process-sessions.js";
 import {
@@ -301,7 +301,12 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
       rows,
       yieldTimeMs,
       maxOutputTokens,
-    }, extra) => observeToolOperation(config, "write_stdin", async () => {
+    }, extra) => {
+      const httpSignal = mcpRequestAbortSignal();
+      const pollSignal = httpSignal && httpSignal !== extra.signal
+        ? AbortSignal.any([extra.signal, httpSignal])
+        : extra.signal;
+      return observeToolOperation(config, "write_stdin", async () => {
       const startedAt = performance.now();
       const snapshot = await runLoggedToolOperation(
         config,
@@ -319,12 +324,13 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
               yieldTimeMs,
               maxOutputTokens,
             },
-            { signal: extra.signal },
+            { signal: pollSignal },
           );
         },
       );
 
       return processToolResponse(snapshot);
-    }),
+      });
+    },
   );
 }
