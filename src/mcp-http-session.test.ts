@@ -1180,3 +1180,146 @@ test("disconnect after dispatch does not erase the eventual tool terminal", {
   assert.equal(closed.requestId, start.requestId);
   if (closed.headersSent === false) assert.equal(closed.statusCode, undefined);
 });
+
+test("aborted HTTP write_stdin poll preserves running output and the process handle", {
+  timeout: 10_000,
+}, async (t) => {
+  const logs = captureDiagnosticLogs(t);
+  const fixture = await startFixture(4);
+  t.after(() => fixture.close());
+  const ready = await initializeReadySession(fixture.baseUrl, fixture.accessToken, fixture.project);
+  const marker = `http-poll-cancel-${randomBytes(8).toString("hex")}`;
+  const script = [
+    `setTimeout(()=>console.log('early-${marker}'),50);`,
+    `setTimeout(()=>console.log('done-${marker}'),3000);`,
+  ].join("");
+
+  const startId = nextId++;
+  const started = await postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    {
+      jsonrpc: "2.0",
+      id: startId,
+      method: "tools/call",
+      params: {
+        name: "exec_command",
+        arguments: {
+          workspaceId: ready.workspaceId,
+          cmd: [JSON.stringify(process.execPath), "-e", JSON.stringify(script)].join(" "),
+          yieldTimeMs: 0,
+        },
+      },
+    },
+    ready.sessionId,
+  );
+  assert.equal(started.status, 200);
+  const startedContent = (
+    responseForId(started, startId).result as
+      | { structuredContent?: Record<string, unknown> }
+      | undefined
+  )?.structuredContent;
+  assert.ok(startedContent);
+  assert.equal(startedContent.running, true);
+  assert.equal(typeof startedContent.sessionId, "number");
+  const processSessionId = startedContent.sessionId as number;
+
+  logs.lines.length = 0;
+  const controller = new AbortController();
+  const pollId = nextId++;
+  const abandonedPoll = fetch(`${fixture.baseUrl}/mcp`, {
+    method: "POST",
+    signal: controller.signal,
+    headers: {
+      Authorization: `Bearer ${fixture.accessToken}`,
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
+      "mcp-session-id": ready.sessionId,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: pollId,
+      method: "tools/call",
+      params: {
+        name: "write_stdin",
+        arguments: {
+          workspaceId: ready.workspaceId,
+          sessionId: processSessionId,
+          yieldTimeMs: 800,
+        },
+      },
+    }),
+  }).then((response) => response.text()).catch(() => undefined);
+  t.after(() => controller.abort());
+
+  await waitForCondition(
+    () => logs.events().some((event) =>
+      event.event === "mcp_tool_started" && event.tool === "write_stdin"),
+    2_000,
+  );
+  controller.abort();
+  await abandonedPoll;
+
+  // Wait beyond the abandoned poll's original 800 ms deadline while the
+  // child is still running. Without request-abort propagation, that waiter
+  // would wake and destructively drain the buffered early output.
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  const runningId = nextId++;
+  const running = await postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    {
+      jsonrpc: "2.0",
+      id: runningId,
+      method: "tools/call",
+      params: {
+        name: "write_stdin",
+        arguments: {
+          workspaceId: ready.workspaceId,
+          sessionId: processSessionId,
+          yieldTimeMs: 0,
+        },
+      },
+    },
+    ready.sessionId,
+  );
+  assert.equal(running.status, 200);
+  const runningContent = (
+    responseForId(running, runningId).result as
+      | { structuredContent?: Record<string, unknown> }
+      | undefined
+  )?.structuredContent;
+  assert.ok(runningContent);
+  assert.equal(runningContent.running, true);
+  assert.match(String(runningContent.result), new RegExp(`early-${marker}`));
+
+  const terminalId = nextId++;
+  const terminal = await postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    {
+      jsonrpc: "2.0",
+      id: terminalId,
+      method: "tools/call",
+      params: {
+        name: "write_stdin",
+        arguments: {
+          workspaceId: ready.workspaceId,
+          sessionId: processSessionId,
+          yieldTimeMs: 4_000,
+        },
+      },
+    },
+    ready.sessionId,
+  );
+  assert.equal(terminal.status, 200);
+  const terminalContent = (
+    responseForId(terminal, terminalId).result as
+      | { structuredContent?: Record<string, unknown> }
+      | undefined
+  )?.structuredContent;
+  assert.ok(terminalContent);
+  assert.equal(terminalContent.running, false);
+  assert.equal(terminalContent.exitCode, 0);
+  assert.match(String(terminalContent.result), new RegExp(`done-${marker}`));
+});
