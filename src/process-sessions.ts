@@ -3,9 +3,12 @@ import { randomBytes } from "node:crypto";
 import { gitEnvironment } from "./git-environment.js";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 
-const DEFAULT_EXEC_YIELD_MS = 10_000;
+const DEFAULT_EXEC_YIELD_MS = 30_000;
 const DEFAULT_INTERACTIVE_YIELD_MS = 250;
-const DEFAULT_POLL_YIELD_MS = 5_000;
+// Pure process polling is intentionally patient. A short poll window turns one
+// local command into many MCP round-trips, which is unnecessary when there is
+// no input to deliver and increases orchestration pressure on long turns.
+const DEFAULT_POLL_YIELD_MS = 30_000;
 const MAX_COMMAND_YIELD_MS = 30_000;
 const MAX_POLL_YIELD_MS = 110_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
@@ -289,7 +292,10 @@ export class ProcessSessionManager {
     const writableChars = chars.replaceAll("\u0003", "");
     if (writableChars && session.running) session.process?.write(writableChars);
 
-    if ((interactionRequested || !session.buffer.hasOutput()) && session.running) {
+    // A pure poll is completion-oriented: buffered output alone is not a reason
+    // to spend another MCP tool call. Callers that need an immediate snapshot
+    // can explicitly pass yieldTimeMs=0.
+    if (session.running) {
       const fallback = interactionRequested ? DEFAULT_INTERACTIVE_YIELD_MS : DEFAULT_POLL_YIELD_MS;
       const maximum = interactionRequested ? MAX_COMMAND_YIELD_MS : MAX_POLL_YIELD_MS;
       const yieldTimeMs = boundedInteger(input.yieldTimeMs, fallback, maximum);

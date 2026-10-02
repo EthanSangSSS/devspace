@@ -89,6 +89,82 @@ assert.equal(completed.running, false);
 assert.equal(completed.exitCode, 0);
 assert.match(completed.output, /finished/);
 
+// exec_command should absorb commands that exceed the old 10-second default
+// so callers do not need a follow-up poll for ordinary 10-30 second work.
+const defaultExec = await manager.start({
+  workspaceId: "workspace-a",
+  cwd: process.cwd(),
+  command: `${node} -e "setTimeout(() => console.log('default-exec-finished'), 10500)"`,
+});
+assert.equal(defaultExec.running, false);
+assert.equal(defaultExec.exitCode, 0);
+assert.match(defaultExec.output, /default-exec-finished/);
+
+// The default no-input poll should absorb a moderately long local wait rather
+// than forcing the caller into repeated short write_stdin round-trips.
+const defaultPoll = await manager.start({
+  workspaceId: "workspace-a",
+  cwd: process.cwd(),
+  command: `${node} -e "setTimeout(() => console.log('default-poll-finished'), 6500)"`,
+  yieldTimeMs: 5,
+});
+assert.equal(defaultPoll.running, true);
+assert.ok(defaultPoll.sessionId);
+const defaultPollCompleted = await manager.write({
+  workspaceId: "workspace-a",
+  sessionId: defaultPoll.sessionId,
+});
+assert.equal(defaultPollCompleted.running, false);
+assert.equal(defaultPollCompleted.exitCode, 0);
+assert.match(defaultPollCompleted.output, /default-poll-finished/);
+
+// Buffered output should not force a pure poll to return while the process is
+// still running. The default poll waits for completion and returns all output.
+const bufferedPoll = await manager.start({
+  workspaceId: "workspace-a",
+  cwd: process.cwd(),
+  command: `${node} -e "setTimeout(() => console.log('buffered-output'), 100); setTimeout(() => console.log('buffered-done'), 600)"`,
+  yieldTimeMs: 5,
+});
+assert.equal(bufferedPoll.running, true);
+assert.ok(bufferedPoll.sessionId);
+await new Promise((resolve) => setTimeout(resolve, 250));
+const bufferedPollCompleted = await manager.write({
+  workspaceId: "workspace-a",
+  sessionId: bufferedPoll.sessionId,
+});
+assert.equal(bufferedPollCompleted.running, false);
+assert.equal(bufferedPollCompleted.exitCode, 0);
+assert.match(bufferedPollCompleted.output, /buffered-output/);
+assert.match(bufferedPollCompleted.output, /buffered-done/);
+
+// Explicit zero-wait polling remains available for callers that deliberately
+// want to inspect buffered output without waiting for process completion.
+const immediatePoll = await manager.start({
+  workspaceId: "workspace-a",
+  cwd: process.cwd(),
+  command: `${node} -e "setTimeout(() => console.log('immediate-output'), 100); setTimeout(() => console.log('immediate-done'), 800)"`,
+  yieldTimeMs: 5,
+});
+assert.equal(immediatePoll.running, true);
+assert.ok(immediatePoll.sessionId);
+await new Promise((resolve) => setTimeout(resolve, 250));
+const immediateSnapshot = await manager.write({
+  workspaceId: "workspace-a",
+  sessionId: immediatePoll.sessionId,
+  yieldTimeMs: 0,
+});
+assert.equal(immediateSnapshot.running, true);
+assert.match(immediateSnapshot.output, /immediate-output/);
+const immediateCompleted = await manager.write({
+  workspaceId: "workspace-a",
+  sessionId: immediatePoll.sessionId,
+  yieldTimeMs: 2_000,
+});
+assert.equal(immediateCompleted.running, false);
+assert.equal(immediateCompleted.exitCode, 0);
+assert.match(immediateCompleted.output, /immediate-done/);
+
 const interactive = await manager.start({
   workspaceId: "workspace-a",
   cwd: process.cwd(),
