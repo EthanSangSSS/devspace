@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Template only. Resolve every placeholder and inspect before bootstrap.
+         Keep outside Library/LaunchAgents: this is a one-shot operator. -->
+    <key>Label</key>
+    <string>com.ethan.devspace.rollout-operator.REPLACE_UNIQUE_NONCE</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>REPLACE_ABSOLUTE_NODE_PATH</string>
+        <string>REPLACE_ABSOLUTE_CHECKOUT/node_modules/tsx/dist/cli.mjs</string>
+        <string>REPLACE_ABSOLUTE_CHECKOUT/scripts/devspace-macos-rollout.ts</string>
+        <string>rollout</string>
+        <string>--expected-live-entrypoint</string>
+        <string>REPLACE_EXPECTED_LIVE_ENTRYPOINT</string>
+        <string>--expected-live-plist-sha256</string>
+        <string>REPLACE_EXPECTED_LIVE_PLIST_SHA256</string>
+        <string>--candidate-entrypoint</string>
+        <string>REPLACE_CANDIDATE_ENTRYPOINT</string>
+        <string>--candidate-slot-manifest-sha256</string>
+        <string>REPLACE_CANDIDATE_SLOT_MANIFEST_SHA256</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>REPLACE_ABSOLUTE_CHECKOUT</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>LANG</key>
+        <string>C</string>
+        <key>LC_ALL</key>
+        <string>C</string>
+    </dict>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>LaunchOnlyOnce</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>REPLACE_EXISTING_PRIVATE_DIRECTORY/result.log</string>
+    <key>StandardErrorPath</key>
+    <string>REPLACE_EXISTING_PRIVATE_DIRECTORY/error.log</string>
+</dict>
+</plist>

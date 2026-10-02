@@ -39,6 +39,54 @@ There are no caller-selectable `--label`, `--port`, `--plist`, or arbitrary topo
 
 Run the production command from an independent operator context that is not a descendant of the live DevSpace process. Do not use `launchctl submit` as a one-shot wrapper for this command: macOS documents that `submit` keeps a failed program alive, so a non-zero rollout result can be retried repeatedly. If automation is required, use an explicitly disposable operator definition whose restart policy is off and whose lifecycle is separately verified.
 
+### Disposable operator scheduling
+
+For a user-requested rollout launched through launchd, start from
+[`examples/macos-rollout-operator.plist`](../examples/macos-rollout-operator.plist).
+It pins `ProcessType=Interactive`, `KeepAlive=false`, `LaunchOnlyOnce=true`,
+`RunAtLoad=true`, and `LANG=C` / `LC_ALL=C`. These settings belong to the
+short-lived operator, not to the production DevSpace LaunchAgent. A terminal
+operator should also set `LANG=C LC_ALL=C` for the command so `ps lstart` has
+the format expected by the identity parser.
+
+The operator has bounded identity checks, including a 5-second `lsof` deadline.
+macOS documents resource restrictions for `Background` jobs in
+`man 5 launchd.plist`; a scheduling delay can exhaust that deadline without
+proving a process identity mismatch. Use `Interactive` for this short,
+user-requested operation so those checks are not deliberately background
+throttled. This is not a guarantee against system-wide load or every timeout.
+
+Prepare the operator as follows:
+
+1. Copy the template to a transaction-specific location outside
+   `~/Library/LaunchAgents`. Replace every `REPLACE_...` value, including a
+   unique label, the absolute Node and checkout paths, fresh expected hashes,
+   and distinct output paths in an existing private directory. Use an already
+   qualified checkout with its existing dependencies. The template invokes the
+   checkout's `tsx` CLI by absolute path and then the helper directly; it
+   contains no shell loop, package-resolution dependency, or retry wrapper.
+2. Inspect all resolved arguments and run `plutil -lint` on that exact file.
+   Verify there are no remaining placeholders, periodic triggers, or
+   `KeepAlive` conditions. Run qualification and bounded read-only identity
+   probes in the same operator execution context before the separately
+   authorized production switch. A terminal-only probe does not qualify a
+   differently scheduled launchd operator.
+3. Bootstrap the prepared definition only when the production switch is
+   authorized: `RunAtLoad=true` starts the rollout immediately. Do not also
+   issue `kickstart`, `start`, or resubmit it when output is slow. Read its
+   result and transaction evidence before deciding whether another attempt is
+   needed; an uncertain result is not permission to retry.
+4. After a terminal result, unload only that exact disposable label and verify
+   it is absent. Preserve its plist, result, and transaction evidence for the
+   audit. Do not install the operator as a persistent login job.
+
+If an identity probe times out, retain the helper's fail-closed result. Record
+the command duration/termination, operator scheduling settings, and fresh live
+PID/argv before a later attempt. Do not increase the deadline, skip `lsof`, or
+weaken identity/CAS checks to make a rollout pass. `Background` versus
+`Interactive` timing differences support a scheduling explanation but do not
+by themselves exclude other I/O or machine-load causes.
+
 ## Mandatory qualification gate
 
 Before the first production-label rollout on a target macOS major version, `qualify` must pass on that machine. Re-qualify after a macOS major-version change.
