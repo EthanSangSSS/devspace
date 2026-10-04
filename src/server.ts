@@ -25,6 +25,7 @@ import {
   isArtifactDownloadSupportedPlatform,
   registerArtifactTools,
 } from "./artifact-tools.js";
+import { registerCompanyAgentTools } from "./company-agent-tools.js";
 import { loadConfig, type ServerConfig } from "./config.js";
 import {
   AgyDelegationService,
@@ -183,8 +184,11 @@ function serverInstructions(
     : "";
   const agents = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
   const common = `Use DevSpace as the primary local execution path for coding and repository work. When the user names a local project, checkout, or worktree path and no usable workspaceId exists, call ${toolNames.openWorkspace} before treating the task as blocked or handing local execution to another agent. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. An allowed-root rejection is a workspace authorization boundary for that path, not evidence that DevSpace, the local machine, or Agy is unavailable. Do not bypass that boundary with shell commands or delegated agents; restore legitimate workspace authorization and retry ${toolNames.openWorkspace}.`;
+  const companyAgentInstruction = config.companyAgent.enabled
+    ? " For normal Company Agent analysis, prefer the company_agent_* product tools over generic shell/database access. Those tools use a fixed server-configured product instance; generic DevSpace engineering capabilities remain available for explicit investigation or implementation."
+    : "";
 
-  return `${common} ${toolSurface.instructions({ agents, skills })}${artifactInstruction}${showChangesInstruction}`;
+  return `${common} ${toolSurface.instructions({ agents, skills })}${artifactInstruction}${showChangesInstruction}${companyAgentInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -649,6 +653,8 @@ export function createMcpServer(
     });
     registerAgyDelegationTools(server, config, workspaces, agyDelegationService);
   }
+
+  registerCompanyAgentTools(server, config);
 
   registerAppResource(
     server,
