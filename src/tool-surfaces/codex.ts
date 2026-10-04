@@ -104,7 +104,7 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
       }),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, patch }) => observeToolOperation(config, "apply_patch", async () => {
+    async ({ workspaceId, patch }, { requestId }) => observeToolOperation(config, "apply_patch", async () => {
       const startedAt = performance.now();
       const applied = await runLoggedToolOperation(
         config,
@@ -128,7 +128,7 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
           files: applied.files,
         },
       };
-    }),
+    }, { rpcRequestId: requestId }),
   );
 }
 
@@ -199,7 +199,7 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
       workingDirectory,
       yieldTimeMs,
       maxOutputTokens,
-    }) => observeToolOperation(config, "exec_command", async () => {
+    }, { requestId }) => observeToolOperation(config, "exec_command", async () => {
       const startedAt = performance.now();
       const snapshot = await runLoggedToolOperation(
         config,
@@ -232,7 +232,7 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
       );
 
       return processToolResponse(snapshot);
-    }),
+    }, { rpcRequestId: requestId }),
   );
 
   server.registerTool(
@@ -330,7 +330,7 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
       );
 
       return processToolResponse(snapshot);
-      });
+      }, { rpcRequestId: extra.requestId });
     },
   );
 }

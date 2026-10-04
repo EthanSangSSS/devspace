@@ -102,7 +102,7 @@ async function bootstrapOAuth(baseUrl: string, ownerToken: string): Promise<stri
 async function postMcp(
   baseUrl: string,
   accessToken: string,
-  message: Record<string, unknown>,
+  message: Record<string, unknown> | Array<Record<string, unknown>>,
   sessionId?: string,
 ): Promise<McpHttpResult> {
   const headers: Record<string, string> = {
@@ -1097,6 +1097,216 @@ test("real SDK HTTP dispatch correlates concurrent calls without session or RPC-
   }
 });
 
+test("tool result HTTP lifecycle proves server finish with opaque host correlations", {
+  timeout: 10_000,
+}, async (t) => {
+  const logs = captureDiagnosticLogs(t);
+  const fixture = await startFixture(4);
+  t.after(() => fixture.close());
+  const ready = await initializeReadySession(fixture.baseUrl, fixture.accessToken, fixture.project);
+  const initialized = logs.events().find((event) => event.event === "mcp_session_client_bound");
+  assert.ok(initialized);
+  assert.equal(typeof initialized.clientCorrelation, "string");
+  assert.equal(typeof initialized.sessionCorrelation, "string");
+  assert.notEqual(initialized.sessionCorrelation, ready.sessionId.slice(0, 16));
+
+  logs.lines.length = 0;
+  const conversationSecret = "SYNTHETIC_OPENAI_SESSION_SECRET";
+  const id = nextId++;
+  const response = await postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    {
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: {
+        name: "exec_command",
+        arguments: {
+          workspaceId: ready.workspaceId,
+          cmd: `"${process.execPath}" -e "process.exit(0)"`,
+          yieldTimeMs: 1_000,
+        },
+        _meta: { "openai/session": conversationSecret },
+      },
+    },
+    ready.sessionId,
+  );
+  assert.equal(response.status, 200);
+  assert.equal("error" in responseForId(response, id), false);
+
+  const events = logs.events();
+  const start = events.find((event) => event.event === "mcp_tool_started");
+  const finish = events.find((event) => event.event === "mcp_tool_finished");
+  const httpFinished = events.find(
+    (event) => event.event === "mcp_http_tool_result_response_finished",
+  );
+  assert.ok(start);
+  assert.ok(finish);
+  assert.ok(httpFinished);
+  assert.equal(finish.requestId, start.requestId);
+  assert.equal(httpFinished.requestId, start.requestId);
+  assert.equal(httpFinished.toolCallId, start.toolCallId);
+  assert.equal(httpFinished.tool, "exec_command");
+  assert.equal(httpFinished.outcome, "process_exit_zero");
+  assert.equal(httpFinished.statusCode, 200);
+  assert.equal(httpFinished.sessionCorrelation, start.sessionCorrelation);
+  assert.equal(start.clientCorrelation, initialized.clientCorrelation);
+  assert.equal(httpFinished.clientCorrelation, initialized.clientCorrelation);
+  assert.equal(typeof start.conversationCorrelation, "string");
+  assert.equal(httpFinished.conversationCorrelation, start.conversationCorrelation);
+  assert.notEqual(start.conversationCorrelation, conversationSecret);
+
+  const output = logs.lines.join("\n");
+  for (const forbidden of [conversationSecret, fixture.accessToken, ready.sessionId]) {
+    assert.equal(output.includes(forbidden), false);
+  }
+});
+
+test("HTTP finish before tool terminal marks result delivery unproven", {
+  timeout: 10_000,
+}, async (t) => {
+  const logs = captureDiagnosticLogs(t);
+  const fixture = await startFixture(4);
+  t.after(() => fixture.close());
+  const ready = await initializeReadySession(fixture.baseUrl, fixture.accessToken, fixture.project);
+  logs.lines.length = 0;
+
+  const id = nextId++;
+  const slowCall = postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    {
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: {
+        name: "exec_command",
+        arguments: {
+          workspaceId: ready.workspaceId,
+          cmd: `"${process.execPath}" -e "setTimeout(()=>process.exit(0),500)"`,
+          yieldTimeMs: 1_000,
+        },
+      },
+    },
+    ready.sessionId,
+  );
+
+  await waitForCondition(
+    () => logs.events().some((event) => event.event === "mcp_tool_started"),
+    2_000,
+  );
+  assert.equal(await deleteMcpSession(fixture.baseUrl, fixture.accessToken, ready.sessionId), 200);
+  const earlyResponse = await slowCall;
+  assert.equal(earlyResponse.status, 200);
+  assert.equal(earlyResponse.messages.length, 0);
+
+  await waitForCondition(
+    () => logs.events().some((event) => event.event === "mcp_tool_finished"),
+    3_000,
+  );
+  const events = logs.events();
+  const start = events.find((event) => event.event === "mcp_tool_started");
+  const finish = events.find((event) => event.event === "mcp_tool_finished");
+  const unproven = events.filter(
+    (event) => event.event === "mcp_http_tool_result_delivery_unproven",
+  );
+  assert.ok(start);
+  assert.ok(finish);
+  assert.equal(finish.outcome, "process_exit_zero");
+  assert.equal(unproven.length, 1);
+  assert.equal(unproven[0]?.requestId, start.requestId);
+  assert.equal(unproven[0]?.toolCallId, start.toolCallId);
+  assert.equal(unproven[0]?.outcome, "process_exit_zero");
+  assert.equal(
+    events.some((event) => event.event === "mcp_http_tool_result_response_finished"),
+    false,
+  );
+});
+
+test("batched tool calls retain per-tool terminal and conversation attribution", {
+  timeout: 10_000,
+}, async (t) => {
+  const logs = captureDiagnosticLogs(t);
+  const fixture = await startFixture(4);
+  t.after(() => fixture.close());
+  const ready = await initializeReadySession(fixture.baseUrl, fixture.accessToken, fixture.project);
+  logs.lines.length = 0;
+
+  const firstId = nextId++;
+  const secondId = nextId++;
+  const firstConversation = "SYNTHETIC_BATCH_CONVERSATION_A";
+  const secondConversation = "SYNTHETIC_BATCH_CONVERSATION_B";
+  const response = await postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    [
+      {
+        jsonrpc: "2.0",
+        id: firstId,
+        method: "tools/call",
+        params: {
+          name: "exec_command",
+          arguments: {
+            workspaceId: ready.workspaceId,
+            cmd: `"${process.execPath}" -e "process.exit(0)"`,
+            yieldTimeMs: 1_000,
+          },
+          _meta: { "openai/session": firstConversation },
+        },
+      },
+      {
+        jsonrpc: "2.0",
+        id: secondId,
+        method: "tools/call",
+        params: {
+          name: "exec_command",
+          arguments: {
+            workspaceId: ready.workspaceId,
+            cmd: `"${process.execPath}" -e "process.exit(0)"`,
+            yieldTimeMs: 1_000,
+          },
+          _meta: { "openai/session": secondConversation },
+        },
+      },
+    ],
+    ready.sessionId,
+  );
+  assert.equal(response.status, 200);
+  assert.equal(response.messages.length, 2);
+  assert.equal("error" in responseForId(response, firstId), false);
+  assert.equal("error" in responseForId(response, secondId), false);
+
+  const events = logs.events();
+  const starts = events.filter((event) => event.event === "mcp_tool_started");
+  const finishes = events.filter((event) => event.event === "mcp_tool_finished");
+  const delivered = events.filter(
+    (event) => event.event === "mcp_http_tool_result_response_finished",
+  );
+  assert.equal(starts.length, 2);
+  assert.equal(finishes.length, 2);
+  assert.equal(delivered.length, 2);
+  assert.notEqual(starts[0]?.toolCallId, starts[1]?.toolCallId);
+
+  const correlations = new Set<string>();
+  for (const start of starts) {
+    assert.equal(typeof start.conversationCorrelation, "string");
+    correlations.add(start.conversationCorrelation as string);
+    const finish = finishes.find((event) => event.toolCallId === start.toolCallId);
+    const http = delivered.find((event) => event.toolCallId === start.toolCallId);
+    assert.ok(finish);
+    assert.ok(http);
+    assert.equal(finish.conversationCorrelation, start.conversationCorrelation);
+    assert.equal(http.conversationCorrelation, start.conversationCorrelation);
+    assert.equal(http.outcome, "process_exit_zero");
+  }
+  assert.equal(correlations.size, 2);
+
+  const output = logs.lines.join("\n");
+  assert.equal(output.includes(firstConversation), false);
+  assert.equal(output.includes(secondConversation), false);
+});
+
 test("MCP route variants and errors emit only whitelisted diagnostic fields", {
   timeout: 15_000,
 }, async (t) => {
@@ -1137,7 +1347,7 @@ test("MCP route variants and errors emit only whitelisted diagnostic fields", {
   assert.equal(events.filter((event) => event.event === "mcp_http_early_response_finished").length, 3);
   const allowed = new Set(["ts", "level", "event", "runtimeGeneration", "requestId", "sessionCorrelation",
     "type", "method", "path", "status", "durationMs", "headersSent", "statusCode", "responsePhase",
-    "tool", "toolCallId", "outcome", "errorClass"]);
+    "tool", "toolCallId", "outcome", "errorClass", "clientCorrelation", "conversationCorrelation"]);
   for (const event of events) assert.ok(Object.keys(event).every((key) => allowed.has(key)), String(event.event));
   const output = logs.lines.join("\n");
   for (const forbidden of [secret, fixture.accessToken, ready.sessionId, fixture.project]) {
@@ -1179,6 +1389,13 @@ test("disconnect after dispatch does not erase the eventual tool terminal", {
   assert.ok(closed);
   assert.equal(closed.requestId, start.requestId);
   if (closed.headersSent === false) assert.equal(closed.statusCode, undefined);
+  const unfinished = events.find(
+    (event) => event.event === "mcp_http_tool_result_response_unfinished",
+  );
+  assert.ok(unfinished);
+  assert.equal(unfinished.requestId, start.requestId);
+  assert.equal(unfinished.toolCallId, start.toolCallId);
+  assert.equal(unfinished.outcome, "process_exit_zero");
 });
 
 test("aborted HTTP write_stdin poll preserves running output and the process handle", {
