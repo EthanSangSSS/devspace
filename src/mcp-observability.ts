@@ -6,7 +6,11 @@ interface RequestContext {
   runtimeGeneration: string;
   requestId: string;
   sessionCorrelation?: string;
+  clientCorrelation?: string;
+  conversationCorrelation?: string;
+  conversationCorrelationForRequest?: (requestId: string | number) => string | undefined;
   requestSignal?: AbortSignal;
+  onToolTerminal?: (terminal: ToolTerminalObservation) => void;
 }
 
 interface ObservationContext extends Partial<RequestContext> {
@@ -20,7 +24,11 @@ export function withMcpRequestContext<T>(fields: RequestContext, action: () => T
     runtimeGeneration: fields.runtimeGeneration,
     requestId: fields.requestId,
     sessionCorrelation: fields.sessionCorrelation,
+    clientCorrelation: fields.clientCorrelation,
+    conversationCorrelation: fields.conversationCorrelation,
+    conversationCorrelationForRequest: fields.conversationCorrelationForRequest,
     requestSignal: fields.requestSignal,
+    onToolTerminal: fields.onToolTerminal,
   }, action);
 }
 
@@ -43,8 +51,20 @@ export function httpMethodLabel(method: string): string {
     ? method : "OTHER";
 }
 
-type ObservedTool = "open_workspace" | "read" | "apply_patch" | "exec_command"
+export type ObservedTool = "open_workspace" | "read" | "apply_patch" | "exec_command"
   | "write_stdin" | "show_changes" | "get_agy_runtime" | "delegate_to_agy";
+
+export interface ToolTerminalObservation {
+  toolCallId: string;
+  tool: ObservedTool;
+  outcome: string;
+  durationMs: number;
+  conversationCorrelation?: string;
+}
+
+interface ToolObservationOptions {
+  rpcRequestId?: string | number;
+}
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object"
@@ -76,40 +96,67 @@ export async function observeToolOperation<T>(
   config: { logging: LoggingConfig },
   tool: ObservedTool,
   operation: () => Promise<T>,
+  options: ToolObservationOptions = {},
 ): Promise<T> {
   const parent = context.getStore();
+  const scopedConversationCorrelation = options.rpcRequestId !== undefined
+    ? parent?.conversationCorrelationForRequest?.(options.rpcRequestId)
+      ?? parent?.conversationCorrelation
+    : parent?.conversationCorrelation;
   const fields = {
     runtimeGeneration: parent?.runtimeGeneration,
     requestId: parent?.requestId,
     sessionCorrelation: parent?.sessionCorrelation,
+    clientCorrelation: parent?.clientCorrelation,
+    conversationCorrelation: scopedConversationCorrelation,
     toolCallId: randomUUID(),
     tool,
   };
-  return context.run({ ...fields, requestSignal: parent?.requestSignal }, async () => {
+  return context.run({
+    ...fields,
+    requestSignal: parent?.requestSignal,
+    onToolTerminal: parent?.onToolTerminal,
+    conversationCorrelationForRequest: parent?.conversationCorrelationForRequest,
+  }, async () => {
     const startedAt = performance.now();
-    const emit = (phase: "started" | "finished", result?: string): void => {
+    const emit = (phase: "started" | "finished", result?: string, durationMs?: number): void => {
       if (!config.logging.toolCalls) return;
       logEvent(config.logging, result === "threw" || result === "tool_error" ? "warn" : "info",
         `mcp_tool_${phase}`, {
           ...fields,
           ...(phase === "finished" ? {
             outcome: result,
-            durationMs: Math.round(performance.now() - startedAt),
+            durationMs,
           } : {}),
         });
+    };
+    const finish = (terminalOutcome: string): void => {
+      const durationMs = Math.round(performance.now() - startedAt);
+      emit("finished", terminalOutcome, durationMs);
+      try {
+        parent?.onToolTerminal?.({
+          toolCallId: fields.toolCallId,
+          tool,
+          outcome: terminalOutcome,
+          durationMs,
+          conversationCorrelation: scopedConversationCorrelation,
+        });
+      } catch {
+        // Diagnostics must never change an already completed tool operation.
+      }
     };
     emit("started");
     let result: T;
     try {
       result = await operation();
     } catch (error) {
-      emit("finished", "threw");
+      finish("threw");
       throw error;
     }
     // Never let diagnostics turn an already completed operation into a failure.
     let terminal = "unclassified";
     try { terminal = outcome(tool, result); } catch { /* Uninspectable result. */ }
-    emit("finished", terminal);
+    finish(terminal);
     return result;
   });
 }
