@@ -73,6 +73,37 @@ test("nested legacy completion logs are suppressed and direct logs use a whiteli
   assert.ok(!lines.join("\n").includes("CANARY"));
 });
 
+test("tool lifecycle carries opaque host correlations and reports one terminal callback", async (t) => {
+  const lines: string[] = [];
+  const terminals: Array<Record<string, unknown>> = [];
+  const original = console.log;
+  console.log = (line: unknown) => { lines.push(String(line)); };
+  t.after(() => { console.log = original; });
+  const result = { structuredContent: { running: false, exitCode: 0 } };
+  await withMcpRequestContext({
+    runtimeGeneration: "runtime",
+    requestId: "request",
+    sessionCorrelation: "session-correlation",
+    clientCorrelation: "client-correlation",
+    conversationCorrelation: "conversation-correlation",
+    onToolTerminal: (terminal) => terminals.push({ ...terminal }),
+  }, () => observeToolOperation({ logging }, "exec_command", async () => result));
+
+  assert.equal(terminals.length, 1);
+  assert.equal(terminals[0]?.tool, "exec_command");
+  assert.equal(terminals[0]?.outcome, "process_exit_zero");
+  assert.equal(typeof terminals[0]?.toolCallId, "string");
+  assert.equal(typeof terminals[0]?.durationMs, "number");
+  const events = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+  assert.equal(events.length, 2);
+  for (const event of events) {
+    assert.equal(event.clientCorrelation, "client-correlation");
+    assert.equal(event.conversationCorrelation, "conversation-correlation");
+    assert.equal(event.sessionCorrelation, "session-correlation");
+  }
+  assert.equal(events[1]?.toolCallId, terminals[0]?.toolCallId);
+});
+
 test("failed logging sinks cannot fail or repeat an operation", async (t) => {
   const originalLog = console.log;
   const originalWarn = console.warn;

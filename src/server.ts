@@ -39,7 +39,14 @@ import {
   logEvent,
   requestPath,
 } from "./logger.js";
-import { httpMethodLabel, isMcpPath, observeToolOperation, withMcpRequestContext } from "./mcp-observability.js";
+import {
+  httpMethodLabel,
+  isMcpPath,
+  observeToolOperation,
+  withMcpRequestContext,
+  type ObservedTool,
+  type ToolTerminalObservation,
+} from "./mcp-observability.js";
 import { readFileTool } from "./pi-tools.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import {
@@ -95,15 +102,23 @@ export interface McpHttpLifecycleEvent {
     | "request_start"
     | "request_aborted"
     | "early_response_finished"
-    | "response_closed_before_finish";
+    | "response_closed_before_finish"
+    | "tool_result_response_finished"
+    | "tool_result_response_unfinished"
+    | "tool_result_delivery_unproven";
   requestId: string;
   sessionCorrelation?: string;
+  clientCorrelation?: string;
+  conversationCorrelation?: string;
   method: string;
   path: string;
   durationMs?: number;
   headersSent?: boolean;
   statusCode?: number;
   responsePhase?: "before_headers" | "headers_sent";
+  toolCallId?: string;
+  tool?: ObservedTool;
+  outcome?: string;
 }
 
 interface RunningServer {
@@ -120,6 +135,38 @@ interface WorkspaceAppManifestEntry {
 }
 
 type WorkspaceAppManifest = Record<string, WorkspaceAppManifestEntry>;
+
+function rpcRequestKey(requestId: string | number): string {
+  return `${typeof requestId}:${String(requestId)}`;
+}
+
+function openAiConversationScopeIdFromRequest(request: unknown): string | undefined {
+  if (request === null || typeof request !== "object" || Array.isArray(request)) return undefined;
+  const params = (request as Record<string, unknown>).params;
+  if (params === null || typeof params !== "object" || Array.isArray(params)) return undefined;
+  return openAiConversationScopeId((params as Record<string, unknown>)._meta);
+}
+
+function requestOpenAiConversationScopes(body: unknown): {
+  requestScopeId?: string;
+  byRequestId: Map<string, string>;
+} {
+  const byRequestId = new Map<string, string>();
+  const requests = Array.isArray(body) ? body : [body];
+  for (const request of requests) {
+    if (request === null || typeof request !== "object" || Array.isArray(request)) continue;
+    const record = request as Record<string, unknown>;
+    const requestId = record.id;
+    const scopeId = openAiConversationScopeIdFromRequest(request);
+    if ((typeof requestId === "string" || typeof requestId === "number") && scopeId) {
+      byRequestId.set(rpcRequestKey(requestId), scopeId);
+    }
+  }
+  return {
+    requestScopeId: Array.isArray(body) ? undefined : openAiConversationScopeIdFromRequest(body),
+    byRequestId,
+  };
+}
 
 function serverInstructions(
   config: ServerConfig,
@@ -338,7 +385,7 @@ function registerAgyDelegationTools(
       },
       _meta: {},
     },
-    async () => observeToolOperation(config, "get_agy_runtime", async () => {
+    async (_input, { requestId }) => observeToolOperation(config, "get_agy_runtime", async () => {
       const startedAt = performance.now();
       const runtime = await service.inspectRuntime();
       const result = `Agy ${runtime.agyVersion} available; configured model ${runtime.requiredModel}, effort ${runtime.requiredEffort}.`;
@@ -370,7 +417,7 @@ function registerAgyDelegationTools(
           runtime_session_state: "task-local-no-resume" as const,
         },
       };
-    }),
+    }, { rpcRequestId: requestId }),
   );
 
   registerAppTool(
@@ -438,7 +485,7 @@ function registerAgyDelegationTools(
       },
       _meta: {},
     },
-    async (input) => observeToolOperation(config, "delegate_to_agy", async () => {
+    async (input, { requestId }) => observeToolOperation(config, "delegate_to_agy", async () => {
       const startedAt = performance.now();
       const dryRun = input.dry_run ?? false;
       let request: AgyDelegationRequest;
@@ -487,7 +534,7 @@ function registerAgyDelegationTools(
         durationMs: Math.round(performance.now() - startedAt),
       });
       return agyDelegationToolResponse(delegated);
-    }),
+    }, { rpcRequestId: requestId }),
   );
 }
 
@@ -696,7 +743,7 @@ export function createMcpServer(
         : {},
       annotations: { readOnlyHint: true },
     },
-    async ({ path, mode, baseRef }, { _meta }) => observeToolOperation(config, "open_workspace", async () => {
+    async ({ path, mode, baseRef }, { _meta, requestId }) => observeToolOperation(config, "open_workspace", async () => {
       const startedAt = performance.now();
       const {
         workspace,
@@ -817,7 +864,7 @@ export function createMcpServer(
           instruction,
         },
       };
-    }),
+    }, { rpcRequestId: requestId }),
   );
 
   server.registerTool(
@@ -861,7 +908,7 @@ export function createMcpServer(
       outputSchema: resultOutputSchema(),
       annotations: { readOnlyHint: true },
     },
-    async ({ workspaceId, ...input }) => observeToolOperation(config, "read", async () => {
+    async ({ workspaceId, ...input }, { requestId }) => observeToolOperation(config, "read", async () => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const readPath = workspaces.resolveReadPath(workspace, input.path);
@@ -898,7 +945,7 @@ export function createMcpServer(
           result: contentText(response.content),
         },
       };
-    }),
+    }, { rpcRequestId: requestId }),
   );
 
   toolSurface.register({
@@ -925,7 +972,7 @@ export function createMcpServer(
       ...workspaceAppDescriptorMeta(config),
       annotations: { readOnlyHint: true },
     },
-    async ({ workspaceId }, { _meta }) => observeToolOperation(config, "show_changes", async () => {
+    async ({ workspaceId }, { _meta, requestId }) => observeToolOperation(config, "show_changes", async () => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const reviewRef = typeof _meta?.["devspace/reviewRef"] === "string"
@@ -969,7 +1016,7 @@ export function createMcpServer(
           result: contentText(content),
         },
       };
-    }),
+    }, { rpcRequestId: requestId }),
   );
 
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
@@ -1027,6 +1074,8 @@ export function createServer(
   const app = express();
   const runtimeGeneration = randomUUID();
   const sessionCorrelationKey = randomBytes(32);
+  const clientCorrelationKey = randomBytes(32);
+  const conversationCorrelationKey = randomBytes(32);
   let missDetailWindowStartedAt = Date.now();
   let missDetailsInWindow = 0;
   let sessionMissLogSuppressedTotal = 0;
@@ -1041,12 +1090,61 @@ export function createServer(
           .slice(0, MCP_SESSION_CORRELATION_LENGTH)
       : undefined;
 
+  const opaqueCorrelation = (
+    key: Buffer,
+    value: string | undefined,
+  ): string | undefined => value
+    ? createHmac("sha256", key)
+        .update(value)
+        .digest("hex")
+        .slice(0, MCP_SESSION_CORRELATION_LENGTH)
+    : undefined;
+
+  const clientCorrelation = (clientId: string | undefined): string | undefined =>
+    opaqueCorrelation(clientCorrelationKey, clientId);
+  const conversationCorrelation = (conversationId: string | undefined): string | undefined =>
+    opaqueCorrelation(conversationCorrelationKey, conversationId);
+
   const emitHttpLifecycle = (event: McpHttpLifecycleEvent): void => {
     options.httpLifecycleObserver?.(event);
     if (!config.logging.requests) return;
     logEvent(config.logging, "info", `mcp_http_${event.type}`, {
       runtimeGeneration,
       ...event,
+    });
+  };
+
+  const emitToolResultHttpLifecycle = (
+    res: Response,
+    type:
+      | "tool_result_response_finished"
+      | "tool_result_response_unfinished"
+      | "tool_result_delivery_unproven",
+    terminal: ToolTerminalObservation,
+  ): void => {
+    const emitted = res.locals.mcpToolResultHttpLifecycleEmitted as Set<string> | undefined
+      ?? new Set<string>();
+    res.locals.mcpToolResultHttpLifecycleEmitted = emitted;
+    if (emitted.has(terminal.toolCallId)) return;
+    emitted.add(terminal.toolCallId);
+    const startedAt = res.locals.mcpHttpStartedAt as number | undefined;
+    emitHttpLifecycle({
+      type,
+      requestId: res.locals.requestId as string,
+      sessionCorrelation: res.locals.sessionCorrelation as string | undefined,
+      clientCorrelation: res.locals.clientCorrelation as string | undefined,
+      conversationCorrelation: terminal.conversationCorrelation,
+      method: res.locals.mcpHttpMethod as string,
+      path: "/mcp",
+      durationMs: startedAt === undefined
+        ? undefined
+        : Math.round(performance.now() - startedAt),
+      headersSent: res.headersSent,
+      statusCode: res.headersSent ? res.statusCode : undefined,
+      responsePhase: res.headersSent ? "headers_sent" : "before_headers",
+      toolCallId: terminal.toolCallId,
+      tool: terminal.tool,
+      outcome: terminal.outcome,
     });
   };
 
@@ -1065,6 +1163,8 @@ export function createServer(
     let responseFinished = false;
     res.locals.requestId = requestId;
     res.locals.sessionCorrelation = correlation;
+    res.locals.mcpHttpStartedAt = startedAt;
+    res.locals.mcpHttpMethod = method;
 
     if (path === "/mcp") {
       const requestAbortController = new AbortController();
@@ -1091,6 +1191,11 @@ export function createServer(
 
       res.once("finish", () => {
         responseFinished = true;
+        res.locals.mcpResponseFinished = true;
+        const terminals = res.locals.mcpToolTerminals as Map<string, ToolTerminalObservation> | undefined;
+        for (const terminal of terminals?.values() ?? []) {
+          emitToolResultHttpLifecycle(res, "tool_result_response_finished", terminal);
+        }
         if (res.locals.mcpDetailedHttpLoggerReached === true) return;
         emitHttpLifecycle({
           type: "early_response_finished",
@@ -1106,6 +1211,11 @@ export function createServer(
       });
       res.once("close", () => {
         if (responseFinished) return;
+        res.locals.mcpResponseClosedBeforeFinish = true;
+        const terminals = res.locals.mcpToolTerminals as Map<string, ToolTerminalObservation> | undefined;
+        for (const terminal of terminals?.values() ?? []) {
+          emitToolResultHttpLifecycle(res, "tool_result_response_unfinished", terminal);
+        }
         requestAbortController.abort();
         emitHttpLifecycle({
           type: "response_closed_before_finish",
@@ -1311,6 +1421,29 @@ export function createServer(
       return;
     }
 
+    const requestClientCorrelation = clientCorrelation(req.auth.clientId);
+    const requestConversationScopes = requestOpenAiConversationScopes(req.body);
+    const requestConversationCorrelation = conversationCorrelation(
+      requestConversationScopes.requestScopeId,
+    );
+    const conversationCorrelationForRequest = (rpcRequestId: string | number): string | undefined =>
+      conversationCorrelation(
+        requestConversationScopes.byRequestId.get(rpcRequestKey(rpcRequestId)),
+      );
+    res.locals.clientCorrelation = requestClientCorrelation;
+    res.locals.conversationCorrelation = requestConversationCorrelation;
+    const onToolTerminal = (terminal: ToolTerminalObservation): void => {
+      const terminals = res.locals.mcpToolTerminals as Map<string, ToolTerminalObservation> | undefined
+        ?? new Map<string, ToolTerminalObservation>();
+      terminals.set(terminal.toolCallId, terminal);
+      res.locals.mcpToolTerminals = terminals;
+      if (res.locals.mcpResponseClosedBeforeFinish === true) {
+        emitToolResultHttpLifecycle(res, "tool_result_response_unfinished", terminal);
+      } else if (res.locals.mcpResponseFinished === true) {
+        emitToolResultHttpLifecycle(res, "tool_result_delivery_unproven", terminal);
+      }
+    };
+
     logEvent(config.logging, "debug", "mcp_request", {
       runtimeGeneration,
       requestId,
@@ -1352,7 +1485,11 @@ export function createServer(
             runtimeGeneration,
             requestId,
             sessionCorrelation: sessionCorrelation(sessionId),
+            clientCorrelation: requestClientCorrelation,
+            conversationCorrelation: requestConversationCorrelation,
+            conversationCorrelationForRequest,
             requestSignal: res.locals.mcpRequestAbortSignal as AbortSignal | undefined,
+            onToolTerminal,
           }, () => lease.transport.handleRequest(req, res, req.body));
         } finally {
           if (explicitDelete) {
@@ -1406,6 +1543,14 @@ export function createServer(
             }
             initializationLease = lease;
             committedSessionId = newSessionId;
+            if (config.logging.requests) {
+              logEvent(config.logging, "info", "mcp_session_client_bound", {
+                runtimeGeneration,
+                requestId,
+                sessionCorrelation: sessionCorrelation(newSessionId),
+                clientCorrelation: requestClientCorrelation,
+              });
+            }
             await options.mcpInitializeCommitBarrier?.(newSessionId);
           },
         });
@@ -1440,7 +1585,11 @@ export function createServer(
         await withMcpRequestContext({
           runtimeGeneration,
           requestId,
+          clientCorrelation: requestClientCorrelation,
+          conversationCorrelation: requestConversationCorrelation,
+          conversationCorrelationForRequest,
           requestSignal: res.locals.mcpRequestAbortSignal as AbortSignal | undefined,
+          onToolTerminal,
         },
           () => transport!.handleRequest(req, res, req.body));
         if (!committedSessionId) {
