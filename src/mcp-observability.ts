@@ -52,7 +52,10 @@ export function httpMethodLabel(method: string): string {
 }
 
 export type ObservedTool = "open_workspace" | "read" | "apply_patch" | "exec_command"
-  | "write_stdin" | "show_changes" | "get_agy_runtime" | "delegate_to_agy";
+  | "write_stdin" | "show_changes" | "get_agy_runtime" | "delegate_to_agy"
+  | "company_agent_get_analysis_packet" | "company_agent_refresh_analysis"
+  | "company_agent_record_judgment" | "company_agent_get_judgment"
+  | "company_agent_update_owner_context";
 
 export interface ToolTerminalObservation {
   toolCallId: string;

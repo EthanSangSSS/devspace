@@ -50,6 +50,12 @@ Run `devspace init` to create both files. `devspace config set publicBaseUrl
     "enabled": false,
     "maxFileBytes": 104857600,
   },
+  "companyAgent": {
+    "enabled": false,
+    "workspacePath": null,
+    "pythonPath": "python3",
+    "timeoutMs": 30000,
+  },
   "skills": {
     "enabled": true,
     "paths": [],
@@ -102,6 +108,51 @@ DevSpace attaches Apps UI metadata only to `open_workspace` and `show_changes`.
 This avoids rendering an iframe for every read, edit, search, or command call.
 Setting `ui.enabled` to `false` removes the metadata but does not remove the
 `show_changes` tool.
+
+## Fixed Company Agent product tools
+
+The optional `companyAgent` integration is disabled by default. When enabled,
+DevSpace registers five fixed-scope product tools for the configured local
+Company Agent instance. These tools do not accept a workspace ID, repository
+URL, ref, database path, command, or model selector from the MCP caller.
+
+```jsonc
+{
+  "configVersion": 1,
+  "workspaces": {
+    "allowedRoots": ["~/work"],
+  },
+  "companyAgent": {
+    "enabled": true,
+    "workspacePath": "~/work/AI-Agent-Company-OS",
+    "pythonPath": "/opt/homebrew/bin/python3",
+    "timeoutMs": 30000,
+  },
+}
+```
+
+`workspacePath` is required when the integration is enabled and must remain
+inside an existing `workspaces.allowedRoots` boundary. DevSpace canonicalizes
+the configured path and invokes only
+`scripts/run_company_agent_product_tool.py` from that root with `shell=false`.
+The Python executable is server-owned configuration; use an absolute path in a
+long-lived installation.
+
+The registered operations are:
+
+- `company_agent_get_analysis_packet` — local read only; never refreshes
+  implicitly.
+- `company_agent_refresh_analysis` — performs the Company Agent's existing
+  read-only GitHub observation and may update its local product state.
+- `company_agent_record_judgment` — validates and idempotently records one
+  local product judgment.
+- `company_agent_get_judgment` — reads one saved judgment.
+- `company_agent_update_owner_context` — versioned local product-state write.
+
+These product tools do not reduce or sandbox DevSpace's generic engineering
+tools. A connected host remains a trusted local engineering operator according
+to the normal DevSpace security model; the fixed Company Agent tools simply
+provide the canonical product workflow.
 
 ## Skills and subagents
 
