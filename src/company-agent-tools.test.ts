@@ -82,7 +82,7 @@ test("enabled Company Agent tools use one fixed configured workspace", async () 
       },
     }));
     const runtime = resolveCompanyAgentRuntime(config);
-    assert.equal(runtime.workspacePath, await realpath(root));
+    assert.equal(await realpath(runtime.workspacePath), await realpath(root));
 
     const server = new McpServer({ name: "test", version: "1" });
     registerCompanyAgentTools(server, config);
