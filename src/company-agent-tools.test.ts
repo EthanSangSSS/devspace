@@ -98,6 +98,22 @@ test("enabled Company Agent tools use one fixed configured workspace", async () 
     assert.equal(tools.get("company_agent_refresh_analysis")?.annotations?.openWorldHint, true);
     assert.equal(tools.get("company_agent_record_judgment")?.annotations?.idempotentHint, true);
     assert.equal(tools.get("company_agent_update_owner_context")?.annotations?.openWorldHint, false);
+    const recordJudgmentSchema = tools.get("company_agent_record_judgment")
+      ?.inputSchema as any;
+    const judgmentProperties = recordJudgmentSchema
+      ?.properties?.judgment?.properties;
+    assert.equal(judgmentProperties?.assessment?.minLength, 1);
+    assert.equal(judgmentProperties?.assessment?.maxLength, 600);
+    assert.equal(judgmentProperties?.goal_ids?.maxItems, 3);
+    assert.equal(judgmentProperties?.evidence_refs?.maxItems, 12);
+    assert.equal(judgmentProperties?.recommended_next_step?.minLength, 1);
+    assert.equal(judgmentProperties?.recommended_next_step?.maxLength, 500);
+    assert.equal(judgmentProperties?.supporting_steps?.maxItems, 2);
+    assert.equal(judgmentProperties?.supporting_steps?.items?.minLength, 1);
+    assert.equal(judgmentProperties?.supporting_steps?.items?.maxLength, 400);
+    assert.equal(judgmentProperties?.uncertainties?.maxItems, 5);
+    assert.equal(judgmentProperties?.uncertainties?.items?.minLength, 1);
+    assert.equal(judgmentProperties?.uncertainties?.items?.maxLength, 400);
 
     const get = await client.callTool({
       name: "company_agent_get_analysis_packet",
@@ -129,6 +145,111 @@ test("enabled Company Agent tools use one fixed configured workspace", async () 
     const updateResult = (update.structuredContent as { result: any }).result;
     assert.equal(updateResult.tool, "company_agent_update_owner_context");
     assert.equal(updateResult.payload.expected_context_version, 0);
+
+    await client.close();
+    await server.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Company Agent judgment text limits count Unicode code points like Python", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-company-agent-unicode-"));
+  try {
+    await fixture(root);
+    const config = loadConfig(writeTestDevspaceConfig(join(root, ".config"), {
+      workspaces: { allowedRoots: [root] },
+      companyAgent: {
+        enabled: true,
+        workspacePath: root,
+        pythonPath: process.execPath,
+        timeoutMs: 2_000,
+      },
+    }));
+    const server = new McpServer({ name: "test", version: "1" });
+    registerCompanyAgentTools(server, config);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "client", version: "1" });
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+
+    const baseJudgment = {
+      disposition: "NO_ACTION" as const,
+      assessment: "ok",
+      goal_ids: ["goal-1"],
+      evidence_refs: ["fact-1"],
+      recommended_next_step: "none",
+      supporting_steps: ["none"],
+      uncertainties: ["none"],
+    };
+    const sourcePacketDigest = `sha256:${"a".repeat(64)}`;
+    const cases = [
+      {
+        name: "assessment",
+        limit: 600,
+        build: (value: string) => ({ ...baseJudgment, assessment: value }),
+      },
+      {
+        name: "recommended_next_step",
+        limit: 500,
+        build: (value: string) => ({ ...baseJudgment, recommended_next_step: value }),
+      },
+      {
+        name: "supporting_steps item",
+        limit: 400,
+        build: (value: string) => ({ ...baseJudgment, supporting_steps: [value] }),
+      },
+      {
+        name: "uncertainties item",
+        limit: 400,
+        build: (value: string) => ({ ...baseJudgment, uncertainties: [value] }),
+      },
+    ];
+
+    for (const [index, testCase] of cases.entries()) {
+      const atLimit = "a".repeat(testCase.limit - 1) + "😀";
+      const overLimit = "a".repeat(testCase.limit) + "😀";
+      assert.equal(Array.from(atLimit).length, testCase.limit);
+      assert.equal(Array.from(overLimit).length, testCase.limit + 1);
+
+      const accepted = await client.callTool({
+        name: "company_agent_record_judgment",
+        arguments: {
+          request_id: `unicode-limit-${index}-accepted`,
+          source_packet_digest: sourcePacketDigest,
+          judgment: testCase.build(atLimit),
+        },
+      });
+      assert.notEqual(accepted.isError, true, `${testCase.name} should accept the limit`);
+      assert.deepEqual(
+        (accepted.structuredContent as { result: any }).result.payload.judgment,
+        testCase.build(atLimit),
+      );
+
+      const rejected = await client.callTool({
+        name: "company_agent_record_judgment",
+        arguments: {
+          request_id: `unicode-limit-${index}-rejected`,
+          source_packet_digest: sourcePacketDigest,
+          judgment: testCase.build(overLimit),
+        },
+      });
+      assert.equal(
+        rejected.isError,
+        true,
+        `${testCase.name} should reject values over the Unicode code-point limit`,
+      );
+      const rejectedContent = rejected.content as Array<{
+        type: string;
+        text?: string;
+      }>;
+      assert.match(
+        rejectedContent
+          .filter((item) => item.type === "text" && typeof item.text === "string")
+          .map((item) => item.text ?? "")
+          .join("\n"),
+        /-32602|Invalid arguments/,
+      );
+    }
 
     await client.close();
     await server.close();

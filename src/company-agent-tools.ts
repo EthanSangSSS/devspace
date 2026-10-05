@@ -72,14 +72,24 @@ const ownerContextSchema = z.object({
   selected_memory_ids: z.array(z.string()),
 }).strict();
 
+function unicodeBoundedText(maxLength: number) {
+  return z.string()
+    .min(1)
+    .refine(
+      (value) => Array.from(value).length <= maxLength,
+      { message: `Must contain at most ${maxLength} Unicode code points` },
+    )
+    .meta({ maxLength });
+}
+
 const judgmentSchema = z.object({
   disposition: z.enum(["NO_ACTION", "REVIEW_RECOMMENDED", "NEEDS_CONTEXT"]),
-  assessment: z.string(),
-  goal_ids: z.array(z.string()),
-  evidence_refs: z.array(z.string()),
-  recommended_next_step: z.string(),
-  supporting_steps: z.array(z.string()),
-  uncertainties: z.array(z.string()),
+  assessment: unicodeBoundedText(600),
+  goal_ids: z.array(z.string()).max(3),
+  evidence_refs: z.array(z.string()).max(12),
+  recommended_next_step: unicodeBoundedText(500),
+  supporting_steps: z.array(unicodeBoundedText(400)).max(2),
+  uncertainties: z.array(unicodeBoundedText(400)).max(5),
 }).strict();
 
 const READ_ONLY_ANNOTATIONS = {
