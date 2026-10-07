@@ -4,12 +4,15 @@ export interface ClosableMcpTransport {
 
 export type McpSessionRegistryState = "running" | "closing" | "closed";
 
+export type McpManagedTransportKind = "session" | "request";
+
 export type McpSessionDisposeReason =
   | "transport_close"
   | "capacity_eviction"
   | "idle_timeout"
   | "server_shutdown"
-  | "initialize_failure";
+  | "initialize_failure"
+  | "request_complete";
 
 export type McpSessionAdmissionFailure = "capacity" | "closing";
 
@@ -21,6 +24,7 @@ export type McpSessionCloseInitiator =
 export interface McpSessionOperationContext {
   requestId?: string;
   closeInitiator?: McpSessionCloseInitiator;
+  transportKind?: McpManagedTransportKind;
 }
 
 export interface McpSessionReservation {
@@ -37,6 +41,10 @@ export interface McpSessionRegistrySnapshot {
   state: McpSessionRegistryState;
   current: number;
   active: number;
+  currentSessions: number;
+  activeSessions: number;
+  currentRequests: number;
+  activeRequests: number;
   pendingReservations: number;
   max: number;
   createdTotal: number;
@@ -68,6 +76,7 @@ export interface McpSessionLifecycleEvent {
   sessionAgeMs?: number;
   idleForMs?: number;
   activeRequests?: number;
+  transportKind?: McpManagedTransportKind;
   snapshot: McpSessionRegistrySnapshot;
 }
 
@@ -83,6 +92,7 @@ export class McpSessionAdmissionError extends Error {
 
 interface McpSessionEntry<TTransport> {
   transport: TTransport;
+  transportKind: McpManagedTransportKind;
   createdAt: number;
   idleSince: number | undefined;
   inFlight: number;
@@ -92,6 +102,7 @@ interface McpSessionEntry<TTransport> {
 interface DetachedSession<TTransport> {
   sessionId: string;
   transport: TTransport;
+  transportKind: McpManagedTransportKind;
   reason: McpSessionDisposeReason;
   sessionAgeMs: number;
   idleForMs?: number;
@@ -150,13 +161,29 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
 
   snapshot(): McpSessionRegistrySnapshot {
     let active = 0;
+    let currentSessions = 0;
+    let activeSessions = 0;
+    let currentRequests = 0;
+    let activeRequests = 0;
     for (const entry of this.sessions.values()) {
-      if (entry.inFlight > 0) active += 1;
+      const isActive = entry.inFlight > 0;
+      if (isActive) active += 1;
+      if (entry.transportKind === "request") {
+        currentRequests += 1;
+        if (isActive) activeRequests += 1;
+      } else {
+        currentSessions += 1;
+        if (isActive) activeSessions += 1;
+      }
     }
     return {
       state: this.state,
       current: this.sessions.size,
       active,
+      currentSessions,
+      activeSessions,
+      currentRequests,
+      activeRequests,
       pendingReservations: this.reservations.size,
       max: this.maxSessions,
       createdTotal: this.createdTotal,
@@ -184,6 +211,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
         this.emit({
           type: "capacity_rejected",
           requestId: context.requestId,
+          transportKind: context.transportKind,
         });
         throw new McpSessionAdmissionError("capacity");
       }
@@ -228,6 +256,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     const createdAt = this.now();
     this.sessions.set(sessionId, {
       transport,
+      transportKind: context.transportKind ?? "session",
       createdAt,
       idleSince: undefined,
       inFlight: 1,
@@ -239,6 +268,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
       type: "created",
       sessionId,
       requestId: context.requestId,
+      transportKind: context.transportKind ?? "session",
     });
     return { token: leaseToken, sessionId, transport };
   }
@@ -301,6 +331,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
         sessionAgeMs: detached.sessionAgeMs,
         idleForMs: detached.idleForMs,
         activeRequests: detached.activeRequests,
+        transportKind: detached.transportKind,
       });
       return { sessionId };
     }
@@ -316,6 +347,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     const registeredAt = this.now();
     this.sessions.set(sessionId, {
       transport,
+      transportKind: "session",
       createdAt: registeredAt,
       idleSince: registeredAt,
       inFlight: 0,
@@ -468,6 +500,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
         sessionAgeMs,
         idleForMs,
         activeRequests,
+        transportKind: entry.transportKind,
       });
     } else if (reason === "idle_timeout") {
       this.idleTimeoutDetachedTotal += 1;
@@ -475,6 +508,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return {
       sessionId,
       transport: entry.transport,
+      transportKind: entry.transportKind,
       reason,
       sessionAgeMs,
       idleForMs,
@@ -498,6 +532,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
         sessionAgeMs: detached.sessionAgeMs,
         idleForMs: detached.idleForMs,
         activeRequests: detached.activeRequests,
+        transportKind: detached.transportKind,
       });
       return { sessionId: detached.sessionId };
     } catch (error) {
@@ -511,6 +546,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
         sessionAgeMs: detached.sessionAgeMs,
         idleForMs: detached.idleForMs,
         activeRequests: detached.activeRequests,
+        transportKind: detached.transportKind,
       });
       return { sessionId: detached.sessionId, error };
     }
@@ -527,6 +563,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
       this.emit({
         type: "close_failed",
         requestId: context.requestId,
+        transportKind: context.transportKind,
       });
     }
   }
