@@ -13,8 +13,10 @@ const logging: LoggingConfig = {
 test("lifecycle terminals are exact, opaque and do not imply process completion", async (t) => {
   const lines: string[] = [];
   const originalLog = console.log;
+  const warns: string[] = [];
   const originalWarn = console.warn;
-  console.log = console.warn = (line: unknown) => { lines.push(String(line)); };
+  console.log = (line: unknown) => { lines.push(String(line)); };
+  console.warn = (line: unknown) => { warns.push(String(line)); };
   t.after(() => { console.log = originalLog; console.warn = originalWarn; });
   const secret = "SYNTHETIC_PRIVATE_CANARY";
   const execute = (tool: Parameters<typeof observeToolOperation>[1], value: unknown) =>
@@ -42,7 +44,9 @@ test("lifecycle terminals are exact, opaque and do not imply process completion"
   for (const line of lines) {
     const event = JSON.parse(line);
     assert.ok(Object.keys(event).every((key) => keys.has(key)));
+    assert.equal(event.level, "info");
   }
+  assert.equal(warns.length, 0);
   assert.ok(!lines.join("\n").includes(secret));
 });
 
