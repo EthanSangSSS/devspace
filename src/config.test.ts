@@ -25,12 +25,6 @@ try {
   assert.equal(defaults.uiEnabled, true);
   assert.equal(defaults.skillsEnabled, true);
   assert.equal(defaults.artifactsEnabled, false);
-  assert.deepEqual(defaults.companyAgent, {
-    enabled: false,
-    workspacePath: null,
-    pythonPath: "python3",
-    timeoutMs: 30_000,
-  });
   assert.deepEqual(defaults.subagents, { enabled: false, providers: [] });
   assert.deepEqual(defaults.agyDelegation, {
     enabled: false,
@@ -71,12 +65,6 @@ try {
     tools: { mode: "claude" },
     ui: { enabled: false },
     artifacts: { enabled: true, maxFileBytes: 321 },
-    companyAgent: {
-      enabled: true,
-      workspacePath: "~/company-agent",
-      pythonPath: "/opt/homebrew/bin/python3",
-      timeoutMs: 25_000,
-    },
     skills: { enabled: false, paths: ["~/skills"], agentDir: "~/agent" },
     subagents: {
       enabled: true,
@@ -132,12 +120,6 @@ try {
   assert.equal(configured.worktreeRoot, resolve(homedir(), "trees"));
   assert.equal(configured.artifactsEnabled, true);
   assert.equal(configured.artifactMaxFileBytes, 321);
-  assert.deepEqual(configured.companyAgent, {
-    enabled: true,
-    workspacePath: resolve(homedir(), "company-agent"),
-    pythonPath: "/opt/homebrew/bin/python3",
-    timeoutMs: 25_000,
-  });
   assert.equal(configured.skillsEnabled, false);
   assert.deepEqual(configured.skillPaths, ["~/skills"]);
   assert.equal(configured.agentDir, resolve(homedir(), "agent"));

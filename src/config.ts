@@ -31,12 +31,6 @@ export interface ServerConfig {
   worktreeRoot: string;
   artifactsEnabled: boolean;
   artifactMaxFileBytes: number;
-  companyAgent: {
-    enabled: boolean;
-    workspacePath: string | null;
-    pythonPath: string;
-    timeoutMs: number;
-  };
   skillsEnabled: boolean;
   skillPaths: string[];
   devspaceSkillsDir: string;
@@ -92,14 +86,6 @@ export function loadConfig(
     worktreeRoot: normalizePath(stored.workspaces.worktreeRoot),
     artifactsEnabled: stored.artifacts.enabled,
     artifactMaxFileBytes: stored.artifacts.maxFileBytes,
-    companyAgent: {
-      enabled: stored.companyAgent.enabled,
-      workspacePath: stored.companyAgent.workspacePath === null
-        ? null
-        : normalizePath(stored.companyAgent.workspacePath),
-      pythonPath: stored.companyAgent.pythonPath,
-      timeoutMs: stored.companyAgent.timeoutMs,
-    },
     skillsEnabled: stored.skills.enabled,
     skillPaths: stored.skills.paths,
     devspaceSkillsDir: devspaceSkillsDir(env),

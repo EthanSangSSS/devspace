@@ -38,21 +38,6 @@ const artifactsConfigSchema = z.object({
   maxFileBytes: z.number().int().positive().default(100 * 1024 * 1024),
 }).strict().prefault({});
 
-const companyAgentConfigSchema = z.object({
-  enabled: z.boolean().default(false),
-  workspacePath: z.string().trim().min(1).nullable().default(null),
-  pythonPath: z.string().trim().min(1).default("python3"),
-  timeoutMs: z.number().int().positive().max(60_000).default(30_000),
-}).strict().prefault({}).superRefine((value, context) => {
-  if (value.enabled && value.workspacePath === null) {
-    context.addIssue({
-      code: "custom",
-      path: ["workspacePath"],
-      message: "workspacePath is required when Company Agent tools are enabled",
-    });
-  }
-});
-
 const skillsConfigSchema = z.object({
   enabled: z.boolean().default(true),
   paths: z.array(z.string().trim().min(1)).default([]),
@@ -99,7 +84,6 @@ export const devspaceConfigSchema = z.object({
   tools: toolsConfigSchema,
   ui: uiConfigSchema,
   artifacts: artifactsConfigSchema,
-  companyAgent: companyAgentConfigSchema,
   skills: skillsConfigSchema,
   subagents: subagentsConfigSchema.default({ enabled: false, providers: [] }),
   agyDelegation: agyDelegationConfigSchema,
