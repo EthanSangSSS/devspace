@@ -121,8 +121,11 @@ export async function observeToolOperation<T>(
     const startedAt = performance.now();
     const emit = (phase: "started" | "finished", result?: string, durationMs?: number): void => {
       if (!config.logging.toolCalls) return;
-      logEvent(config.logging, result === "threw" || result === "tool_error" ? "warn" : "info",
-        `mcp_tool_${phase}`, {
+      // Lifecycle terminals are correlation evidence first. Keep both successful
+      // and failed terminals in the canonical info stream so a single-log scan
+      // cannot mistake a tool error for an in-flight request merely because
+      // warn output was routed to stderr.
+      logEvent(config.logging, "info", `mcp_tool_${phase}`, {
           ...fields,
           ...(phase === "finished" ? {
             outcome: result,
