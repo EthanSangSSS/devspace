@@ -85,6 +85,152 @@ test("cancelled pure MCP poll preserves buffered output and the process handle",
   assert.match(terminalRecovery.output, new RegExp(`done-${marker}`));
 });
 
+test("initial terminal exec result stays discoverable and replayable after normal delivery", async (t) => {
+  const manager = new ProcessSessionManager({
+    completedSessionTtlMs: 1_000,
+    sessionIdGenerator: () => 1101,
+  });
+  t.after(async () => manager.shutdown());
+  const marker = `initial-terminal-normal-${randomUUID()}`;
+
+  const snapshot = await manager.start({
+    workspaceId: "owner",
+    cwd: process.cwd(),
+    command: `${node} -e "setTimeout(() => console.log('${marker}'), 40)"`,
+    yieldTimeMs: 1_000,
+  });
+
+  assert.equal(snapshot.running, false);
+  assert.equal(snapshot.exitCode, 0);
+  assert.match(snapshot.output, new RegExp(marker));
+
+  const listed = manager.listRecoverable("owner");
+  assert.equal(listed.sessions.length, 1);
+  assert.equal(listed.sessions[0]?.sessionId, 1101);
+  assert.equal(listed.sessions[0]?.status, "completed");
+  assert.equal(listed.sessions[0]?.hasBufferedOutput, true);
+
+  const replay = await manager.write({
+    workspaceId: "owner",
+    sessionId: 1101,
+    yieldTimeMs: 0,
+  });
+  assert.equal(replay.running, false);
+  assert.equal(replay.exitCode, 0);
+  assert.match(replay.output, new RegExp(marker));
+});
+
+test("initial terminal exec survives an MCP client timeout and can be rediscovered", async (t) => {
+  const { client } = await fixture(t);
+  const marker = `initial-terminal-timeout-${randomUUID()}`;
+
+  let timeoutError: unknown;
+  try {
+    await client.callTool({
+      name: "exec_command",
+      arguments: {
+        workspaceId: "owner",
+        cmd: `${node} -e "setTimeout(() => console.log('${marker}'), 180)"`,
+        yieldTimeMs: 1_000,
+      },
+    }, undefined, { timeout: 50 });
+  } catch (error) {
+    timeoutError = error;
+  }
+  assert.equal((timeoutError as { name?: string })?.name, "McpError");
+  assert.equal((timeoutError as { code?: number })?.code, -32001);
+
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const listed = await client.callTool({
+    name: "list_process_sessions",
+    arguments: { workspaceId: "owner" },
+  });
+  assert.notEqual(listed.isError, true);
+  const sessions = (listed.structuredContent as {
+    sessions: Array<{ sessionId: number; status: "running" | "completed" }>;
+  }).sessions;
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0]?.status, "completed");
+  assert.ok(sessions[0]?.sessionId);
+
+  const replay = await client.callTool({
+    name: "write_stdin",
+    arguments: {
+      workspaceId: "owner",
+      sessionId: sessions[0]!.sessionId,
+      yieldTimeMs: 0,
+    },
+  });
+  assert.notEqual(replay.isError, true);
+  const content = replay.structuredContent as Record<string, unknown>;
+  assert.equal(content.running, false);
+  assert.equal(content.exitCode, 0);
+  assert.match(String(content.result), new RegExp(marker));
+});
+
+test("initial terminal exec recovery expires at the existing completed-session TTL", async (t) => {
+  const manager = new ProcessSessionManager({
+    completedSessionTtlMs: 120,
+    sessionIdGenerator: () => 1201,
+  });
+  t.after(async () => manager.shutdown());
+  const marker = `initial-terminal-ttl-${randomUUID()}`;
+
+  const snapshot = await manager.start({
+    workspaceId: "owner",
+    cwd: process.cwd(),
+    command: `${node} -e "console.log('${marker}')"`,
+    yieldTimeMs: 1_000,
+  });
+  assert.equal(snapshot.running, false);
+  assert.equal(snapshot.exitCode, 0);
+  assert.equal(manager.listRecoverable("owner").sessions.length, 1);
+
+  await new Promise((resolve) => setTimeout(resolve, 220));
+  assert.deepEqual(manager.listRecoverable("owner").sessions, []);
+  await assert.rejects(
+    manager.write({ workspaceId: "owner", sessionId: 1201, yieldTimeMs: 0 }),
+    /Unknown process session:/,
+  );
+});
+
+test("initial terminal retention obeys the 32-result discovery cap without evicting omitted handles", async (t) => {
+  let nextSessionId = 2_000;
+  const manager = new ProcessSessionManager({
+    completedSessionTtlMs: 30_000,
+    sessionIdGenerator: () => ++nextSessionId,
+  });
+  t.after(async () => manager.shutdown());
+  const retainedIds: number[] = [];
+
+  for (let index = 0; index < 33; index += 1) {
+    const snapshot = await manager.start({
+      workspaceId: "owner",
+      cwd: process.cwd(),
+      command: `${node} -e "process.exit(0)"`,
+      yieldTimeMs: 1_000,
+    });
+    assert.equal(snapshot.running, false);
+    retainedIds.push(nextSessionId);
+  }
+
+  const listed = manager.listRecoverable("owner");
+  assert.equal(listed.sessions.length, 32);
+  assert.equal(listed.truncated, true);
+  assert.ok(listed.sessions.every((session) => session.status === "completed"));
+
+  const visibleIds = new Set(listed.sessions.map((session) => session.sessionId));
+  const omittedIds = retainedIds.filter((sessionId) => !visibleIds.has(sessionId));
+  assert.equal(omittedIds.length, 1);
+  const omittedReplay = await manager.write({
+    workspaceId: "owner",
+    sessionId: omittedIds[0]!,
+    yieldTimeMs: 0,
+  });
+  assert.equal(omittedReplay.running, false);
+  assert.equal(omittedReplay.exitCode, 0);
+});
+
 test("already-aborted pure poll does not consume a completed session", async (t) => {
   const manager = new ProcessSessionManager();
   t.after(async () => manager.shutdown());

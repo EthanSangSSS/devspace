@@ -297,8 +297,13 @@ export class ProcessSessionManager {
 
     await this.waitForExit(session, yieldTimeMs);
 
-    const snapshot = this.consume(session, input.maxOutputTokens);
-    if (!session.running) this.removeSession(session.id);
+    const snapshot = this.consume(session, input.maxOutputTokens, {
+      // A terminal result from the initial exec yield may be lost after local
+      // execution completes but before the host consumes the MCP response.
+      // Keep the terminal output replayable through the existing completed
+      // session TTL so list_process_sessions + write_stdin can recover it.
+      preserveTerminalOutput: !session.running,
+    });
     return snapshot;
   }
 
@@ -580,9 +585,4 @@ export class ProcessSessionManager {
     return session;
   }
 
-  private removeSession(sessionId: number): void {
-    const session = this.sessions.get(sessionId);
-    if (session?.cleanupTimer) clearTimeout(session.cleanupTimer);
-    this.sessions.delete(sessionId);
-  }
 }
