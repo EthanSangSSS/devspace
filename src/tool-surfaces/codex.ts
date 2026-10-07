@@ -1,7 +1,10 @@
 import * as z from "zod/v4";
 import { mcpRequestAbortSignal, observeToolOperation } from "../mcp-observability.js";
 import { applyPatch } from "../apply-patch.js";
-import type { ProcessSnapshot } from "../process-sessions.js";
+import type {
+  ProcessSnapshot,
+  RecoverableProcessSessionList,
+} from "../process-sessions.js";
 import {
   EDIT_TOOL_ANNOTATIONS,
   SHELL_TOOL_ANNOTATIONS,
@@ -18,7 +21,7 @@ import {
 
 type CodexRegistration = (context: ToolRegistrationContext) => void;
 
-const CODEX_INSTRUCTIONS = `After ${toolNames.openWorkspace} succeeds, use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Commands run with the local user's authority and are not sandboxed; workspace validation only selects their initial working directory. exec_command is not a substitute for opening or authorizing the target workspace. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.`;
+const CODEX_INSTRUCTIONS = `After ${toolNames.openWorkspace} succeeds, use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. If a host turn is interrupted after a process was left running and its sessionId is no longer available, use ${toolNames.listProcessSessions} with the existing workspaceId before rerunning the command. Commands run with the local user's authority and are not sandboxed; workspace validation only selects their initial working directory. exec_command is not a substitute for opening or authorizing the target workspace. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.`;
 
 export function codexInstructions(): string {
   return CODEX_INSTRUCTIONS;
@@ -70,6 +73,31 @@ function processToolResponse(snapshot: ProcessSnapshot) {
       signal: snapshot.signal,
       wallTimeMs: snapshot.wallTimeMs,
       outputTruncated: snapshot.outputTruncated,
+    },
+  };
+}
+
+function recoverableProcessToolResponse(list: RecoverableProcessSessionList) {
+  const result = list.sessions.length === 0
+    ? "No recoverable process sessions are available for this workspace in the current DevSpace runtime. The prior handle is expired-or-unavailable from this recovery surface; do not infer that rerunning the original command is safe."
+    : [
+        "Recoverable process sessions for this workspace:",
+        ...list.sessions.map((session) => [
+          `sessionId=${session.sessionId}`,
+          `status=${session.status}`,
+          `wallTimeMs=${session.wallTimeMs}`,
+          `hasBufferedOutput=${session.hasBufferedOutput}`,
+          session.exitCode !== undefined ? `exitCode=${session.exitCode}` : undefined,
+          session.signal ? `signal=${session.signal}` : undefined,
+        ].filter(Boolean).join(" ")),
+        ...(list.truncated ? ["Additional older recoverable sessions were omitted."] : []),
+      ].join("\n");
+  return {
+    content: [textBlock(result)],
+    structuredContent: {
+      result,
+      sessions: list.sessions,
+      truncated: list.truncated,
     },
   };
 }
@@ -134,6 +162,54 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
 
 function registerCodexProcessTools(context: ToolRegistrationContext): void {
   const { server, config, workspaces, processSessions } = context;
+
+  server.registerTool(
+    toolNames.listProcessSessions,
+    {
+      title: "List process sessions",
+      description:
+        "List recoverable process session handles owned by one known workspaceId in the current DevSpace runtime without consuming process output. Use this after a host/turn interruption when a previous exec_command or write_stdin may have left a process running or recently completed but the sessionId is no longer available. A session can be running or completed; absence means expired-or-unavailable from this recovery surface and must not be treated as proof that rerunning the original command is safe. Do not infer that a returned handle is the interrupted task solely because it is the only handle or because of its ordering; reuse it only when the caller's context supports that identity. Returns only opaque lifecycle metadata and never command text, environment variables, stdin history, or process output. This tool does not merge process visibility across workspaceIds or recover processes across DevSpace runtime restarts.",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+      },
+      outputSchema: resultOutputSchema({
+        sessions: z.array(z.object({
+          sessionId: z.number().int().positive().safe(),
+          status: z.enum(["running", "completed"]),
+          startedAt: z.number().int().nonnegative(),
+          wallTimeMs: z.number().nonnegative(),
+          hasBufferedOutput: z.boolean(),
+          exitCode: z.number().int().optional(),
+          signal: z.string().optional(),
+        })),
+        truncated: z.boolean(),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ workspaceId }, { requestId }) => observeToolOperation(
+      config,
+      toolNames.listProcessSessions,
+      async () => {
+        const startedAt = performance.now();
+        const list = await runLoggedToolOperation(
+          config,
+          { tool: toolNames.listProcessSessions, workspaceId },
+          startedAt,
+          async () => {
+            workspaces.getWorkspace(workspaceId);
+            return processSessions.listRecoverable(workspaceId);
+          },
+        );
+        return recoverableProcessToolResponse(list);
+      },
+      { rpcRequestId: requestId },
+    ),
+  );
 
   server.registerTool(
     "exec_command",

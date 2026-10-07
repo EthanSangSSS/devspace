@@ -200,3 +200,127 @@ test("interactive writes ignore poll cancellation semantics", async (t) => {
   assert.equal(result.exitCode, 0);
   assert.match(result.output, /interactive:hello/);
 });
+
+test("list_process_sessions rediscovers an owned handle without consuming output or leaking command text", async (t) => {
+  const { client, processSessions } = await fixture(t);
+  const marker = `recoverable-output-${randomUUID()}`;
+  const commandOnlyMarker = `command-only-${randomUUID()}`;
+  const started = await processSessions.start({
+    workspaceId: "owner",
+    cwd: process.cwd(),
+    command: `${node} -e "setTimeout(() => console.log('${marker}'), 20); setTimeout(() => {}, 1_000)" # ${commandOnlyMarker}`,
+    yieldTimeMs: 0,
+  });
+  assert.ok(started.sessionId);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const listed = await client.callTool({
+    name: "list_process_sessions",
+    arguments: { workspaceId: "owner" },
+  });
+  assert.notEqual(listed.isError, true);
+  const content = listed.structuredContent as {
+    result: string;
+    sessions: Array<{
+      sessionId: number;
+      status: "running" | "completed";
+      hasBufferedOutput: boolean;
+    }>;
+    truncated: boolean;
+  };
+  assert.equal(content.sessions.length, 1);
+  assert.equal(content.sessions[0]?.sessionId, started.sessionId);
+  assert.equal(content.sessions[0]?.status, "running");
+  assert.equal(content.sessions[0]?.hasBufferedOutput, true);
+  assert.equal(content.truncated, false);
+  assert.doesNotMatch(content.result, new RegExp(marker));
+  assert.doesNotMatch(content.result, new RegExp(commandOnlyMarker));
+
+  const foreign = await client.callTool({
+    name: "list_process_sessions",
+    arguments: { workspaceId: "foreign" },
+  });
+  assert.notEqual(foreign.isError, true);
+  assert.deepEqual(
+    (foreign.structuredContent as { sessions: unknown[] }).sessions,
+    [],
+  );
+  assert.match(
+    String((foreign.structuredContent as { result?: unknown }).result),
+    /expired-or-unavailable/,
+  );
+  assert.match(
+    String((foreign.structuredContent as { result?: unknown }).result),
+    /rerunning the original command is safe/,
+  );
+
+  const recovered = await processSessions.write({
+    workspaceId: "owner",
+    sessionId: started.sessionId,
+    yieldTimeMs: 0,
+  });
+  assert.equal(recovered.running, true);
+  assert.match(recovered.output, new RegExp(marker));
+  processSessions.terminate("owner", started.sessionId);
+});
+
+test("recoverable process discovery is deterministic, workspace-scoped, and bounded", async (t) => {
+  const generatedIds = [901, 902, 903];
+  const manager = new ProcessSessionManager({
+    sessionIdGenerator: () => generatedIds.shift() ?? 999,
+  });
+  t.after(async () => manager.shutdown());
+
+  const startedIds: number[] = [];
+  for (let index = 0; index < 3; index += 1) {
+    const started = await manager.start({
+      workspaceId: "owner",
+      cwd: process.cwd(),
+      command: `${node} -e "setTimeout(() => {}, 2_000)"`,
+      yieldTimeMs: 0,
+    });
+    assert.ok(started.sessionId);
+    startedIds.push(started.sessionId);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+
+  const limited = manager.listRecoverable("owner", 2);
+  assert.deepEqual(limited.sessions.map((session) => session.sessionId), [903, 902]);
+  assert.equal(limited.truncated, true);
+  assert.deepEqual(manager.listRecoverable("foreign").sessions, []);
+  assert.deepEqual(startedIds, [901, 902, 903]);
+});
+
+test("a listed running process remains discoverable after exit until completed-session TTL cleanup", async (t) => {
+  const manager = new ProcessSessionManager({
+    completedSessionTtlMs: 250,
+    sessionIdGenerator: () => 1001,
+  });
+  t.after(async () => manager.shutdown());
+  const marker = `list-terminal-race-${randomUUID()}`;
+  const started = await manager.start({
+    workspaceId: "owner",
+    cwd: process.cwd(),
+    command: `${node} -e "setTimeout(() => console.log('${marker}'), 40)"`,
+    yieldTimeMs: 0,
+  });
+  assert.equal(started.sessionId, 1001);
+  assert.equal(manager.listRecoverable("owner").sessions[0]?.status, "running");
+
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  const completed = manager.listRecoverable("owner");
+  assert.equal(completed.sessions.length, 1);
+  assert.equal(completed.sessions[0]?.sessionId, 1001);
+  assert.equal(completed.sessions[0]?.status, "completed");
+
+  const replay = await manager.write({
+    workspaceId: "owner",
+    sessionId: 1001,
+    yieldTimeMs: 0,
+  });
+  assert.equal(replay.running, false);
+  assert.match(replay.output, new RegExp(marker));
+
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.deepEqual(manager.listRecoverable("owner").sessions, []);
+});

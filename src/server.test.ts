@@ -74,7 +74,7 @@ test("tool modes expose the expected host-facing tool surface", async (t) => {
     },
     {
       mode: "codex",
-      expected: ["open_workspace", "read", "apply_patch", "exec_command", "write_stdin", "show_changes"],
+      expected: ["open_workspace", "read", "apply_patch", "exec_command", "write_stdin", "list_process_sessions", "show_changes"],
     },
   ];
 

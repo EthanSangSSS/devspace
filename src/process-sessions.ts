@@ -14,6 +14,7 @@ const MAX_POLL_YIELD_MS = 110_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
 const DEFAULT_BUFFER_CHARACTERS = 1_000_000;
 const COMPLETED_SESSION_TTL_MS = 5 * 60 * 1_000;
+const MAX_RECOVERABLE_PROCESS_SESSIONS = 32;
 const DEFAULT_COLUMNS = 80;
 const DEFAULT_ROWS = 24;
 const PROCESS_SESSION_ID_BYTES = 6;
@@ -53,6 +54,21 @@ export interface ProcessSnapshot {
   exitCode?: number;
   signal?: string;
   wallTimeMs: number;
+}
+
+export interface RecoverableProcessSession {
+  sessionId: number;
+  status: "running" | "completed";
+  startedAt: number;
+  wallTimeMs: number;
+  hasBufferedOutput: boolean;
+  exitCode?: number;
+  signal?: string;
+}
+
+export interface RecoverableProcessSessionList {
+  sessions: RecoverableProcessSession[];
+  truncated: boolean;
 }
 
 interface ManagedProcess {
@@ -339,6 +355,32 @@ export class ProcessSessionManager {
   terminate(workspaceId: string, sessionId: number): void {
     const session = this.getOwnedSession(workspaceId, sessionId);
     if (session.running) session.process?.kill("SIGTERM");
+  }
+
+  listRecoverable(
+    workspaceId: string,
+    limit = MAX_RECOVERABLE_PROCESS_SESSIONS,
+  ): RecoverableProcessSessionList {
+    if (!Number.isInteger(limit) || limit < 1) {
+      throw new Error("Recoverable process session limit must be a positive integer.");
+    }
+    const boundedLimit = Math.min(limit, MAX_RECOVERABLE_PROCESS_SESSIONS);
+    const ownedSessions = [...this.sessions.values()]
+      .filter((session) => session.workspaceId === workspaceId)
+      .sort((left, right) => right.startedAt - left.startedAt || left.id - right.id);
+    const sessions = ownedSessions.slice(0, boundedLimit).map((session) => ({
+      sessionId: session.id,
+      status: session.running ? "running" as const : "completed" as const,
+      startedAt: session.startedAt,
+      wallTimeMs: Date.now() - session.startedAt,
+      hasBufferedOutput: session.buffer.hasOutput(),
+      exitCode: session.exitCode,
+      signal: session.signal,
+    }));
+    return {
+      sessions,
+      truncated: ownedSessions.length > sessions.length,
+    };
   }
 
   async shutdown(options: { graceMs?: number; killWaitMs?: number } = {}): Promise<void> {

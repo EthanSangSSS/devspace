@@ -176,12 +176,27 @@ DevSpace uses the Codex-style surface by default. It exposes:
 - `apply_patch`
 - `exec_command`
 - `write_stdin`
+- `list_process_sessions`
 - `show_changes`
 
 In this mode, `write`, `edit`, and `bash` are not registered. `exec_command`
 returns a process session ID when a command is still
 running after its yield window. Use `write_stdin` to poll it, send input, resize
 a PTY, or send Ctrl-C. Set `tty: true` only for commands that need a terminal.
+If a host turn is interrupted and the process session ID is no longer available,
+call `list_process_sessions` with the existing workspace ID before rerunning the
+command. It lists only recoverable handles owned by that workspace in the
+current DevSpace runtime; it does not expose command text, environment values,
+stdin history, or buffered process output. Continue the selected handle with
+`write_stdin`. Returned handles explicitly report `running` or `completed`.
+An empty result means the prior handle is expired-or-unavailable from this
+recovery surface; it is not evidence that rerunning the original command is
+safe. Do not infer that a returned handle belongs to the interrupted task just
+because it is the only handle or because of its ordering; reuse it only when
+the caller's context supports that identity. A different conversation may
+receive a different workspace ID for the same path, and this recovery surface
+intentionally does not merge process visibility across workspace IDs or survive
+a DevSpace runtime restart.
 
 Set `tools.mode` to `claude` in `~/.devspace/config.jsonc` to expose `write`,
 `edit`, and `bash` instead of the Codex mutation and command tools. Dedicated

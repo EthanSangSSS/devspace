@@ -41,6 +41,7 @@ export function logToolCall(config: ServerConfig, fields: ToolLogFields): void {
   // paths, command text, error messages or arbitrary extra properties.
   logEvent(config.logging, fields.success ? "info" : "warn", "tool_call", {
     tool: ["open_workspace", "read", "apply_patch", "exec_command", "write_stdin",
+      "list_process_sessions",
       "show_changes", "get_agy_runtime", "delegate_to_agy", "write", "edit", "bash"]
       .includes(fields.tool) ? fields.tool : "other",
     success: fields.success === true,
