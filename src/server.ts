@@ -91,7 +91,118 @@ import {
   type ToolSurface,
 } from "./tool-surfaces/types.js";
 
-type Transport = StreamableHTTPServerTransport;
+class RequestScopedJsonTransport {
+  private readonly inner: StreamableHTTPServerTransport;
+  private inFlightResponse: Response | undefined;
+  private forceHandleCompletion: (() => void) | undefined;
+  private handleInFlight = false;
+  private closed = false;
+
+  constructor() {
+    this.inner = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+    });
+  }
+
+  get sessionId(): string | undefined {
+    return this.inner.sessionId;
+  }
+
+  get onclose(): StreamableHTTPServerTransport["onclose"] {
+    return this.inner.onclose;
+  }
+
+  set onclose(handler: StreamableHTTPServerTransport["onclose"]) {
+    this.inner.onclose = handler;
+  }
+
+  get onerror(): StreamableHTTPServerTransport["onerror"] {
+    return this.inner.onerror;
+  }
+
+  set onerror(handler: StreamableHTTPServerTransport["onerror"]) {
+    this.inner.onerror = handler;
+  }
+
+  get onmessage(): StreamableHTTPServerTransport["onmessage"] {
+    return this.inner.onmessage;
+  }
+
+  set onmessage(handler: StreamableHTTPServerTransport["onmessage"]) {
+    this.inner.onmessage = handler;
+  }
+
+  start(): Promise<void> {
+    return this.inner.start();
+  }
+
+  send(...args: Parameters<StreamableHTTPServerTransport["send"]>): Promise<void> {
+    return this.inner.send(...args);
+  }
+
+  async handleRequest(...args: Parameters<StreamableHTTPServerTransport["handleRequest"]>): Promise<void> {
+    const response = args[1] as Response;
+    if (this.closed) {
+      this.finishForcedResponse(response);
+      return;
+    }
+
+    this.handleInFlight = true;
+    this.inFlightResponse = response;
+    let forceResolve: (() => void) | undefined;
+    const forced = new Promise<"forced">((resolve) => {
+      forceResolve = () => resolve("forced");
+    });
+    this.forceHandleCompletion = forceResolve;
+    const handled = this.inner.handleRequest(...args).then(() => "handled" as const);
+
+    try {
+      const outcome = await Promise.race([handled, forced]);
+      if (outcome === "forced") {
+        // The SDK 1.29.0 JSON response promise can remain pending after close().
+        // Its late completion is intentionally detached from the HTTP lifecycle.
+        void handled.catch(() => undefined);
+      }
+    } finally {
+      this.handleInFlight = false;
+      this.inFlightResponse = undefined;
+      this.forceHandleCompletion = undefined;
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.handleInFlight) {
+      const response = this.inFlightResponse;
+      if (response) this.finishForcedResponse(response);
+      this.forceHandleCompletion?.();
+    }
+    await this.inner.close();
+  }
+
+  private finishForcedResponse(response: Response): void {
+    if (response.writableEnded || response.destroyed) return;
+    if (!response.headersSent) {
+      response.statusCode = 503;
+      response.setHeader("content-type", "application/json; charset=utf-8");
+      response.setHeader("connection", "close");
+      response.end(JSON.stringify({
+        jsonrpc: "2.0",
+        error: {
+          code: -32001,
+          message: "MCP request interrupted by server shutdown",
+        },
+        id: null,
+      }));
+      return;
+    }
+    response.end();
+  }
+}
+
+type Transport = StreamableHTTPServerTransport | RequestScopedJsonTransport;
 const MCP_RUNTIME_SNAPSHOT_INTERVAL_MS = 60_000;
 const MCP_SESSION_MISS_DETAIL_LIMIT = 8;
 const MCP_SESSION_MISS_DETAIL_WINDOW_MS = 60_000;
@@ -139,6 +250,11 @@ type WorkspaceAppManifest = Record<string, WorkspaceAppManifestEntry>;
 
 function rpcRequestKey(requestId: string | number): string {
   return `${typeof requestId}:${String(requestId)}`;
+}
+
+function isOpenAiMcpRequest(req: Request): boolean {
+  const userAgent = req.header("user-agent")?.trim() ?? "";
+  return /^openai-mcp(?:\/|$)/i.test(userAgent);
 }
 
 function openAiConversationScopeIdFromRequest(request: unknown): string | undefined {
@@ -1043,6 +1159,7 @@ export interface CreateServerOptions {
   mcpMaxSessions?: number;
   mcpSessionIdleTimeoutMs?: number;
   mcpSessionCleanupIntervalMs?: number;
+  mcpSessionDrainTimeoutMs?: number;
   runtimeSnapshotIntervalMs?: number;
   mcpSessionLifecycleObserver?: (event: McpSessionLifecycleEvent) => void;
   httpLifecycleObserver?: (event: McpHttpLifecycleEvent) => void;
@@ -1260,14 +1377,24 @@ export function createServer(
     maxSessions: options.mcpMaxSessions ?? config.mcpMaxSessions,
     onEvent: (event) => {
       options.mcpSessionLifecycleObserver?.(event);
-      const names = {
-        created: "mcp_session_created",
-        closed: "mcp_session_closed",
-        evicted: "mcp_session_evicted",
-        miss: "mcp_session_miss",
-        capacity_rejected: "mcp_session_capacity_rejected",
-        close_failed: "mcp_session_close_failed",
-      } as const;
+      const requestScoped = event.transportKind === "request";
+      const names = requestScoped
+        ? {
+            created: "mcp_request_transport_created",
+            closed: "mcp_request_transport_closed",
+            evicted: "mcp_request_transport_evicted",
+            miss: "mcp_request_transport_miss",
+            capacity_rejected: "mcp_request_transport_capacity_rejected",
+            close_failed: "mcp_request_transport_close_failed",
+          } as const
+        : {
+            created: "mcp_session_created",
+            closed: "mcp_session_closed",
+            evicted: "mcp_session_evicted",
+            miss: "mcp_session_miss",
+            capacity_rejected: "mcp_session_capacity_rejected",
+            close_failed: "mcp_session_close_failed",
+          } as const;
 
       if (event.type === "miss") {
         const now = Date.now();
@@ -1298,6 +1425,7 @@ export function createServer(
           sessionAgeMs: event.sessionAgeMs,
           idleForMs: event.idleForMs,
           activeRequests: event.activeRequests,
+          transportKind: event.transportKind,
           ...(event.type === "miss" && suppressedSincePreviousDetail > 0
             ? { suppressedSincePreviousDetail }
             : {}),
@@ -1460,6 +1588,89 @@ export function createServer(
     });
 
     try {
+      if (isOpenAiMcpRequest(req)) {
+        let reservation: Awaited<ReturnType<typeof transports.reserve>> | undefined;
+        try {
+          reservation = await transports.reserve({ requestId, transportKind: "request" });
+        } catch (error) {
+          if (error instanceof McpSessionAdmissionError) {
+            sendJsonRpcError(
+              res,
+              503,
+              -32001,
+              "MCP request transport temporarily unavailable",
+            );
+            return;
+          }
+          throw error;
+        }
+
+        let transport: Transport | undefined;
+        let lease: McpSessionLease<Transport> | undefined;
+        const managedRequestId = `request:${requestId}`;
+        try {
+          transport = new RequestScopedJsonTransport();
+          const server = createMcpServer(
+            config,
+            workspaces,
+            reviewCheckpoints,
+            processSessions,
+            resolveLocalAgentProviders,
+            incomingArtifactAdapters,
+          );
+          await server.connect(transport);
+          const committed = await transports.commit(
+            reservation,
+            managedRequestId,
+            transport,
+            { requestId, transportKind: "request" },
+          );
+          reservation = undefined;
+          if (!committed) {
+            transport = undefined;
+            sendJsonRpcError(
+              res,
+              503,
+              -32001,
+              "MCP request transport temporarily unavailable",
+            );
+            return;
+          }
+          lease = committed;
+          if (config.logging.requests && initializeRequest) {
+            logEvent(config.logging, "info", "mcp_stateless_client_bound", {
+              runtimeGeneration,
+              requestId,
+              clientCorrelation: requestClientCorrelation,
+              responseMode: "json",
+            });
+          }
+          await withMcpRequestContext({
+            runtimeGeneration,
+            requestId,
+            sessionCorrelation: undefined,
+            clientCorrelation: requestClientCorrelation,
+            conversationCorrelation: requestConversationCorrelation,
+            conversationCorrelationForRequest,
+            requestSignal: res.locals.mcpRequestAbortSignal as AbortSignal | undefined,
+            onToolTerminal,
+          }, () => lease!.transport.handleRequest(req, res, req.body));
+        } finally {
+          if (lease) {
+            transports.release(lease);
+            await transports.dispose(
+              managedRequestId,
+              "request_complete",
+              { requestId, transportKind: "request" },
+            );
+          } else {
+            if (reservation) transports.cancel(reservation);
+            if (transport) await transport.close().catch(() => {});
+          }
+        }
+        return;
+      }
+
       if (sessionId) {
         const lease = transports.acquire(sessionId, { requestId });
         if (!lease) {
@@ -1663,7 +1874,7 @@ export function createServer(
         let transportResults: Awaited<ReturnType<typeof transports.closeAll>> = [];
         try {
           transportResults = await transports.closeAll({
-            drainTimeoutMs: MCP_SESSION_DRAIN_TIMEOUT_MS,
+            drainTimeoutMs: options.mcpSessionDrainTimeoutMs ?? MCP_SESSION_DRAIN_TIMEOUT_MS,
           });
         } finally {
           try {

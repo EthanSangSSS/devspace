@@ -10,11 +10,13 @@ import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js";
 import { loadConfig } from "./config.js";
 import type { McpSessionLifecycleEvent } from "./mcp-sessions.js";
 import { createServer, type McpHttpLifecycleEvent } from "./server.js";
+import { shutdownHttpServer, trackHttpConnections } from "./server-shutdown.js";
 import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 
 interface McpHttpResult {
   status: number;
   sessionId?: string;
+  contentType: string;
   messages: Array<Record<string, unknown>>;
 }
 
@@ -104,11 +106,13 @@ async function postMcp(
   accessToken: string,
   message: Record<string, unknown> | Array<Record<string, unknown>>,
   sessionId?: string,
+  extraHeaders: Record<string, string> = {},
 ): Promise<McpHttpResult> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${accessToken}`,
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
+    ...extraHeaders,
   };
   if (sessionId) headers["mcp-session-id"] = sessionId;
 
@@ -119,10 +123,10 @@ async function postMcp(
   });
   const nextSessionId = response.headers.get("mcp-session-id") ?? sessionId ?? undefined;
   const text = await response.text();
-  if (!text.trim()) {
-    return { status: response.status, sessionId: nextSessionId, messages: [] };
-  }
   const contentType = response.headers.get("content-type") ?? "";
+  if (!text.trim()) {
+    return { status: response.status, sessionId: nextSessionId, contentType, messages: [] };
+  }
   if (contentType.includes("application/json")) {
     const parsed = JSON.parse(text) as
       | Record<string, unknown>
@@ -130,6 +134,7 @@ async function postMcp(
     return {
       status: response.status,
       sessionId: nextSessionId,
+      contentType,
       messages: Array.isArray(parsed) ? parsed : [parsed],
     };
   }
@@ -140,7 +145,7 @@ async function postMcp(
       .map((line) => line.slice("data:".length).trim())
       .filter((data) => data && data !== "[DONE]")
       .map((data) => JSON.parse(data) as Record<string, unknown>);
-    return { status: response.status, sessionId: nextSessionId, messages };
+    return { status: response.status, sessionId: nextSessionId, contentType, messages };
   }
   throw new Error(`Unexpected MCP content type: ${contentType}`);
 }
@@ -376,12 +381,15 @@ interface HttpFixture {
   baseUrl: string;
   ownerToken: string;
   accessToken: string;
+  closeRuntime(): Promise<void>;
+  shutdown(timeoutMs: number): Promise<void>;
   close(): Promise<void>;
 }
 
 interface HttpFixtureOptions {
   idleTimeoutMs?: number;
   cleanupIntervalMs?: number;
+  drainTimeoutMs?: number;
   httpLifecycleObserver?: (event: McpHttpLifecycleEvent) => void;
   sessionLifecycleObserver?: (event: McpSessionLifecycleEvent) => void;
   deleteHandleBarrier?: (sessionId: string, requestId: string) => Promise<void>;
@@ -421,33 +429,116 @@ async function startFixture(
     mcpMaxSessions: maxSessions,
     mcpSessionIdleTimeoutMs: options.idleTimeoutMs,
     mcpSessionCleanupIntervalMs: options.cleanupIntervalMs,
+    mcpSessionDrainTimeoutMs: options.drainTimeoutMs,
     runtimeSnapshotIntervalMs: 1_000,
     httpLifecycleObserver: options.httpLifecycleObserver,
     mcpSessionLifecycleObserver: options.sessionLifecycleObserver,
   });
   const httpServer = running.app.listen(port, "127.0.0.1");
+  trackHttpConnections(httpServer);
   await new Promise<void>((resolve, reject) => {
     httpServer.once("listening", resolve);
     httpServer.once("error", reject);
   });
   const accessToken = await bootstrapOAuth(baseUrl, ownerToken);
   let closed = false;
+  let runtimeClosed = false;
+  const closeRuntime = async () => {
+    if (runtimeClosed) return;
+    runtimeClosed = true;
+    await running.close();
+  };
   return {
     root,
     project,
     baseUrl,
     ownerToken,
     accessToken,
+    closeRuntime,
+    async shutdown(timeoutMs: number) {
+      if (closed) return;
+      closed = true;
+      await shutdownHttpServer(httpServer, closeRuntime, { timeoutMs });
+    },
     async close() {
       if (closed) return;
       closed = true;
       await new Promise<void>((resolve, reject) =>
         httpServer.close((error) => (error ? reject(error) : resolve())),
       );
-      await running.close();
+      await closeRuntime();
     },
   };
 }
+
+test("OpenAI MCP clients use request-scoped stateless JSON while other clients keep stateful SSE", async (t) => {
+  const fixture = await startFixture(4);
+  t.after(() => fixture.close());
+  const openAiHeaders = { "User-Agent": "openai-mcp/1.0.0" };
+
+  const openAiInitializeId = nextId++;
+  const openAiInitialize = await postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    {
+      jsonrpc: "2.0",
+      id: openAiInitializeId,
+      method: "initialize",
+      params: {
+        protocolVersion: LATEST_PROTOCOL_VERSION,
+        capabilities: {},
+        clientInfo: { name: "openai-mcp", version: "1.0.0" },
+      },
+    },
+    undefined,
+    openAiHeaders,
+  );
+  assert.equal(openAiInitialize.status, 200);
+  assert.equal(openAiInitialize.sessionId, undefined);
+  assert.match(openAiInitialize.contentType, /application\/json/i);
+  assert.equal("error" in responseForId(openAiInitialize, openAiInitializeId), false);
+
+  const initialized = await postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+    undefined,
+    openAiHeaders,
+  );
+  assert.equal(initialized.status, 202);
+  assert.equal(initialized.sessionId, undefined);
+
+  for (let index = 0; index < 6; index += 1) {
+    const id = nextId++;
+    const openAiTools = await postMcp(
+      fixture.baseUrl,
+      fixture.accessToken,
+      { jsonrpc: "2.0", id, method: "tools/list", params: {} },
+      undefined,
+      openAiHeaders,
+    );
+    assert.equal(openAiTools.status, 200);
+    assert.equal(openAiTools.sessionId, undefined);
+    assert.match(openAiTools.contentType, /application\/json/i);
+    assert.equal("error" in responseForId(openAiTools, id), false);
+  }
+
+  const defaultInitializeId = nextId++;
+  const defaultInitialize = await postMcp(fixture.baseUrl, fixture.accessToken, {
+    jsonrpc: "2.0",
+    id: defaultInitializeId,
+    method: "initialize",
+    params: {
+      protocolVersion: LATEST_PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: { name: "devspace-reliability-test", version: "1.0.0" },
+    },
+  });
+  assert.equal(defaultInitialize.status, 200);
+  assert.ok(defaultInitialize.sessionId);
+  assert.match(defaultInitialize.contentType, /text\/event-stream/i);
+  assert.equal("error" in responseForId(defaultInitialize, defaultInitializeId), false);
+});
 
 test("idle session is evicted when a new initialize reaches maxSessions", async (t) => {
   const fixture = await startFixture(1);
@@ -1103,12 +1194,27 @@ test("tool result HTTP lifecycle proves server finish with opaque host correlati
   const logs = captureDiagnosticLogs(t);
   const fixture = await startFixture(4);
   t.after(() => fixture.close());
-  const ready = await initializeReadySession(fixture.baseUrl, fixture.accessToken, fixture.project);
-  const initialized = logs.events().find((event) => event.event === "mcp_session_client_bound");
-  assert.ok(initialized);
-  assert.equal(typeof initialized.clientCorrelation, "string");
-  assert.equal(typeof initialized.sessionCorrelation, "string");
-  assert.notEqual(initialized.sessionCorrelation, ready.sessionId.slice(0, 16));
+  const openAiHeaders = { "User-Agent": "openai-mcp/1.0.0" };
+  const openId = nextId++;
+  const opened = await postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    {
+      jsonrpc: "2.0",
+      id: openId,
+      method: "tools/call",
+      params: {
+        name: "open_workspace",
+        arguments: { path: fixture.project },
+      },
+    },
+    undefined,
+    openAiHeaders,
+  );
+  assert.equal(opened.status, 200);
+  assert.equal(opened.sessionId, undefined);
+  assert.match(opened.contentType, /application\/json/i);
+  const workspaceId = workspaceIdFromToolResponse(responseForId(opened, openId));
 
   logs.lines.length = 0;
   const conversationSecret = "SYNTHETIC_OPENAI_SESSION_SECRET";
@@ -1123,16 +1229,18 @@ test("tool result HTTP lifecycle proves server finish with opaque host correlati
       params: {
         name: "exec_command",
         arguments: {
-          workspaceId: ready.workspaceId,
+          workspaceId,
           cmd: `"${process.execPath}" -e "process.exit(0)"`,
           yieldTimeMs: 1_000,
         },
         _meta: { "openai/session": conversationSecret },
       },
     },
-    ready.sessionId,
+    undefined,
+    openAiHeaders,
   );
   assert.equal(response.status, 200);
+  assert.match(response.contentType, /application\/json/i);
   assert.equal("error" in responseForId(response, id), false);
 
   const events = logs.events();
@@ -1151,16 +1259,337 @@ test("tool result HTTP lifecycle proves server finish with opaque host correlati
   assert.equal(httpFinished.outcome, "process_exit_zero");
   assert.equal(httpFinished.statusCode, 200);
   assert.equal(httpFinished.sessionCorrelation, start.sessionCorrelation);
-  assert.equal(start.clientCorrelation, initialized.clientCorrelation);
-  assert.equal(httpFinished.clientCorrelation, initialized.clientCorrelation);
+  assert.equal(start.sessionCorrelation, undefined);
+  assert.equal(typeof start.clientCorrelation, "string");
+  assert.equal(httpFinished.clientCorrelation, start.clientCorrelation);
   assert.equal(typeof start.conversationCorrelation, "string");
   assert.equal(httpFinished.conversationCorrelation, start.conversationCorrelation);
   assert.notEqual(start.conversationCorrelation, conversationSecret);
 
   const output = logs.lines.join("\n");
-  for (const forbidden of [conversationSecret, fixture.accessToken, ready.sessionId]) {
+  for (const forbidden of [conversationSecret, fixture.accessToken]) {
     assert.equal(output.includes(forbidden), false);
   }
+});
+
+test("OpenAI stateless DELETE cannot terminate a different in-flight JSON tool request", {
+  timeout: 10_000,
+}, async (t) => {
+  const logs = captureDiagnosticLogs(t);
+  const fixture = await startFixture(4);
+  t.after(() => fixture.close());
+  const openAiHeaders = { "User-Agent": "openai-mcp/1.0.0" };
+
+  const openId = nextId++;
+  const opened = await postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    {
+      jsonrpc: "2.0",
+      id: openId,
+      method: "tools/call",
+      params: {
+        name: "open_workspace",
+        arguments: { path: fixture.project },
+      },
+    },
+    undefined,
+    openAiHeaders,
+  );
+  const workspaceId = workspaceIdFromToolResponse(responseForId(opened, openId));
+
+  logs.lines.length = 0;
+  const toolId = nextId++;
+  const toolRequest = postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    {
+      jsonrpc: "2.0",
+      id: toolId,
+      method: "tools/call",
+      params: {
+        name: "exec_command",
+        arguments: {
+          workspaceId,
+          cmd: `"${process.execPath}" -e "setTimeout(()=>process.exit(0),350)"`,
+          yieldTimeMs: 1_000,
+        },
+      },
+    },
+    undefined,
+    openAiHeaders,
+  );
+
+  await waitForCondition(
+    () => logs.events().some((event) => event.event === "mcp_tool_started"),
+    2_000,
+  );
+
+  const deleteResponse = await fetch(`${fixture.baseUrl}/mcp`, {
+    method: "DELETE",
+    headers: {
+      Authorization: `Bearer ${fixture.accessToken}`,
+      Accept: "application/json, text/event-stream",
+      ...openAiHeaders,
+    },
+  });
+  assert.equal(deleteResponse.status, 200);
+  await deleteResponse.text();
+
+  const completed = await toolRequest;
+  assert.equal(completed.status, 200);
+  assert.equal(completed.sessionId, undefined);
+  assert.match(completed.contentType, /application\/json/i);
+  assert.equal("error" in responseForId(completed, toolId), false);
+
+  const events = logs.events();
+  const start = events.find((event) => event.event === "mcp_tool_started");
+  const finish = events.find((event) => event.event === "mcp_tool_finished");
+  const httpFinished = events.find((event) => event.event === "mcp_http_tool_result_response_finished");
+  assert.ok(start);
+  assert.ok(finish);
+  assert.ok(httpFinished);
+  assert.equal(finish.toolCallId, start.toolCallId);
+  assert.equal(finish.outcome, "process_exit_zero");
+  assert.equal(httpFinished.toolCallId, start.toolCallId);
+  assert.equal(httpFinished.statusCode, 200);
+  assert.equal(events.some((event) => event.event === "mcp_session_closed"), false);
+});
+
+test("OpenAI request transports share capacity, closing fence, and graceful shutdown drain", {
+  timeout: 10_000,
+}, async (t) => {
+  const lifecycle: McpSessionLifecycleEvent[] = [];
+  const fixture = await startFixture(1, undefined, {
+    sessionLifecycleObserver: (event) => lifecycle.push(event),
+  });
+  t.after(() => fixture.close());
+  const openAiHeaders = { "User-Agent": "openai-mcp/1.0.0" };
+
+  const openId = nextId++;
+  const opened = await postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    {
+      jsonrpc: "2.0",
+      id: openId,
+      method: "tools/call",
+      params: { name: "open_workspace", arguments: { path: fixture.project } },
+    },
+    undefined,
+    openAiHeaders,
+  );
+  const workspaceId = workspaceIdFromToolResponse(responseForId(opened, openId));
+
+  const readyPath = join(fixture.root, "openai-shutdown-ready");
+  const releasePath = join(fixture.root, "openai-shutdown-release");
+  const activeId = nextId++;
+  const activeRequest = postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    {
+      jsonrpc: "2.0",
+      id: activeId,
+      method: "tools/call",
+      params: {
+        name: "exec_command",
+        arguments: activeExecArgs(workspaceId, readyPath, releasePath),
+      },
+    },
+    undefined,
+    openAiHeaders,
+  );
+  await waitForFile(readyPath, 2_000);
+
+  const activeCreated = [...lifecycle].reverse().find(
+    (event) => event.type === "created" && event.transportKind === "request",
+  );
+  assert.ok(activeCreated);
+  assert.equal(activeCreated.snapshot.current, 1);
+  assert.equal(activeCreated.snapshot.active, 1);
+  assert.equal(activeCreated.snapshot.currentRequests, 1);
+  assert.equal(activeCreated.snapshot.activeRequests, 1);
+  assert.equal(activeCreated.snapshot.currentSessions, 0);
+
+  const capacityId = nextId++;
+  const capacityResponse = await postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    { jsonrpc: "2.0", id: capacityId, method: "tools/list", params: {} },
+    undefined,
+    openAiHeaders,
+  );
+  assert.equal(capacityResponse.status, 503);
+  const capacityRejected = lifecycle.find(
+    (event) => event.type === "capacity_rejected" && event.transportKind === "request",
+  );
+  assert.ok(capacityRejected);
+  assert.equal(capacityRejected.snapshot.currentRequests, 1);
+  assert.equal(capacityRejected.snapshot.activeRequests, 1);
+
+  let runtimeCloseSettled = false;
+  const runtimeClose = fixture.closeRuntime().finally(() => {
+    runtimeCloseSettled = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(runtimeCloseSettled, false, "shutdown must wait for the active OpenAI request");
+
+  const fencedId = nextId++;
+  const fenced = await postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    {
+      jsonrpc: "2.0",
+      id: fencedId,
+      method: "tools/call",
+      params: { name: "open_workspace", arguments: { path: fixture.project } },
+    },
+    undefined,
+    openAiHeaders,
+  );
+  assert.equal(fenced.status, 503);
+
+  await writeFile(releasePath, "release\n");
+  const completed = await activeRequest;
+  assert.equal(completed.status, 200);
+  assert.equal("error" in responseForId(completed, activeId), false);
+  await runtimeClose;
+  assert.equal(runtimeCloseSettled, true);
+
+  const shutdownClose = [...lifecycle].reverse().find(
+    (event) => event.type === "closed" && event.transportKind === "request",
+  );
+  assert.ok(shutdownClose);
+  assert.ok(["closing", "closed"].includes(shutdownClose.snapshot.state));
+  assert.equal(shutdownClose.snapshot.currentRequests, 0);
+  assert.equal(shutdownClose.snapshot.activeRequests, 0);
+});
+
+test("OpenAI GET SSE is force-closed by the shared bounded shutdown drain", {
+  timeout: 5_000,
+}, async (t) => {
+  const lifecycle: McpSessionLifecycleEvent[] = [];
+  const fixture = await startFixture(1, undefined, {
+    drainTimeoutMs: 100,
+    sessionLifecycleObserver: (event) => lifecycle.push(event),
+  });
+  t.after(() => fixture.close());
+
+  const response = await fetch(`${fixture.baseUrl}/mcp`, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${fixture.accessToken}`,
+      Accept: "text/event-stream",
+      "User-Agent": "openai-mcp/1.0.0",
+    },
+  });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/i);
+  assert.equal(response.headers.get("mcp-session-id"), null);
+
+  await waitForCondition(
+    () => lifecycle.some(
+      (event) => event.type === "created"
+        && event.transportKind === "request"
+        && event.snapshot.activeRequests === 1,
+    ),
+    1_000,
+  );
+
+  const startedAt = Date.now();
+  await fixture.closeRuntime();
+  const elapsedMs = Date.now() - startedAt;
+  assert.ok(elapsedMs >= 75, `shutdown drain returned too early: ${elapsedMs}ms`);
+  assert.ok(elapsedMs < 2_000, `shutdown drain exceeded bounded close: ${elapsedMs}ms`);
+
+  const shutdownClose = lifecycle.find(
+    (event) => event.type === "closed"
+      && event.transportKind === "request"
+      && event.reason === "server_shutdown",
+  );
+  assert.ok(shutdownClose);
+  assert.equal(shutdownClose.snapshot.state, "closing");
+  assert.equal(shutdownClose.snapshot.currentRequests, 0);
+  assert.equal(shutdownClose.snapshot.activeRequests, 0);
+
+  await response.body?.cancel();
+});
+
+test("OpenAI JSON POST is force-settled when shutdown exceeds the request drain deadline", {
+  timeout: 5_000,
+}, async (t) => {
+  const lifecycle: McpSessionLifecycleEvent[] = [];
+  const fixture = await startFixture(1, undefined, {
+    drainTimeoutMs: 100,
+    sessionLifecycleObserver: (event) => lifecycle.push(event),
+  });
+  t.after(() => fixture.close());
+  const openAiHeaders = { "User-Agent": "openai-mcp/1.0.0", Connection: "close" };
+
+  const openId = nextId++;
+  const opened = await postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    {
+      jsonrpc: "2.0",
+      id: openId,
+      method: "tools/call",
+      params: { name: "open_workspace", arguments: { path: fixture.project } },
+    },
+    undefined,
+    openAiHeaders,
+  );
+  const workspaceId = workspaceIdFromToolResponse(responseForId(opened, openId));
+
+  const readyPath = join(fixture.root, "openai-forced-post-ready");
+  const releasePath = join(fixture.root, "openai-forced-post-release");
+  const activeId = nextId++;
+  const activeRequest = postMcp(
+    fixture.baseUrl,
+    fixture.accessToken,
+    {
+      jsonrpc: "2.0",
+      id: activeId,
+      method: "tools/call",
+      params: {
+        name: "exec_command",
+        arguments: activeExecArgs(workspaceId, readyPath, releasePath),
+      },
+    },
+    undefined,
+    openAiHeaders,
+  );
+  await waitForFile(readyPath, 2_000);
+  await waitForCondition(
+    () => lifecycle.some(
+      (event) => event.type === "created"
+        && event.transportKind === "request"
+        && event.snapshot.activeRequests === 1,
+    ),
+    1_000,
+  );
+
+  const startedAt = Date.now();
+  const shutdown = fixture.shutdown(2_000);
+  const [shutdownResult, responseResult] = await Promise.allSettled([shutdown, activeRequest]);
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(shutdownResult.status, "fulfilled");
+  assert.equal(responseResult.status, "fulfilled");
+  if (responseResult.status !== "fulfilled") return;
+  assert.ok(elapsedMs >= 75, `shutdown drain returned too early: ${elapsedMs}ms`);
+  assert.ok(elapsedMs < 1_500, `shutdown exceeded bounded completion: ${elapsedMs}ms`);
+  assert.equal(responseResult.value.status, 503);
+  assert.match(responseResult.value.contentType, /application\/json/i);
+
+  const forcedClose = lifecycle.find(
+    (event) => event.type === "closed"
+      && event.transportKind === "request"
+      && event.reason === "server_shutdown",
+  );
+  assert.ok(forcedClose);
+  assert.equal(forcedClose.snapshot.currentRequests, 0);
+  assert.equal(forcedClose.snapshot.activeRequests, 0);
 });
 
 test("HTTP finish before tool terminal marks result delivery unproven", {
