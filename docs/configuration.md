@@ -39,6 +39,8 @@ Run `devspace init` to create both files. `devspace config set publicBaseUrl
     "legacyWorktreeRoots": [],
     "requireExistingWorktreeRoot": false,
     "managedWorktreeSourceRoots": [],
+    "managedWorktreeMountPoint": "",
+    "managedWorktreeVolumeUuid": "",
   },
   "storage": {
     "stateDir": "~/.local/share/devspace",
@@ -97,6 +99,8 @@ the preferred destination, so already-stored managed sessions remain readable:
     "worktreeRoot": "/Volumes/DevSSD/Worktrees",
     "legacyWorktreeRoots": ["~/.devspace/worktrees"],
     "requireExistingWorktreeRoot": true,
+    "managedWorktreeMountPoint": "/Volumes/DevSSD",
+    "managedWorktreeVolumeUuid": "00000000-0000-0000-0000-000000000000",
     "managedWorktreeSourceRoots": [
       "/Volumes/DevSSD/Developer/devspace-mcp-session-reliability-v1-1",
       "/Volumes/DevSSD/Developer/app-legal-docs"
@@ -108,14 +112,26 @@ the preferred destination, so already-stored managed sessions remain readable:
 Legacy roots authorize persisted managed workspace access; they are **not**
 destinations for new managed worktrees. With `requireExistingWorktreeRoot=true`,
 an unavailable directory or a symlink at the configured new root causes new
-worktree creation to fail rather than creating a fallback directory. It does
-**not** establish the filesystem's physical identity or encryption: confirm
-the correct external volume is mounted before changing the configuration,
-restarting a running server, or creating new worktrees. Do not delete or move
-old worktrees until their active sessions and uncommitted changes are
-independently accounted for. The global configuration change also affects
-sources outside the external volume; validate the backup allowlist before
-creating worktrees from those repositories.
+worktree creation to fail rather than creating a fallback directory.
+
+On macOS, replace the example all-zero UUID above with the **actual UUID** of
+the intended encrypted APFS volume as reported by `diskutil info -plist`.
+When `managedWorktreeMountPoint` and `managedWorktreeVolumeUuid` are both set,
+new worktree creation checks the exact volume UUID, mount point, APFS type,
+encryption (`FileVault` flag), writable status, and that the configured
+worktree directory resides on the mounted volume rather than the host disk.
+If either field is missing, the other does not grant permission: new worktree
+creation fails closed. Both fields default to empty to preserve current
+configurations, which means volume identity checking is **opt-in**. This
+guard requires macOS; non-macOS systems reject the opt-in settings.
+`requireExistingWorktreeRoot` must also be enabled. The check occurs before
+`git worktree add`, but it cannot eliminate all filesystem hot-unplug races;
+maintain backups and verify a stable physical connection.
+
+Do not delete or move old worktrees until their active sessions and
+uncommitted changes are independently accounted for. The global configuration
+change also affects sources outside the external volume; validate the backup
+allowlist before creating worktrees from those repositories.
 
 `managedWorktreeSourceRoots` restricts **new managed worktree creation** to
 the listed **exact Git repository roots** (without changing general checkout
@@ -127,6 +143,11 @@ list synchronized with the local backup allowlist. Listing the parent
 prevents snapshot-only or unprotected Git sources from gaining automatic
 worktree access through an overly broad parent. A new project needs separate
 source and backup authorization before using managed worktree mode.
+
+If Git fails to create a new managed worktree, DevSpace leaves any remaining
+target directory in place rather than recursively removing files whose
+ownership cannot be established. Inspect the resulting path before explicit
+cleanup; this intentionally favors preserving user data over automatic cleanup.
 
 `server.mcpSessionIdleTimeoutMs` applies only after a session has no in-flight
 requests. The cleanup timer never expires an active tool call or active MCP

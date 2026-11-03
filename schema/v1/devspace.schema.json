@@ -110,6 +110,14 @@
             "type": "string",
             "minLength": 1
           }
+        },
+        "managedWorktreeMountPoint": {
+          "default": "",
+          "type": "string"
+        },
+        "managedWorktreeVolumeUuid": {
+          "default": "",
+          "type": "string"
         }
       },
       "additionalProperties": false

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -250,6 +250,72 @@ test("an existing-only managed root rejects a redirected symlink", { skip: platf
       error.code === "GIT_WORKTREE_CREATE_FAILED",
   );
   assert.deepEqual(await stat(actualRoot).then((s) => s.isDirectory()), true);
+});
+
+test("failed managed worktree creation never recursively deletes an unexpected pre-existing file", { skip: platform() === "win32" }, async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const targetRoot = join(context.root, "preserve-failed-git-worktree");
+  const shimDir = join(context.root, "fake-git-tools");
+  await mkdir(targetRoot);
+  await mkdir(shimDir);
+  const shim = join(shimDir, "git");
+  await writeFile(shim, [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"worktree\" ] && [ \"$2\" = \"add\" ]; then",
+    "  /bin/mkdir -p \"$4\"",
+    "  printf 'UNOWNED_FILE' > \"$4/preserve-me.txt\"",
+    "  exit 1",
+    "fi",
+    "exec /usr/bin/git \"$@\"",
+    "",
+  ].join("\n"));
+  await chmod(shim, 0o700);
+  const config = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "config-preserve-git-error"),
+    { server: { port: 1 }, workspaces: {
+      allowedRoots: [context.root], worktreeRoot: targetRoot,
+      requireExistingWorktreeRoot: true,
+    } },
+  ));
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${shimDir}:${originalPath ?? ""}`;
+  try {
+    await assert.rejects(
+      () => new WorkspaceRegistry(config).openWorkspace({ path: gitRoot, mode: "worktree" }),
+      (error: unknown) => error instanceof GitWorktreeError &&
+        error.code === "GIT_WORKTREE_CREATE_FAILED",
+    );
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+  }
+  const children = await readdir(targetRoot);
+  assert.equal(children.length, 1);
+  assert.equal(await readFile(join(targetRoot, children[0], "preserve-me.txt"), "utf8"), "UNOWNED_FILE");
+});
+
+test("configured managed SSD volume identity must fail closed on an ordinary directory", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const fakeMount = join(context.root, "unmounted-external-volume");
+  const targetRoot = join(fakeMount, "Worktrees");
+  await mkdir(targetRoot, { recursive: true });
+  const config = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "config-identity-mismatch"),
+    { server: { port: 1 }, workspaces: {
+      allowedRoots: [context.root], worktreeRoot: targetRoot,
+      requireExistingWorktreeRoot: true,
+      managedWorktreeMountPoint: fakeMount,
+      managedWorktreeVolumeUuid: "00000000-0000-0000-0000-000000000000",
+    } },
+  ));
+  await assert.rejects(
+    () => new WorkspaceRegistry(config).openWorkspace({ path: gitRoot, mode: "worktree" }),
+    (error: unknown) => error instanceof GitWorktreeError &&
+      error.code === "GIT_WORKTREE_CREATE_FAILED",
+  );
+  assert.deepEqual(await readdir(targetRoot), []);
 });
 
 test("new managed worktrees may be created only from explicitly listed Git repositories", async (t) => {

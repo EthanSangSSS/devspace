@@ -22,6 +22,8 @@ const workspacesConfigSchema = z.object({
   legacyWorktreeRoots: z.array(z.string().trim().min(1)).default([]),
   requireExistingWorktreeRoot: z.boolean().default(false),
   managedWorktreeSourceRoots: z.array(z.string().trim().min(1)).default([]),
+  managedWorktreeMountPoint: z.string().trim().default(""),
+  managedWorktreeVolumeUuid: z.string().trim().default(""),
 }).strict().prefault({});
 
 const storageConfigSchema = z.object({

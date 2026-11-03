@@ -28,6 +28,8 @@ try {
   assert.deepEqual(defaults.legacyWorktreeRoots, []);
   assert.equal(defaults.requireExistingWorktreeRoot, false);
   assert.deepEqual(defaults.managedWorktreeSourceRoots, []);
+  assert.equal(defaults.managedWorktreeMountPoint, "");
+  assert.equal(defaults.managedWorktreeVolumeUuid, "");
   assert.deepEqual(defaults.subagents, { enabled: false, providers: [] });
   assert.deepEqual(defaults.agyDelegation, {
     enabled: false,
@@ -66,6 +68,8 @@ try {
       legacyWorktreeRoots: ["~/trees-old", "~/trees-older"],
       requireExistingWorktreeRoot: true,
       managedWorktreeSourceRoots: ["~/work/approved"],
+      managedWorktreeMountPoint: "/Volumes/DevSSD",
+      managedWorktreeVolumeUuid: "00000000-0000-0000-0000-000000000000",
     },
     storage: { stateDir: "~/state" },
     tools: { mode: "claude" },
@@ -130,6 +134,8 @@ try {
   ]);
   assert.equal(configured.requireExistingWorktreeRoot, true);
   assert.deepEqual(configured.managedWorktreeSourceRoots, [resolve(homedir(), "work", "approved")]);
+  assert.equal(configured.managedWorktreeMountPoint, "/Volumes/DevSSD");
+  assert.equal(configured.managedWorktreeVolumeUuid, "00000000-0000-0000-0000-000000000000");
   assert.equal(configured.artifactsEnabled, true);
   assert.equal(configured.artifactMaxFileBytes, 321);
   assert.equal(configured.skillsEnabled, false);

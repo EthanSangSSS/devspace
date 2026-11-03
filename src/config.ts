@@ -32,6 +32,8 @@ export interface ServerConfig {
   legacyWorktreeRoots: string[];
   requireExistingWorktreeRoot: boolean;
   managedWorktreeSourceRoots: string[];
+  managedWorktreeMountPoint: string;
+  managedWorktreeVolumeUuid: string;
   artifactsEnabled: boolean;
   artifactMaxFileBytes: number;
   skillsEnabled: boolean;
@@ -90,6 +92,9 @@ export function loadConfig(
     legacyWorktreeRoots: normalizePaths(stored.workspaces.legacyWorktreeRoots),
     requireExistingWorktreeRoot: stored.workspaces.requireExistingWorktreeRoot,
     managedWorktreeSourceRoots: normalizePaths(stored.workspaces.managedWorktreeSourceRoots),
+    managedWorktreeMountPoint: stored.workspaces.managedWorktreeMountPoint
+      ? normalizePath(stored.workspaces.managedWorktreeMountPoint) : "",
+    managedWorktreeVolumeUuid: stored.workspaces.managedWorktreeVolumeUuid,
     artifactsEnabled: stored.artifacts.enabled,
     artifactMaxFileBytes: stored.artifacts.maxFileBytes,
     skillsEnabled: stored.skills.enabled,

@@ -1,8 +1,9 @@
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { lstat, mkdir, realpath, rm, stat } from "node:fs/promises";
-import { basename, join, relative, resolve } from "node:path";
+import { lstat, mkdir, realpath, stat } from "node:fs/promises";
+import { platform } from "node:os";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import type { ServerConfig } from "./config.js";
 import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
 import { gitEnvironment } from "./git-environment.js";
@@ -106,12 +107,16 @@ export async function createManagedWorktree(input: {
   } else {
     await mkdir(input.config.worktreeRoot, { recursive: true });
   }
+  await verifyManagedWorktreeVolume(input.config);
   assertAllowedPath(worktreePath, [input.config.worktreeRoot]);
 
   try {
     await git(["worktree", "add", "--detach", worktreePath, baseSha], sourceRoot);
   } catch (error) {
-    await rm(worktreePath, { recursive: true, force: true });
+    // A different process (or the user) may have created this path while Git
+    // was running. Never recursively remove a path we cannot prove we own.
+    // Leave any partial directory for explicit diagnosis rather than risking
+    // the destruction of worktree or user files.
     const message = error instanceof Error ? error.message : String(error);
     throw new GitWorktreeError(
       "GIT_WORKTREE_CREATE_FAILED",
@@ -128,6 +133,49 @@ export async function createManagedWorktree(input: {
     detached: true,
     managed: true,
   };
+}
+
+/** Opt-in macOS external-volume guard. Does not change the v1.1 default. */
+export async function verifyManagedWorktreeVolume(config: ServerConfig): Promise<void> {
+  const mount = config.managedWorktreeMountPoint;
+  const uuid = config.managedWorktreeVolumeUuid;
+  if (!mount && !uuid) return;
+  const rejected = (): never => {
+    throw new GitWorktreeError(
+      "GIT_WORKTREE_CREATE_FAILED",
+      "Managed worktree destination volume is not the configured mounted encrypted APFS volume.",
+    );
+  };
+  if (!mount || !/^[0-9a-fA-F-]{36}$/.test(uuid)
+      || !config.requireExistingWorktreeRoot || platform() !== "darwin") rejected();
+
+  try {
+    const [volume, parent, target] = await Promise.all([
+      lstat(mount), stat(dirname(mount)), lstat(config.worktreeRoot),
+    ]);
+    if (!volume.isDirectory() || volume.isSymbolicLink()
+        || !target.isDirectory() || target.isSymbolicLink()
+        || volume.dev === parent.dev || target.dev !== volume.dev
+        || !isPathInsideRoot(config.worktreeRoot, mount)) rejected();
+
+    // diskutil info -plist requires the actual mount point (not a child path).
+    // Parse only known scalar fields. Missing/ambiguous values fail closed.
+    const { stdout } = await execFileAsync("/usr/sbin/diskutil",
+      ["info", "-plist", mount], { maxBuffer: 1024 * 1024, timeout: 12000 });
+    const field = (name: string): string | undefined => {
+      const match = new RegExp(
+        `<key>${name}</key>\\s*(?:<string>([^<]*)</string>|<(true|false)\\s*/>)`,
+      ).exec(stdout);
+      return match?.[1] ?? match?.[2];
+    };
+    if (field("VolumeUUID")?.toUpperCase() !== uuid.toUpperCase()
+        || field("MountPoint") !== mount
+        || field("FilesystemName") !== "APFS"
+        || field("Writable") !== "true"
+        || field("FileVault") !== "true") rejected();
+  } catch {
+    rejected();
+  }
 }
 
 async function resolveGitRoot(path: string, allowedRoots: string[]): Promise<string> {
