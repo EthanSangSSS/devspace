@@ -19,6 +19,8 @@ const serverConfigSchema = z.object({
 const workspacesConfigSchema = z.object({
   allowedRoots: z.array(z.string().trim().min(1)).default([]),
   worktreeRoot: z.string().trim().min(1).default("~/.devspace/worktrees"),
+  legacyWorktreeRoots: z.array(z.string().trim().min(1)).default([]),
+  requireExistingWorktreeRoot: z.boolean().default(false),
 }).strict().prefault({});
 
 const storageConfigSchema = z.object({

@@ -133,6 +133,125 @@ test("persisted checkout and worktree sessions restore after recreating the regi
   }
 });
 
+test("a new managed worktree root retains old stored sessions through explicitly listed legacy roots", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const oldRoot = join(context.root, "managed-old");
+  const newRoot = join(context.root, "managed-new");
+  const stateDir = join(context.root, "state-dual-roots");
+  const oldConfig = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "config-old-root"),
+    { server: { port: 1 }, workspaces: { allowedRoots: [context.root], worktreeRoot: oldRoot } },
+  ));
+
+  const firstStore = new SqliteWorkspaceStore(stateDir);
+  const original = await new WorkspaceRegistry(oldConfig, firstStore)
+    .openWorkspace({ path: gitRoot, mode: "worktree" });
+  assert.ok(original.workspace.root.startsWith(`${oldRoot}/`));
+  firstStore.close();
+
+  const newConfig = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "config-new-root"),
+    {
+      server: { port: 1 },
+      workspaces: {
+        allowedRoots: [context.root],
+        worktreeRoot: newRoot,
+        legacyWorktreeRoots: [oldRoot],
+      },
+    },
+  ));
+  const secondStore = new SqliteWorkspaceStore(stateDir);
+  try {
+    const registry = new WorkspaceRegistry(newConfig, secondStore);
+    const persisted = registry.getWorkspace(original.workspace.id);
+    assert.equal(persisted.root, original.workspace.root);
+    assert.equal(persisted.mode, "worktree");
+
+    const created = await registry.openWorkspace({ path: gitRoot, mode: "worktree" });
+    assert.ok(created.workspace.root.startsWith(`${newRoot}/`));
+    assert.equal(created.workspace.sourceRoot, gitRoot);
+    assert.equal(registry.getWorkspace(original.workspace.id).root, original.workspace.root);
+  } finally {
+    secondStore.close();
+  }
+});
+
+test("switching managed roots without a legacy allowlist rejects old stored worktrees", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const storeDir = join(context.root, "state-reject-legacy");
+  const store = new SqliteWorkspaceStore(storeDir);
+  const original = await new WorkspaceRegistry(context.config, store)
+    .openWorkspace({ path: gitRoot, mode: "worktree" });
+  store.close();
+
+  const config = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "config-reject-legacy"),
+    { server: { port: 1 }, workspaces: {
+      allowedRoots: [context.root],
+      worktreeRoot: join(context.root, "replacement-root"),
+    } },
+  ));
+  const persistedStore = new SqliteWorkspaceStore(storeDir);
+  try {
+    const registry = new WorkspaceRegistry(config, persistedStore);
+    assert.throws(() => registry.getWorkspace(original.workspace.id), /outside allowed roots/);
+  } finally {
+    persistedStore.close();
+  }
+});
+
+test("an external managed root configured as existing-only is never created when missing", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const targetRoot = join(context.root, "unmounted-drive", "worktrees");
+  const config = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "config-require-existing"),
+    { server: { port: 1 }, workspaces: {
+      allowedRoots: [context.root],
+      worktreeRoot: targetRoot,
+      requireExistingWorktreeRoot: true,
+    } },
+  ));
+  const registry = new WorkspaceRegistry(config);
+
+  await assert.rejects(
+    () => registry.openWorkspace({ path: gitRoot, mode: "worktree" }),
+    (error: unknown) => error instanceof GitWorktreeError &&
+      error.code === "GIT_WORKTREE_CREATE_FAILED",
+  );
+  await assert.rejects(stat(targetRoot), { code: "ENOENT" });
+
+  await mkdir(targetRoot, { recursive: true });
+  const created = await registry.openWorkspace({ path: gitRoot, mode: "worktree" });
+  assert.ok(created.workspace.root.startsWith(`${targetRoot}/`));
+});
+
+test("an existing-only managed root rejects a redirected symlink", { skip: platform() === "win32" }, async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const actualRoot = join(context.root, "other-location");
+  const redirectedRoot = join(context.root, "redirected-worktree-root");
+  await mkdir(actualRoot);
+  await symlink(actualRoot, redirectedRoot, "dir");
+  const config = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "config-symlink-root"),
+    { server: { port: 1 }, workspaces: {
+      allowedRoots: [context.root],
+      worktreeRoot: redirectedRoot,
+      requireExistingWorktreeRoot: true,
+    } },
+  ));
+  const registry = new WorkspaceRegistry(config);
+  await assert.rejects(
+    () => registry.openWorkspace({ path: gitRoot, mode: "worktree" }),
+    (error: unknown) => error instanceof GitWorktreeError &&
+      error.code === "GIT_WORKTREE_CREATE_FAILED",
+  );
+  assert.deepEqual(await stat(actualRoot).then((s) => s.isDirectory()), true);
+});
+
 test("workspace paths outside the allowed roots are rejected", async (t) => {
   const context = await fixture(t);
 

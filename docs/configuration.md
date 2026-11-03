@@ -36,6 +36,8 @@ Run `devspace init` to create both files. `devspace config set publicBaseUrl
   "workspaces": {
     "allowedRoots": ["~/personal", "~/work"],
     "worktreeRoot": "~/.devspace/worktrees",
+    "legacyWorktreeRoots": [],
+    "requireExistingWorktreeRoot": false,
   },
   "storage": {
     "stateDir": "~/.local/share/devspace",
@@ -79,6 +81,36 @@ Run `devspace init` to create both files. `devspace config set publicBaseUrl
 Omitted sections and keys use the defaults shown above. An empty
 `workspaces.allowedRoots` uses the current working directory. Unknown keys are
 rejected so spelling mistakes cannot silently alter behavior.
+
+### Moving managed worktrees without breaking older sessions
+
+`workspaces.worktreeRoot` is the destination for **new** managed worktrees.
+Changing it does not relocate old worktrees or rewrite persisted workspace
+session records. Add the previous root to `legacyWorktreeRoots` when changing
+the preferred destination, so already-stored managed sessions remain readable:
+
+```jsonc
+{
+  "workspaces": {
+    "allowedRoots": ["~/projects", "/Volumes/DevSSD/Developer"],
+    "worktreeRoot": "/Volumes/DevSSD/Worktrees",
+    "legacyWorktreeRoots": ["~/.devspace/worktrees"],
+    "requireExistingWorktreeRoot": true
+  }
+}
+```
+
+Legacy roots authorize persisted managed workspace access; they are **not**
+destinations for new managed worktrees. With `requireExistingWorktreeRoot=true`,
+an unavailable directory or a symlink at the configured new root causes new
+worktree creation to fail rather than creating a fallback directory. It does
+**not** establish the filesystem's physical identity or encryption: confirm
+the correct external volume is mounted before changing the configuration,
+restarting a running server, or creating new worktrees. Do not delete or move
+old worktrees until their active sessions and uncommitted changes are
+independently accounted for. The global configuration change also affects
+sources outside the external volume; validate the backup allowlist before
+creating worktrees from those repositories.
 
 `server.mcpSessionIdleTimeoutMs` applies only after a session has no in-flight
 requests. The cleanup timer never expires an active tool call or active MCP

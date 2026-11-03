@@ -25,6 +25,8 @@ try {
   assert.equal(defaults.uiEnabled, true);
   assert.equal(defaults.skillsEnabled, true);
   assert.equal(defaults.artifactsEnabled, false);
+  assert.deepEqual(defaults.legacyWorktreeRoots, []);
+  assert.equal(defaults.requireExistingWorktreeRoot, false);
   assert.deepEqual(defaults.subagents, { enabled: false, providers: [] });
   assert.deepEqual(defaults.agyDelegation, {
     enabled: false,
@@ -60,6 +62,8 @@ try {
     workspaces: {
       allowedRoots: ["~/work"],
       worktreeRoot: "~/trees",
+      legacyWorktreeRoots: ["~/trees-old", "~/trees-older"],
+      requireExistingWorktreeRoot: true,
     },
     storage: { stateDir: "~/state" },
     tools: { mode: "claude" },
@@ -118,6 +122,11 @@ try {
   assert.equal(configured.uiEnabled, false);
   assert.equal(configured.stateDir, resolve(homedir(), "state"));
   assert.equal(configured.worktreeRoot, resolve(homedir(), "trees"));
+  assert.deepEqual(configured.legacyWorktreeRoots, [
+    resolve(homedir(), "trees-old"),
+    resolve(homedir(), "trees-older"),
+  ]);
+  assert.equal(configured.requireExistingWorktreeRoot, true);
   assert.equal(configured.artifactsEnabled, true);
   assert.equal(configured.artifactMaxFileBytes, 321);
   assert.equal(configured.skillsEnabled, false);

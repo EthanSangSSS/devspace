@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, realpath, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import type { ServerConfig } from "./config.js";
 import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
@@ -66,7 +66,24 @@ export async function createManagedWorktree(input: {
     repoRoot: sourceRoot,
   });
 
-  await mkdir(input.config.worktreeRoot, { recursive: true });
+  if (input.config.requireExistingWorktreeRoot) {
+    // Never create a fallback directory on the host when an external
+    // worktree volume is disconnected. The operator must verify the actual
+    // mounted volume identity separately before enabling this policy.
+    try {
+      const rootStats = await lstat(input.config.worktreeRoot);
+      if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) {
+        throw new Error("not an ordinary directory");
+      }
+    } catch {
+      throw new GitWorktreeError(
+        "GIT_WORKTREE_CREATE_FAILED",
+        "Configured managed worktree root is unavailable or redirected; no fallback directory was created.",
+      );
+    }
+  } else {
+    await mkdir(input.config.worktreeRoot, { recursive: true });
+  }
   assertAllowedPath(worktreePath, [input.config.worktreeRoot]);
 
   try {

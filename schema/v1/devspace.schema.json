@@ -90,6 +90,18 @@
           "default": "~/.devspace/worktrees",
           "type": "string",
           "minLength": 1
+        },
+        "legacyWorktreeRoots": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "requireExistingWorktreeRoot": {
+          "default": false,
+          "type": "boolean"
         }
       },
       "additionalProperties": false

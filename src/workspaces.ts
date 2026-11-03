@@ -429,7 +429,10 @@ export class WorkspaceRegistry {
         throw new Error(`Stored worktree workspace is missing sourceRoot: ${root}`);
       }
       assertAllowedPath(sourceRoot, this.config.allowedRoots);
-      return assertAllowedPath(root, [this.config.worktreeRoot]);
+      return assertAllowedPath(root, [
+        this.config.worktreeRoot,
+        ...this.config.legacyWorktreeRoots,
+      ]);
     }
 
     return assertAllowedPath(root, this.config.allowedRoots);
@@ -445,7 +448,10 @@ export class WorkspaceRegistry {
         throw new Error(`Stored worktree workspace is missing sourceRoot: ${root}`);
       }
       assertAllowedPath(sourceRoot, this.config.allowedRoots);
-      assertAllowedPath(root, [this.config.worktreeRoot]);
+      assertAllowedPath(root, [
+        this.config.worktreeRoot,
+        ...this.config.legacyWorktreeRoots,
+      ]);
     }
 
     try {
