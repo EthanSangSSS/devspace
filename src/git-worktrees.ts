@@ -4,7 +4,7 @@ import { promisify } from "node:util";
 import { lstat, mkdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import type { ServerConfig } from "./config.js";
-import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
+import { AccessDeniedError, assertAllowedPath, isPathInsideRoot } from "./roots.js";
 import { gitEnvironment } from "./git-environment.js";
 
 const execFileAsync = promisify(execFile);
@@ -58,6 +58,17 @@ export async function createManagedWorktree(input: {
   }
 
   const sourceRoot = await resolveGitRoot(sourcePath, input.config.allowedRoots);
+  if (input.config.managedWorktreeSourceRoots.length > 0) {
+    try {
+      assertAllowedPath(sourceRoot, input.config.managedWorktreeSourceRoots);
+    } catch (error) {
+      if (!(error instanceof AccessDeniedError)) throw error;
+      throw new GitWorktreeError(
+        "GIT_WORKTREE_CREATE_FAILED",
+        "Source Git repository is outside the configured managed worktree source roots.",
+      );
+    }
+  }
   const baseRef = input.baseRef ?? "HEAD";
   const baseSha = await resolveBaseCommit(sourceRoot, baseRef);
   const dirtySource = (await git(["status", "--porcelain=v1"], sourceRoot)).trim().length > 0;
