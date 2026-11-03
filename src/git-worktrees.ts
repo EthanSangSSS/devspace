@@ -4,7 +4,7 @@ import { promisify } from "node:util";
 import { lstat, mkdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import type { ServerConfig } from "./config.js";
-import { AccessDeniedError, assertAllowedPath, isPathInsideRoot } from "./roots.js";
+import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
 import { gitEnvironment } from "./git-environment.js";
 
 const execFileAsync = promisify(execFile);
@@ -59,13 +59,24 @@ export async function createManagedWorktree(input: {
 
   const sourceRoot = await resolveGitRoot(sourcePath, input.config.allowedRoots);
   if (input.config.managedWorktreeSourceRoots.length > 0) {
-    try {
-      assertAllowedPath(sourceRoot, input.config.managedWorktreeSourceRoots);
-    } catch (error) {
-      if (!(error instanceof AccessDeniedError)) throw error;
+    // These are exact Git repository roots, not ancestor-directory grants.
+    // A Developer parent contains snapshot-only projects and must not
+    // implicitly authorize them for new managed worktrees.
+    const sourceCanonical = await realpath(sourceRoot);
+    const authorized = await Promise.all(input.config.managedWorktreeSourceRoots.map(
+      async (candidate) => {
+        try {
+          return (await realpath(candidate)) === sourceCanonical;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+          throw error;
+        }
+      },
+    ));
+    if (!authorized.includes(true)) {
       throw new GitWorktreeError(
         "GIT_WORKTREE_CREATE_FAILED",
-        "Source Git repository is outside the configured managed worktree source roots.",
+        "Source Git repository is not an explicitly approved managed worktree source.",
       );
     }
   }

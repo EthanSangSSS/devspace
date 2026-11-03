@@ -252,7 +252,7 @@ test("an existing-only managed root rejects a redirected symlink", { skip: platf
   assert.deepEqual(await stat(actualRoot).then((s) => s.isDirectory()), true);
 });
 
-test("new managed worktrees may be created only from configured source roots", async (t) => {
+test("new managed worktrees may be created only from explicitly listed Git repositories", async (t) => {
   const context = await fixture(t);
   const approvedParent = join(context.root, "approved-source-repos");
   const excludedParent = join(context.root, "excluded-source-repos");
@@ -267,7 +267,7 @@ test("new managed worktrees may be created only from configured source roots", a
     { server: { port: 1 }, workspaces: {
       allowedRoots: [context.root],
       worktreeRoot: destination,
-      managedWorktreeSourceRoots: [approvedParent],
+      managedWorktreeSourceRoots: [approvedGit],
       requireExistingWorktreeRoot: true,
     } },
   ));
@@ -283,6 +283,32 @@ test("new managed worktrees may be created only from configured source roots", a
   const opened = await registry.openWorkspace({ path: approvedGit, mode: "worktree" });
   assert.ok(opened.workspace.root.startsWith(`${destination}/`));
   assert.equal(opened.workspace.sourceRoot, approvedGit);
+});
+
+test("a broad parent directory never permits unlisted source Git repositories", async (t) => {
+  const context = await fixture(t);
+  const parent = join(context.root, "shared-developer-parent");
+  await mkdir(parent);
+  const excludedProject = await createGitProject(parent);
+  const destination = join(context.root, "isolated-managed-target");
+  await mkdir(destination);
+  const config = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "config-not-a-prefix-allowlist"),
+    { server: { port: 1 }, workspaces: {
+      allowedRoots: [context.root],
+      worktreeRoot: destination,
+      managedWorktreeSourceRoots: [parent],
+      requireExistingWorktreeRoot: true,
+    } },
+  ));
+  const registry = new WorkspaceRegistry(config);
+
+  await assert.rejects(
+    () => registry.openWorkspace({ path: excludedProject, mode: "worktree" }),
+    (error: unknown) => error instanceof GitWorktreeError &&
+      error.code === "GIT_WORKTREE_CREATE_FAILED",
+  );
+  assert.deepEqual(await (await import("node:fs/promises")).readdir(destination), []);
 });
 
 test("workspace paths outside the allowed roots are rejected", async (t) => {

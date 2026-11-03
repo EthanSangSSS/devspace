@@ -97,7 +97,10 @@ the preferred destination, so already-stored managed sessions remain readable:
     "worktreeRoot": "/Volumes/DevSSD/Worktrees",
     "legacyWorktreeRoots": ["~/.devspace/worktrees"],
     "requireExistingWorktreeRoot": true,
-    "managedWorktreeSourceRoots": ["/Volumes/DevSSD/Developer"]
+    "managedWorktreeSourceRoots": [
+      "/Volumes/DevSSD/Developer/devspace-mcp-session-reliability-v1-1",
+      "/Volumes/DevSSD/Developer/app-legal-docs"
+    ]
   }
 }
 ```
@@ -115,12 +118,15 @@ sources outside the external volume; validate the backup allowlist before
 creating worktrees from those repositories.
 
 `managedWorktreeSourceRoots` restricts **new managed worktree creation** to
-the listed source Git roots (without changing general checkout access or
-historical workspace recovery). The empty default retains v1.1 behavior.
-For an SSD-only development cutover, set this to the verified SSD Developer
-directory so worktree mode cannot accidentally make new SSD worktrees that
-refer back to an unprotected internal Git object store. The existing backup
-allowlist must still be enforced independently.
+the listed **exact Git repository roots** (without changing general checkout
+access or historical workspace recovery). The empty default retains v1.1
+behavior. For an SSD-only development cutover, list each approved repository
+under the verified SSD Developer directory **individually**, and keep that
+list synchronized with the local backup allowlist. Listing the parent
+`/Volumes/DevSSD/Developer` does *not* grant access to its children. This
+prevents snapshot-only or unprotected Git sources from gaining automatic
+worktree access through an overly broad parent. A new project needs separate
+source and backup authorization before using managed worktree mode.
 
 `server.mcpSessionIdleTimeoutMs` applies only after a session has no in-flight
 requests. The cleanup timer never expires an active tool call or active MCP
