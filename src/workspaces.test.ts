@@ -440,6 +440,25 @@ test("cached workspace access rejects a root symlink retargeted within the allow
   );
 });
 
+test("cached managed workspace rejects a different directory recreated at the same path", async (t) => {
+  const context = await fixture(t);
+  const source = await createGitProject(context.root);
+  const opened = await context.registry.openWorkspace({ path: source, mode: "worktree" });
+  const originalRoot = opened.workspace.root;
+  const relocatedRoot = join(context.root, "displaced-original-worktree");
+
+  // A disconnected volume can leave the same logical mount path backed by a
+  // different physical directory. The path string alone is not an identity.
+  await rename(originalRoot, relocatedRoot);
+  await mkdir(originalRoot);
+  await writeFile(join(originalRoot, "unexpected-file.txt"), "other data\n");
+
+  assert.throws(
+    () => context.registry.getWorkspace(opened.workspace.id),
+    /workspace root (changed|replaced) after it was opened/i,
+  );
+});
+
 test("a symlinked allowed root preserves checkout and worktree path behavior", { skip: platform() === "win32" }, async (t) => {
   const context = await fixture(t);
   const aliasRoot = join(context.root, "alias-root");

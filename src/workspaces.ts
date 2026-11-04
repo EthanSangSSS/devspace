@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { realpathSync, type Stats } from "node:fs";
+import { realpathSync, statSync, type Stats } from "node:fs";
 import type {
   WorkspaceConversationBinding,
   WorkspaceMode,
@@ -51,6 +51,8 @@ export interface Workspace {
   id: string;
   root: string;
   canonicalRoot: string;
+  rootDevice: number;
+  rootInode: number;
   mode: WorkspaceMode;
   sourceRoot?: string;
   worktree?: WorkspaceWorktree;
@@ -268,10 +270,13 @@ export class WorkspaceRegistry {
       session.mode,
       session.sourceRoot,
     );
+    const restoredRootStats = statSync(canonicalRoot);
     const restoredWorkspace: Workspace = {
       id: session.id,
       root,
       canonicalRoot,
+      rootDevice: restoredRootStats.dev,
+      rootInode: restoredRootStats.ino,
       mode: session.mode,
       sourceRoot: session.sourceRoot,
       worktree:
@@ -381,10 +386,13 @@ export class WorkspaceRegistry {
     sourceRoot?: string;
     worktree?: WorkspaceWorktree;
   }): Promise<WorkspaceContext> {
+    const initialRootStats = statSync(input.canonicalRoot);
     const workspace: Workspace = {
       id: `ws_${randomBytes(5).toString("hex")}`,
       root: input.root,
       canonicalRoot: input.canonicalRoot,
+      rootDevice: initialRootStats.dev,
+      rootInode: initialRootStats.ino,
       mode: input.mode,
       sourceRoot: input.sourceRoot,
       worktree: input.worktree,
@@ -463,14 +471,18 @@ export class WorkspaceRegistry {
 
   private assertWorkspaceRootUnchanged(workspace: Workspace): void {
     let currentRoot: string;
+    let currentRootStats: Stats;
     try {
       currentRoot = realpathSync(workspace.root);
+      currentRootStats = statSync(currentRoot);
     } catch {
       throw new AccessDeniedError(
         `Workspace root is no longer accessible: ${workspace.root}`,
       );
     }
-    if (currentRoot !== workspace.canonicalRoot) {
+    if (currentRoot !== workspace.canonicalRoot
+        || currentRootStats.dev !== workspace.rootDevice
+        || currentRootStats.ino !== workspace.rootInode) {
       throw new AccessDeniedError(
         `Workspace root changed after it was opened: ${workspace.root}`,
       );
