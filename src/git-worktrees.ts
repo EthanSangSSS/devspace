@@ -89,6 +89,9 @@ export async function createManagedWorktree(input: {
     repoRoot: sourceRoot,
   });
 
+  // Validate the opt-in mounted-volume policy before any mkdir. Even an
+  // invalid configuration must not create a fallback on the internal disk.
+  await verifyManagedWorktreeVolume(input.config);
   if (input.config.requireExistingWorktreeRoot) {
     // Never create a fallback directory on the host when an external
     // worktree volume is disconnected. The operator must verify the actual
@@ -107,7 +110,6 @@ export async function createManagedWorktree(input: {
   } else {
     await mkdir(input.config.worktreeRoot, { recursive: true });
   }
-  await verifyManagedWorktreeVolume(input.config);
   assertAllowedPath(worktreePath, [input.config.worktreeRoot]);
 
   try {

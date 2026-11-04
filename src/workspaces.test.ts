@@ -318,6 +318,31 @@ test("configured managed SSD volume identity must fail closed on an ordinary dir
   assert.deepEqual(await readdir(targetRoot), []);
 });
 
+test("SSD identity guard never creates a host fallback when existing-root protection is omitted", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const fakeUnmountedVolume = join(context.root, "not-mounted-ssd");
+  const targetRoot = join(fakeUnmountedVolume, "Worktrees");
+  const config = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "config-missing-external-volume"),
+    { server: { port: 1 }, workspaces: {
+      allowedRoots: [context.root],
+      worktreeRoot: targetRoot,
+      requireExistingWorktreeRoot: false,
+      managedWorktreeMountPoint: fakeUnmountedVolume,
+      managedWorktreeVolumeUuid: "00000000-0000-0000-0000-000000000000",
+    } },
+  ));
+
+  await assert.rejects(
+    () => new WorkspaceRegistry(config).openWorkspace({ path: gitRoot, mode: "worktree" }),
+    (error: unknown) => error instanceof GitWorktreeError &&
+      error.code === "GIT_WORKTREE_CREATE_FAILED",
+  );
+  await assert.rejects(stat(fakeUnmountedVolume), { code: "ENOENT" });
+  await assert.rejects(stat(targetRoot), { code: "ENOENT" });
+});
+
 test("new managed worktrees may be created only from explicitly listed Git repositories", async (t) => {
   const context = await fixture(t);
   const approvedParent = join(context.root, "approved-source-repos");
