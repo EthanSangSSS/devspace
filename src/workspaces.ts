@@ -253,6 +253,15 @@ export class WorkspaceRegistry {
       // A cached ID is not a permanent filesystem authorization. Recheck the
       // configured roots before using a checkout that may have been replaced.
       this.assertWorkspaceRootAllowed(workspace.root, workspace.mode, workspace.sourceRoot);
+      // The same device/inode can be observed again after a volume is
+      // remounted. For opt-in SSD-managed worktrees, revalidate the actual
+      // encrypted APFS UUID on every cache hit, not just at session restore.
+      // Legacy roots retain their separate Git-backlink recovery policy.
+      if (workspace.mode === "worktree" && workspace.worktree?.managed
+          && isPathInsideRoot(workspace.root, this.config.worktreeRoot)
+          && (this.config.managedWorktreeMountPoint || this.config.managedWorktreeVolumeUuid)) {
+        verifyManagedWorktreeVolumeSync(this.config);
+      }
       this.assertWorkspaceRootUnchanged(workspace);
       // An unchanged directory inode does not guarantee its .git metadata
       // still belongs to the original managed source repository.

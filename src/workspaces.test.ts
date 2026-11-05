@@ -377,8 +377,17 @@ test("a restarted registry accepts the same managed worktree on the verified rea
     } },
   ));
   const firstStore = new SqliteWorkspaceStore(stateDir);
-  const created = await new WorkspaceRegistry(config, firstStore)
+  const firstRegistry = new WorkspaceRegistry(config, firstStore);
+  const created = await firstRegistry
     .openWorkspace({ path: gitRoot, mode: "worktree" });
+  assert.equal(firstRegistry.getWorkspace(created.workspace.id).id, created.workspace.id);
+  config.managedWorktreeVolumeUuid = "00000000-0000-0000-0000-000000000000";
+  assert.throws(
+    () => firstRegistry.getWorkspace(created.workspace.id),
+    /configured mounted encrypted APFS volume/,
+  );
+  config.managedWorktreeVolumeUuid = uuid;
+  assert.equal(firstRegistry.getWorkspace(created.workspace.id).id, created.workspace.id);
   const persisted = firstStore.getSession(created.workspace.id);
   assert.equal(persisted?.rootVolumeUuid?.toUpperCase(), uuid.toUpperCase());
   assert.match(persisted?.rootInode ?? "", /^\d+$/);
@@ -754,6 +763,30 @@ test("cached managed workspace rejects a different directory recreated at the sa
     () => context.registry.getWorkspace(opened.workspace.id),
     /workspace root (changed|replaced) after it was opened/i,
   );
+});
+
+test("cached managed workspace fails closed when its configured SSD volume identity is no longer valid", async (t) => {
+  const context = await fixture(t);
+  const source = await createGitProject(context.root);
+  const opened = await context.registry.openWorkspace({ path: source, mode: "worktree" });
+  const marker = join(opened.workspace.root, "README.md");
+  const before = await readFile(marker, "utf8");
+
+  // Model a mount/volume policy mismatch without unmounting any real SSD.
+  // The same cached workspace ID must not bypass the opt-in volume guard.
+  context.config.requireExistingWorktreeRoot = true;
+  context.config.managedWorktreeMountPoint = join(context.root, "not-a-mounted-volume");
+  context.config.managedWorktreeVolumeUuid = "00000000-0000-0000-0000-000000000000";
+  assert.throws(
+    () => context.registry.getWorkspace(opened.workspace.id),
+    /configured mounted encrypted APFS volume/,
+  );
+  assert.equal(await readFile(marker, "utf8"), before);
+
+  context.config.managedWorktreeMountPoint = "";
+  context.config.managedWorktreeVolumeUuid = "";
+  context.config.requireExistingWorktreeRoot = false;
+  assert.equal(context.registry.getWorkspace(opened.workspace.id).id, opened.workspace.id);
 });
 
 test("cached managed workspace rejects a changed Git admin backlink even when its directory is unchanged", async (t) => {
