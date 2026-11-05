@@ -857,7 +857,8 @@ export function createMcpServer(
             },
           }
         : {},
-      annotations: { readOnlyHint: true },
+      // Checkout registration and managed worktree creation can persist state.
+      annotations: { readOnlyHint: false, destructiveHint: false },
     },
     async ({ path, mode, baseRef }, { _meta, requestId }) => observeToolOperation(config, "open_workspace", async () => {
       const startedAt = performance.now();

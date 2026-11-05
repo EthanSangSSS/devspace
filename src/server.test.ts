@@ -103,6 +103,23 @@ test("open_workspace tells fresh hosts to use DevSpace first and preserves the r
   assert.match(openTool.description ?? "", /do not bypass it with shell or delegation/);
 });
 
+test("open_workspace is not advertised as read-only because worktree mode creates files", async (t) => {
+  for (const mode of ["claude", "codex"] as const) {
+    await t.test(mode, async (nested) => {
+      const context = await fixture(nested, { toolMode: mode, uiEnabled: false });
+      const tools = await context.client.listTools();
+      const openTool = tools.tools.find((tool) => tool.name === "open_workspace");
+      const readTool = tools.tools.find((tool) => tool.name === "read");
+
+      assert.ok(openTool);
+      assert.ok(readTool);
+      assert.equal(openTool.annotations?.readOnlyHint, false);
+      assert.equal(openTool.annotations?.destructiveHint, false);
+      assert.equal(readTool.annotations?.readOnlyHint, true);
+    });
+  }
+});
+
 test("open_workspace stays model-only without a widget while show_changes keeps its widget", async (t) => {
   for (const uiEnabled of [true, false]) {
     await t.test(uiEnabled ? "enabled" : "disabled", async (nested) => {
