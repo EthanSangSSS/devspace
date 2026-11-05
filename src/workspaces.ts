@@ -253,6 +253,11 @@ export class WorkspaceRegistry {
       // configured roots before using a checkout that may have been replaced.
       this.assertWorkspaceRootAllowed(workspace.root, workspace.mode, workspace.sourceRoot);
       this.assertWorkspaceRootUnchanged(workspace);
+      // An unchanged directory inode does not guarantee its .git metadata
+      // still belongs to the original managed source repository.
+      if (workspace.mode === "worktree" && workspace.worktree?.managed) {
+        assertManagedGitWorktreeBacklink(workspace.root, workspace.sourceRoot);
+      }
       this.store?.touchSession(workspaceId);
       return workspace;
     }

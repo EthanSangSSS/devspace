@@ -756,6 +756,24 @@ test("cached managed workspace rejects a different directory recreated at the sa
   );
 });
 
+test("cached managed workspace rejects a changed Git admin backlink even when its directory is unchanged", async (t) => {
+  const context = await fixture(t);
+  const source = await createGitProject(context.root);
+  const opened = await context.registry.openWorkspace({ path: source, mode: "worktree" });
+  const pointer = join(opened.workspace.root, ".git");
+  const original = await readFile(pointer, "utf8");
+  const unexpected = `gitdir: ${join(context.root, "unrelated-git-admin")}\n`;
+  await writeFile(pointer, unexpected);
+
+  assert.throws(
+    () => context.registry.getWorkspace(opened.workspace.id),
+    /Unverified managed Git worktree/,
+  );
+  assert.equal(await readFile(pointer, "utf8"), unexpected);
+  await writeFile(pointer, original);
+  assert.equal(context.registry.getWorkspace(opened.workspace.id).id, opened.workspace.id);
+});
+
 test("a symlinked allowed root preserves checkout and worktree path behavior", { skip: platform() === "win32" }, async (t) => {
   const context = await fixture(t);
   const aliasRoot = join(context.root, "alias-root");
