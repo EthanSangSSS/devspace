@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { chmod, copyFile, lstat, mkdtemp, mkdir, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
-import { dirname, join, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 import Database from "better-sqlite3";
@@ -761,18 +761,22 @@ test("cached managed workspace rejects a changed Git admin backlink even when it
   const source = await createGitProject(context.root);
   const opened = await context.registry.openWorkspace({ path: source, mode: "worktree" });
   const pointer = join(opened.workspace.root, ".git");
-  const original = await readFile(pointer, "utf8");
-  const unexpected = `gitdir: ${join(context.root, "unrelated-git-admin")}\n`;
-  // Git for Windows may mark its generated .git pointer read-only.
-  await chmod(pointer, 0o666);
-  await writeFile(pointer, unexpected);
+  const adminPath = resolve(opened.workspace.root,
+    (await readFile(pointer, "utf8")).trim().slice("gitdir: ".length));
+  const backlink = join(adminPath, "gitdir");
+  const original = await readFile(backlink, "utf8");
+  const unexpected = `${join(source, ".git", "config")}\n`;
+  // Windows may protect the generated .git pointer from direct modification.
+  // Mutate the synthetic admin backlink instead; the worktree inode stays put.
+  await chmod(backlink, 0o666);
+  await writeFile(backlink, unexpected);
 
   assert.throws(
     () => context.registry.getWorkspace(opened.workspace.id),
     /Unverified managed Git worktree/,
   );
-  assert.equal(await readFile(pointer, "utf8"), unexpected);
-  await writeFile(pointer, original);
+  assert.equal(await readFile(backlink, "utf8"), unexpected);
+  await writeFile(backlink, original);
   assert.equal(context.registry.getWorkspace(opened.workspace.id).id, opened.workspace.id);
 });
 

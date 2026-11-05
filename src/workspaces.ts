@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync, statSync, type Stats } from "node:fs";
+import { platform } from "node:os";
 import type {
   WorkspaceConversationBinding,
   WorkspaceMode,
@@ -615,26 +616,45 @@ function assertManagedGitWorktreeBacklink(root: string, sourceRoot: string | und
       if (!sourceLink.startsWith("gitdir: ")) rejected("SOURCE_POINTER_FORMAT");
       const sourceAdmin = realpathSync(resolve(sourceRoot, sourceLink.slice(8)));
       const sourceBack = readFileSync(join(sourceAdmin, "gitdir"), "utf8").trim();
-      if (realpathSync(sourceBack) !== realpathSync(sourcePointerPath)) rejected("SOURCE_BACKLINK");
+      if (!sameGitPathIdentity(sourceBack, sourcePointerPath)) rejected("SOURCE_BACKLINK");
       const commonRelative = readFileSync(join(sourceAdmin, "commondir"), "utf8").trim();
       if (!commonRelative || commonRelative.length > 4096) rejected("SOURCE_COMMONDIR_FORMAT");
       sourceGitDir = realpathSync(resolve(sourceAdmin, commonRelative));
       if (!lstatSync(sourceGitDir).isDirectory()
-          || !isPathInsideRoot(sourceAdmin, join(sourceGitDir, "worktrees"))) return rejected("SOURCE_COMMONDIR_IDENTITY");
+          || !gitAdminInsideRoot(sourceAdmin, join(sourceGitDir, "worktrees"))) return rejected("SOURCE_COMMONDIR_IDENTITY");
     } else {
       return rejected("SOURCE_POINTER_TYPE");
     }
     const adminRoot = join(sourceGitDir, "worktrees");
-    if (!isPathInsideRoot(gitAdmin, adminRoot) || gitAdmin === adminRoot
+    if (!gitAdminInsideRoot(gitAdmin, adminRoot)
         || !lstatSync(gitAdmin).isDirectory()) rejected("WORKTREE_ADMIN_IDENTITY");
     const backPointer = readFileSync(join(gitAdmin, "gitdir"), "utf8").trim();
     // macOS may report the same directory through /var and /private/var.
     // Compare physical pointer paths, not the spelling Git used at creation.
-    if (realpathSync(backPointer) !== realpathSync(pointerPath)) rejected("WORKTREE_BACKLINK");
+    if (!sameGitPathIdentity(backPointer, pointerPath)) rejected("WORKTREE_BACKLINK");
   } catch (error) {
     if (error instanceof AccessDeniedError) throw error;
     rejected("METADATA_UNREADABLE");
   }
+}
+
+/** Windows Git may store 8.3/long-path aliases for the same NTFS object.
+ *  Keep Unix canonical-path equality; accept the same nonzero physical file
+ *  identity on Windows only, never a name-only or zero-inode match.
+ */
+function sameGitPathIdentity(first: string, second: string): boolean {
+  if (realpathSync(first) === realpathSync(second)) return true;
+  if (platform() !== "win32") return false;
+  const left = statSync(first, { bigint: true });
+  const right = statSync(second, { bigint: true });
+  return left.ino !== 0n && left.ino === right.ino && left.dev === right.dev;
+}
+
+function gitAdminInsideRoot(admin: string, root: string): boolean {
+  if (admin !== root && isPathInsideRoot(admin, root)) return true;
+  // Physical parent equality accepts Windows 8.3 aliases while keeping the
+  // Git admin at exactly one child level of its verified common-dir/worktrees.
+  return platform() === "win32" && sameGitPathIdentity(dirname(admin), root);
 }
 
 async function canonicalPath(path: string): Promise<string> {
