@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, realpath, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, realpath, rmdir, stat } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import type { ServerConfig } from "./config.js";
 import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
@@ -34,6 +34,73 @@ export interface ManagedWorktree {
   managed: boolean;
 }
 
+export interface ReservedWorktreePath {
+  path: string;
+  dev: number;
+  ino: number;
+}
+
+/** Reserve a new, empty directory atomically. An existing candidate is never reused. */
+export async function reserveManagedWorktreePath(input: {
+  worktreeRoot: string;
+  repoRoot: string;
+  generateId?: () => string;
+}): Promise<ReservedWorktreePath> {
+  const repoName = sanitizePathSegment(basename(input.repoRoot)) || "repo";
+  const generateId = input.generateId ?? (() => randomBytes(12).toString("hex"));
+  await mkdir(input.worktreeRoot, { recursive: true });
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const id = generateId();
+    if (!/^[a-f0-9]{24}$/.test(id)) {
+      throw new GitWorktreeError("GIT_WORKTREE_CREATE_FAILED", "Invalid managed worktree identifier.");
+    }
+    const path = join(input.worktreeRoot, `${repoName}-${id}`);
+    assertAllowedPath(path, [input.worktreeRoot]);
+    try {
+      // Non-recursive mkdir is exclusive: EEXIST is a collision, not ownership.
+      await mkdir(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+      throw error;
+    }
+
+    const identity = await lstat(path);
+    if (!identity.isDirectory() || identity.isSymbolicLink()) {
+      throw new GitWorktreeError("GIT_WORKTREE_CREATE_FAILED", "Reserved worktree path changed during creation.");
+    }
+    return { path, dev: identity.dev, ino: identity.ino };
+  }
+
+  throw new GitWorktreeError("GIT_WORKTREE_CREATE_FAILED", "Could not reserve a unique managed worktree path.");
+}
+
+/** Never recursively delete a failed worktree: unknown contents must survive. */
+export async function releaseReservedWorktreePath(reservation: ReservedWorktreePath): Promise<boolean> {
+  let identity;
+  try {
+    identity = await lstat(reservation.path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  if (!identity.isDirectory() || identity.isSymbolicLink()
+    || identity.dev !== reservation.dev || identity.ino !== reservation.ino) {
+    return false;
+  }
+
+  try {
+    // rmdir removes empty directories only, even if another process races the identity check.
+    await rmdir(reservation.path);
+    return true;
+  } catch (error) {
+    if (["ENOTEMPTY", "EEXIST", "ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+      return false;
+    }
+    throw error;
+  }
+}
+
 export async function createManagedWorktree(input: {
   sourcePath: string;
   baseRef?: string;
@@ -61,28 +128,27 @@ export async function createManagedWorktree(input: {
   const baseRef = input.baseRef ?? "HEAD";
   const baseSha = await resolveBaseCommit(sourceRoot, baseRef);
   const dirtySource = (await git(["status", "--porcelain=v1"], sourceRoot)).trim().length > 0;
-  const worktreePath = managedWorktreePath({
+  const reservation = await reserveManagedWorktreePath({
     worktreeRoot: input.config.worktreeRoot,
     repoRoot: sourceRoot,
   });
 
-  await mkdir(input.config.worktreeRoot, { recursive: true });
-  assertAllowedPath(worktreePath, [input.config.worktreeRoot]);
-
   try {
-    await git(["worktree", "add", "--detach", worktreePath, baseSha], sourceRoot);
+    await git(["worktree", "add", "--detach", reservation.path, baseSha], sourceRoot);
   } catch (error) {
-    await rm(worktreePath, { recursive: true, force: true });
+    // If Git left files or another process replaced the directory, retain it for recovery.
+    const removed = await releaseReservedWorktreePath(reservation).catch(() => false);
     const message = error instanceof Error ? error.message : String(error);
     throw new GitWorktreeError(
       "GIT_WORKTREE_CREATE_FAILED",
-      `Git failed to create the managed worktree. ${message}`,
+      `Git failed to create the managed worktree. ${message}`
+        + (removed ? "" : ` The worktree path was retained for inspection: ${reservation.path}`),
     );
   }
 
   return {
     sourceRoot,
-    path: worktreePath,
+    path: reservation.path,
     baseRef,
     baseSha,
     dirtySource,
@@ -142,12 +208,6 @@ async function resolveBaseCommit(sourceRoot: string, baseRef: string): Promise<s
       `Cannot open workspace in worktree mode because baseRef ${JSON.stringify(baseRef)} does not resolve to a commit.`,
     );
   }
-}
-
-function managedWorktreePath(input: { worktreeRoot: string; repoRoot: string }): string {
-  const repoName = sanitizePathSegment(basename(input.repoRoot)) || "repo";
-  const worktreeId = randomBytes(4).toString("hex");
-  return join(input.worktreeRoot, `${repoName}-${worktreeId}`);
 }
 
 function sanitizePathSegment(value: string): string {
