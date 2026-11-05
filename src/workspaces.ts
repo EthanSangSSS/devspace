@@ -590,20 +590,20 @@ export class WorkspaceRegistry {
  *  metadata; it never reads or changes the worktree's user files.
  */
 function assertManagedGitWorktreeBacklink(root: string, sourceRoot: string | undefined): void {
-  const rejected = (): never => {
-    throw new AccessDeniedError(`Unverified managed Git worktree at the original path: ${root}`);
+  const rejected = (stage: string): never => {
+    throw new AccessDeniedError(`Unverified managed Git worktree (${stage}) at the original path: ${root}`);
   };
-  if (!sourceRoot) return rejected();
+  if (!sourceRoot) return rejected("SOURCE_MISSING");
   try {
     const pointerPath = join(root, ".git");
     const pointerStats = lstatSync(pointerPath);
-    if (!pointerStats.isFile() || pointerStats.isSymbolicLink() || pointerStats.size > 4096) rejected();
+    if (!pointerStats.isFile() || pointerStats.isSymbolicLink() || pointerStats.size > 4096) rejected("WORKTREE_POINTER_TYPE");
     const content = readFileSync(pointerPath, "utf8").trim();
-    if (!content.startsWith("gitdir: ")) rejected();
+    if (!content.startsWith("gitdir: ")) rejected("WORKTREE_POINTER_FORMAT");
     const gitAdmin = realpathSync(resolve(root, content.slice(8)));
     const sourcePointerPath = join(sourceRoot, ".git");
     const sourcePointerStats = lstatSync(sourcePointerPath);
-    if (sourcePointerStats.isSymbolicLink()) rejected();
+    if (sourcePointerStats.isSymbolicLink()) rejected("SOURCE_POINTER_SYMLINK");
     let sourceGitDir: string;
     if (sourcePointerStats.isDirectory()) {
       sourceGitDir = realpathSync(sourcePointerPath);
@@ -612,27 +612,28 @@ function assertManagedGitWorktreeBacklink(root: string, sourceRoot: string | und
       // as their source. Follow its Git admin `commondir` back to the real
       // object store instead of requiring sourceRoot/.git to be a directory.
       const sourceLink = readFileSync(sourcePointerPath, "utf8").trim();
-      if (!sourceLink.startsWith("gitdir: ")) rejected();
+      if (!sourceLink.startsWith("gitdir: ")) rejected("SOURCE_POINTER_FORMAT");
       const sourceAdmin = realpathSync(resolve(sourceRoot, sourceLink.slice(8)));
       const sourceBack = readFileSync(join(sourceAdmin, "gitdir"), "utf8").trim();
-      if (realpathSync(sourceBack) !== realpathSync(sourcePointerPath)) rejected();
+      if (realpathSync(sourceBack) !== realpathSync(sourcePointerPath)) rejected("SOURCE_BACKLINK");
       const commonRelative = readFileSync(join(sourceAdmin, "commondir"), "utf8").trim();
-      if (!commonRelative || commonRelative.length > 4096) rejected();
+      if (!commonRelative || commonRelative.length > 4096) rejected("SOURCE_COMMONDIR_FORMAT");
       sourceGitDir = realpathSync(resolve(sourceAdmin, commonRelative));
       if (!lstatSync(sourceGitDir).isDirectory()
-          || !isPathInsideRoot(sourceAdmin, join(sourceGitDir, "worktrees"))) return rejected();
+          || !isPathInsideRoot(sourceAdmin, join(sourceGitDir, "worktrees"))) return rejected("SOURCE_COMMONDIR_IDENTITY");
     } else {
-      return rejected();
+      return rejected("SOURCE_POINTER_TYPE");
     }
     const adminRoot = join(sourceGitDir, "worktrees");
     if (!isPathInsideRoot(gitAdmin, adminRoot) || gitAdmin === adminRoot
-        || !lstatSync(gitAdmin).isDirectory()) rejected();
+        || !lstatSync(gitAdmin).isDirectory()) rejected("WORKTREE_ADMIN_IDENTITY");
     const backPointer = readFileSync(join(gitAdmin, "gitdir"), "utf8").trim();
     // macOS may report the same directory through /var and /private/var.
     // Compare physical pointer paths, not the spelling Git used at creation.
-    if (realpathSync(backPointer) !== realpathSync(pointerPath)) rejected();
-  } catch {
-    rejected();
+    if (realpathSync(backPointer) !== realpathSync(pointerPath)) rejected("WORKTREE_BACKLINK");
+  } catch (error) {
+    if (error instanceof AccessDeniedError) throw error;
+    rejected("METADATA_UNREADABLE");
   }
 }
 

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { chmod, copyFile, lstat, mkdtemp, mkdir, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 import Database from "better-sqlite3";
@@ -444,7 +444,7 @@ test("a new managed worktree root retains old stored sessions through explicitly
   const firstStore = new SqliteWorkspaceStore(stateDir);
   const original = await new WorkspaceRegistry(oldConfig, firstStore)
     .openWorkspace({ path: gitRoot, mode: "worktree" });
-  assert.ok(original.workspace.root.startsWith(`${oldRoot}/`));
+  assert.ok(original.workspace.root.startsWith(`${oldRoot}${sep}`));
   firstStore.close();
 
   const newConfig = loadConfig(writeTestDevspaceConfig(
@@ -466,7 +466,7 @@ test("a new managed worktree root retains old stored sessions through explicitly
     assert.equal(persisted.mode, "worktree");
 
     const created = await registry.openWorkspace({ path: gitRoot, mode: "worktree" });
-    assert.ok(created.workspace.root.startsWith(`${newRoot}/`));
+    assert.ok(created.workspace.root.startsWith(`${newRoot}${sep}`));
     assert.equal(created.workspace.sourceRoot, gitRoot);
     assert.equal(registry.getWorkspace(original.workspace.id).root, original.workspace.root);
   } finally {
@@ -522,7 +522,7 @@ test("an external managed root configured as existing-only is never created when
 
   await mkdir(targetRoot, { recursive: true });
   const created = await registry.openWorkspace({ path: gitRoot, mode: "worktree" });
-  assert.ok(created.workspace.root.startsWith(`${targetRoot}/`));
+  assert.ok(created.workspace.root.startsWith(`${targetRoot}${sep}`));
 });
 
 test("an existing-only managed root rejects a redirected symlink", { skip: platform() === "win32" }, async (t) => {
@@ -669,7 +669,7 @@ test("new managed worktrees may be created only from explicitly listed Git repos
   assert.deepEqual(await (await import("node:fs/promises")).readdir(destination), []);
 
   const opened = await registry.openWorkspace({ path: approvedGit, mode: "worktree" });
-  assert.ok(opened.workspace.root.startsWith(`${destination}/`));
+  assert.ok(opened.workspace.root.startsWith(`${destination}${sep}`));
   assert.equal(opened.workspace.sourceRoot, approvedGit);
 });
 
@@ -763,6 +763,8 @@ test("cached managed workspace rejects a changed Git admin backlink even when it
   const pointer = join(opened.workspace.root, ".git");
   const original = await readFile(pointer, "utf8");
   const unexpected = `gitdir: ${join(context.root, "unrelated-git-admin")}\n`;
+  // Git for Windows may mark its generated .git pointer read-only.
+  await chmod(pointer, 0o666);
   await writeFile(pointer, unexpected);
 
   assert.throws(

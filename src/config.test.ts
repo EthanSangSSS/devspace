@@ -134,7 +134,7 @@ try {
   ]);
   assert.equal(configured.requireExistingWorktreeRoot, true);
   assert.deepEqual(configured.managedWorktreeSourceRoots, [resolve(homedir(), "work", "approved")]);
-  assert.equal(configured.managedWorktreeMountPoint, "/Volumes/DevSSD");
+  assert.equal(configured.managedWorktreeMountPoint, resolve("/Volumes/DevSSD"));
   assert.equal(configured.managedWorktreeVolumeUuid, "00000000-0000-0000-0000-000000000000");
   assert.equal(configured.artifactsEnabled, true);
   assert.equal(configured.artifactMaxFileBytes, 321);
