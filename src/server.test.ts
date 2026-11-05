@@ -105,18 +105,20 @@ test("open_workspace tells fresh hosts to use DevSpace first and preserves the r
 
 test("open_workspace is not advertised as read-only because worktree mode creates files", async (t) => {
   for (const mode of ["claude", "codex"] as const) {
-    await t.test(mode, async (nested) => {
-      const context = await fixture(nested, { toolMode: mode, uiEnabled: false });
-      const tools = await context.client.listTools();
-      const openTool = tools.tools.find((tool) => tool.name === "open_workspace");
-      const readTool = tools.tools.find((tool) => tool.name === "read");
+    for (const uiEnabled of [true, false]) {
+      await t.test(`${mode}, UI ${uiEnabled ? "enabled" : "disabled"}`, async (nested) => {
+        const context = await fixture(nested, { toolMode: mode, uiEnabled });
+        const tools = await context.client.listTools();
+        const openTool = tools.tools.find((tool) => tool.name === "open_workspace");
+        const readTool = tools.tools.find((tool) => tool.name === "read");
 
-      assert.ok(openTool);
-      assert.ok(readTool);
-      assert.equal(openTool.annotations?.readOnlyHint, false);
-      assert.equal(openTool.annotations?.destructiveHint, false);
-      assert.equal(readTool.annotations?.readOnlyHint, true);
-    });
+        assert.ok(openTool);
+        assert.ok(readTool);
+        assert.equal(openTool.annotations?.readOnlyHint, false);
+        assert.equal(openTool.annotations?.destructiveHint, false);
+        assert.equal(readTool.annotations?.readOnlyHint, true);
+      });
+    }
   }
 });
 
