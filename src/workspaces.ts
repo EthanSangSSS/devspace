@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { realpathSync, statSync, type Stats } from "node:fs";
+import { lstatSync, readFileSync, realpathSync, statSync, type Stats } from "node:fs";
 import type {
   WorkspaceConversationBinding,
   WorkspaceMode,
@@ -9,7 +9,7 @@ import { mkdir, opendir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
-import { createManagedWorktree } from "./git-worktrees.js";
+import { createManagedWorktree, verifyManagedWorktreeVolumeSync } from "./git-worktrees.js";
 import {
   AccessDeniedError,
   assertAllowedPath,
@@ -270,6 +270,7 @@ export class WorkspaceRegistry {
       session.mode,
       session.sourceRoot,
     );
+    this.assertRestoredWorkspaceIdentity(session, root, canonicalRoot);
     const restoredRootStats = statSync(canonicalRoot);
     const restoredWorkspace: Workspace = {
       id: session.id,
@@ -409,6 +410,12 @@ export class WorkspaceRegistry {
       baseRef: workspace.worktree?.baseRef,
       baseSha: workspace.worktree?.baseSha,
       managed: workspace.worktree?.managed,
+      rootInode: statSync(input.canonicalRoot, { bigint: true }).ino.toString(),
+      rootVolumeUuid: input.mode === "worktree"
+        && input.worktree?.managed
+        && isPathInsideRoot(input.root, this.config.worktreeRoot)
+        ? this.config.managedWorktreeVolumeUuid || undefined
+        : undefined,
     });
     this.workspaces.set(workspace.id, workspace);
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
@@ -467,6 +474,38 @@ export class WorkspaceRegistry {
     } catch {
       throw new AccessDeniedError(`Workspace root is no longer accessible: ${root}`);
     }
+  }
+
+  private assertRestoredWorkspaceIdentity(
+    session: NonNullable<ReturnType<WorkspaceStore["getSession"]>>,
+    root: string,
+    canonicalRoot: string,
+  ): void {
+    const currentInode = statSync(canonicalRoot, { bigint: true }).ino.toString();
+    if (session.rootInode && session.rootInode !== currentInode) {
+      throw new AccessDeniedError(`Workspace root changed after it was opened: ${root}`);
+    }
+    if (session.mode !== "worktree" || !session.managed) return;
+
+    const isNewRoot = isPathInsideRoot(root, this.config.worktreeRoot);
+    const configuredUuid = this.config.managedWorktreeVolumeUuid;
+    const requiresVolume = Boolean(
+      this.config.managedWorktreeMountPoint || configuredUuid || session.rootVolumeUuid,
+    );
+    if (isNewRoot && requiresVolume) {
+      // Old sessions must never be rebound to a new physical SSD merely
+      // because the filesystem currently happens to have the same path.
+      if (!session.rootVolumeUuid
+          || session.rootVolumeUuid.toUpperCase() !== configuredUuid.toUpperCase()) {
+        throw new AccessDeniedError(`Unverified managed worktree volume identity: ${root}`);
+      }
+      verifyManagedWorktreeVolumeSync(this.config);
+    } else if (session.rootVolumeUuid) {
+      // A session once bound to an encrypted volume may not be restored with
+      // the volume guard removed or with a different configured root.
+      throw new AccessDeniedError(`Unverified managed worktree volume identity: ${root}`);
+    }
+    assertManagedGitWorktreeBacklink(root, session.sourceRoot);
   }
 
   private assertWorkspaceRootUnchanged(workspace: Workspace): void {
@@ -538,6 +577,57 @@ export class WorkspaceRegistry {
     });
 
     return discovered.sort((a, b) => a.path.localeCompare(b.path));
+  }
+}
+
+/** A legacy worktree without persisted inode has to prove it still belongs
+ *  to the original source Git repository. This checks only Git admin pointer
+ *  metadata; it never reads or changes the worktree's user files.
+ */
+function assertManagedGitWorktreeBacklink(root: string, sourceRoot: string | undefined): void {
+  const rejected = (): never => {
+    throw new AccessDeniedError(`Unverified managed Git worktree at the original path: ${root}`);
+  };
+  if (!sourceRoot) return rejected();
+  try {
+    const pointerPath = join(root, ".git");
+    const pointerStats = lstatSync(pointerPath);
+    if (!pointerStats.isFile() || pointerStats.isSymbolicLink() || pointerStats.size > 4096) rejected();
+    const content = readFileSync(pointerPath, "utf8").trim();
+    if (!content.startsWith("gitdir: ")) rejected();
+    const gitAdmin = realpathSync(resolve(root, content.slice(8)));
+    const sourcePointerPath = join(sourceRoot, ".git");
+    const sourcePointerStats = lstatSync(sourcePointerPath);
+    if (sourcePointerStats.isSymbolicLink()) rejected();
+    let sourceGitDir: string;
+    if (sourcePointerStats.isDirectory()) {
+      sourceGitDir = realpathSync(sourcePointerPath);
+    } else if (sourcePointerStats.isFile() && sourcePointerStats.size <= 4096) {
+      // Historical nested managed worktrees may use another linked worktree
+      // as their source. Follow its Git admin `commondir` back to the real
+      // object store instead of requiring sourceRoot/.git to be a directory.
+      const sourceLink = readFileSync(sourcePointerPath, "utf8").trim();
+      if (!sourceLink.startsWith("gitdir: ")) rejected();
+      const sourceAdmin = realpathSync(resolve(sourceRoot, sourceLink.slice(8)));
+      const sourceBack = readFileSync(join(sourceAdmin, "gitdir"), "utf8").trim();
+      if (realpathSync(sourceBack) !== realpathSync(sourcePointerPath)) rejected();
+      const commonRelative = readFileSync(join(sourceAdmin, "commondir"), "utf8").trim();
+      if (!commonRelative || commonRelative.length > 4096) rejected();
+      sourceGitDir = realpathSync(resolve(sourceAdmin, commonRelative));
+      if (!lstatSync(sourceGitDir).isDirectory()
+          || !isPathInsideRoot(sourceAdmin, join(sourceGitDir, "worktrees"))) return rejected();
+    } else {
+      return rejected();
+    }
+    const adminRoot = join(sourceGitDir, "worktrees");
+    if (!isPathInsideRoot(gitAdmin, adminRoot) || gitAdmin === adminRoot
+        || !lstatSync(gitAdmin).isDirectory()) rejected();
+    const backPointer = readFileSync(join(gitAdmin, "gitdir"), "utf8").trim();
+    // macOS may report the same directory through /var and /private/var.
+    // Compare physical pointer paths, not the spelling Git used at creation.
+    if (realpathSync(backPointer) !== realpathSync(pointerPath)) rejected();
+  } catch {
+    rejected();
   }
 }
 

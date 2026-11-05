@@ -2,6 +2,8 @@ import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { lstat, mkdir, realpath, stat } from "node:fs/promises";
+import { lstatSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { platform } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import type { ServerConfig } from "./config.js";
@@ -168,6 +170,50 @@ export async function verifyManagedWorktreeVolume(config: ServerConfig): Promise
       const match = new RegExp(
         `<key>${name}</key>\\s*(?:<string>([^<]*)</string>|<(true|false)\\s*/>)`,
       ).exec(stdout);
+      return match?.[1] ?? match?.[2];
+    };
+    if (field("VolumeUUID")?.toUpperCase() !== uuid.toUpperCase()
+        || field("MountPoint") !== mount
+        || field("FilesystemName") !== "APFS"
+        || field("Writable") !== "true"
+        || field("FileVault") !== "true") rejected();
+  } catch {
+    rejected();
+  }
+}
+
+/** Recheck the encrypted volume before *synchronous* persisted-session recovery.
+ *  This is deliberately independent of the new-worktree creation check: a
+ *  session may be restored long after its original mount has disappeared.
+ */
+export function verifyManagedWorktreeVolumeSync(config: ServerConfig): void {
+  const mount = config.managedWorktreeMountPoint;
+  const uuid = config.managedWorktreeVolumeUuid;
+  if (!mount && !uuid) return;
+  const rejected = (): never => {
+    throw new GitWorktreeError(
+      "GIT_WORKTREE_CREATE_FAILED",
+      "Managed worktree destination volume is not the configured mounted encrypted APFS volume.",
+    );
+  };
+  if (!mount || !/^[0-9a-fA-F-]{36}$/.test(uuid)
+      || !config.requireExistingWorktreeRoot || platform() !== "darwin") rejected();
+
+  try {
+    const volume = lstatSync(mount);
+    const parent = statSync(dirname(mount));
+    const target = lstatSync(config.worktreeRoot);
+    if (!volume.isDirectory() || volume.isSymbolicLink()
+        || !target.isDirectory() || target.isSymbolicLink()
+        || volume.dev === parent.dev || target.dev !== volume.dev
+        || !isPathInsideRoot(config.worktreeRoot, mount)) rejected();
+    const xml = execFileSync("/usr/sbin/diskutil", ["info", "-plist", mount], {
+      encoding: "utf8", timeout: 12000, maxBuffer: 1024 * 1024,
+    });
+    const field = (name: string): string | undefined => {
+      const match = new RegExp(
+        `<key>${name}</key>\\s*(?:<string>([^<]*)</string>|<(true|false)\\s*/>)`,
+      ).exec(xml);
       return match?.[1] ?? match?.[2];
     };
     if (field("VolumeUUID")?.toUpperCase() !== uuid.toUpperCase()

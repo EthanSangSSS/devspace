@@ -18,6 +18,8 @@ export interface WorkspaceSession {
   baseRef?: string;
   baseSha?: string;
   managed: boolean;
+  rootInode?: string;
+  rootVolumeUuid?: string;
   createdAt: string;
   lastUsedAt: string;
 }
@@ -39,6 +41,8 @@ export interface WorkspaceStore {
     baseRef?: string;
     baseSha?: string;
     managed?: boolean;
+    rootInode?: string;
+    rootVolumeUuid?: string;
   }): WorkspaceSession;
   getSession(id: string): WorkspaceSession | undefined;
   touchSession(id: string): void;
@@ -71,6 +75,8 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     baseRef?: string;
     baseSha?: string;
     managed?: boolean;
+    rootInode?: string;
+    rootVolumeUuid?: string;
   }): WorkspaceSession {
     const now = new Date().toISOString();
     const session: WorkspaceSession = {
@@ -82,6 +88,8 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       baseRef: input.baseRef,
       baseSha: input.baseSha,
       managed: input.managed ?? false,
+      rootInode: input.rootInode,
+      rootVolumeUuid: input.rootVolumeUuid,
       createdAt: now,
       lastUsedAt: now,
     };
@@ -97,6 +105,8 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         baseRef: session.baseRef ?? null,
         baseSha: session.baseSha ?? null,
         managed: String(session.managed),
+        rootInode: session.rootInode ?? null,
+        rootVolumeUuid: session.rootVolumeUuid ?? null,
         createdAt: session.createdAt,
         lastUsedAt: session.lastUsedAt,
       })
@@ -221,6 +231,8 @@ function rowToWorkspaceSession(row: WorkspaceSessionRow): WorkspaceSession {
     baseRef: row.baseRef ?? undefined,
     baseSha: row.baseSha ?? undefined,
     managed: row.managed === "true",
+    rootInode: row.rootInode ?? undefined,
+    rootVolumeUuid: row.rootVolumeUuid ?? undefined,
     createdAt: row.createdAt,
     lastUsedAt: row.lastUsedAt,
   };

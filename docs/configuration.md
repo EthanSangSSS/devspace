@@ -128,6 +128,33 @@ guard requires macOS; non-macOS systems reject the opt-in settings.
 `git worktree add`, but it cannot eliminate all filesystem hot-unplug races;
 maintain backups and verify a stable physical connection.
 
+**Restart and persisted-session safety:** DevSpace also checks the configured
+mount UUID before restoring a saved managed workspace located under the **new**
+`worktreeRoot`. Sessions created with this opt-in guard remember their expected
+volume UUID and original directory inode in the state database. After a server
+restart, an unexpectedly replaced directory or an incorrect/missing encrypted
+APFS volume causes session restoration to **fail closed**, without creating,
+remapping or deleting any worktree files. A matching UUID can safely be
+accepted even if macOS assigned a different `st_dev` after remounting; directory
+inode and Git worktree links must still match.
+
+Database migration v7 adds nullable `workspace_sessions.root_inode` and
+`workspace_sessions.root_volume_uuid`. It never guesses physical identity for
+pre-existing session rows. Historical managed worktrees are instead checked
+against their source repository's Git admin directory **and its reverse
+`gitdir` backlink**, including sources that are themselves linked worktrees.
+Missing directories, inconsistent Git links or a new-root session without its
+original expected volume identity are not recreated or silently rebound.
+Old checkout sessions are retained for compatibility.
+
+This is a conservative filesystem/Git identity check, **not cryptographic
+attestation**: a legacy session with no recorded inode cannot distinguish a
+perfectly forged working-tree copy with equivalent Git metadata. Nor can it
+eliminate filesystem races between verification and subsequent file access.
+Back up the existing state database, confirm the volume UUID, test legacy
+session restoration on an isolated instance, and preserve rollback capability
+**before** installing the new binary: startup migrates the database schema.
+
 Do not delete or move old worktrees until their active sessions and
 uncommitted changes are independently accounted for. The global configuration
 change also affects sources outside the external volume; validate the backup
