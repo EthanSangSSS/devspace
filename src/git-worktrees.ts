@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { lstat, mkdir, realpath, rmdir, stat } from "node:fs/promises";
+import { lstat, mkdir, realpath, stat } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import type { ServerConfig } from "./config.js";
 import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
@@ -34,18 +34,12 @@ export interface ManagedWorktree {
   managed: boolean;
 }
 
-export interface ReservedWorktreePath {
-  path: string;
-  dev: number;
-  ino: number;
-}
-
 /** Reserve a new, empty directory atomically. An existing candidate is never reused. */
 export async function reserveManagedWorktreePath(input: {
   worktreeRoot: string;
   repoRoot: string;
   generateId?: () => string;
-}): Promise<ReservedWorktreePath> {
+}): Promise<string> {
   const repoName = sanitizePathSegment(basename(input.repoRoot)) || "repo";
   const generateId = input.generateId ?? (() => randomBytes(12).toString("hex"));
   await mkdir(input.worktreeRoot, { recursive: true });
@@ -69,36 +63,10 @@ export async function reserveManagedWorktreePath(input: {
     if (!identity.isDirectory() || identity.isSymbolicLink()) {
       throw new GitWorktreeError("GIT_WORKTREE_CREATE_FAILED", "Reserved worktree path changed during creation.");
     }
-    return { path, dev: identity.dev, ino: identity.ino };
+    return path;
   }
 
   throw new GitWorktreeError("GIT_WORKTREE_CREATE_FAILED", "Could not reserve a unique managed worktree path.");
-}
-
-/** Never recursively delete a failed worktree: unknown contents must survive. */
-export async function releaseReservedWorktreePath(reservation: ReservedWorktreePath): Promise<boolean> {
-  let identity;
-  try {
-    identity = await lstat(reservation.path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw error;
-  }
-  if (!identity.isDirectory() || identity.isSymbolicLink()
-    || identity.dev !== reservation.dev || identity.ino !== reservation.ino) {
-    return false;
-  }
-
-  try {
-    // rmdir removes empty directories only, even if another process races the identity check.
-    await rmdir(reservation.path);
-    return true;
-  } catch (error) {
-    if (["ENOTEMPTY", "EEXIST", "ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) {
-      return false;
-    }
-    throw error;
-  }
 }
 
 export async function createManagedWorktree(input: {
@@ -128,27 +96,28 @@ export async function createManagedWorktree(input: {
   const baseRef = input.baseRef ?? "HEAD";
   const baseSha = await resolveBaseCommit(sourceRoot, baseRef);
   const dirtySource = (await git(["status", "--porcelain=v1"], sourceRoot)).trim().length > 0;
-  const reservation = await reserveManagedWorktreePath({
+  const worktreePath = await reserveManagedWorktreePath({
     worktreeRoot: input.config.worktreeRoot,
     repoRoot: sourceRoot,
   });
 
   try {
-    await git(["worktree", "add", "--detach", reservation.path, baseSha], sourceRoot);
+    await git(["worktree", "add", "--detach", worktreePath, baseSha], sourceRoot);
   } catch (error) {
-    // If Git left files or another process replaced the directory, retain it for recovery.
-    const removed = await releaseReservedWorktreePath(reservation).catch(() => false);
+    // Do not unlink by pathname after a separate identity check: another
+    // process could replace the directory between that check and the unlink.
+    // Preserve even an empty reservation for explicit, verified recovery.
     const message = error instanceof Error ? error.message : String(error);
     throw new GitWorktreeError(
       "GIT_WORKTREE_CREATE_FAILED",
       `Git failed to create the managed worktree. ${message}`
-        + (removed ? "" : ` The worktree path was retained for inspection: ${reservation.path}`),
+        + ` The reserved worktree path was retained for inspection: ${worktreePath}`,
     );
   }
 
   return {
     sourceRoot,
-    path: reservation.path,
+    path: worktreePath,
     baseRef,
     baseSha,
     dirtySource,

@@ -8,7 +8,6 @@ import { promisify } from "node:util";
 import { loadConfig, type ServerConfig } from "./config.js";
 import {
   GitWorktreeError,
-  releaseReservedWorktreePath,
   reserveManagedWorktreePath,
 } from "./git-worktrees.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
@@ -132,62 +131,62 @@ test("managed worktree reservation retries collisions without touching existing 
     },
   });
 
-  assert.equal(reserved.path, join(worktreeRoot, `git-project-${nextId}`));
+  assert.equal(reserved, join(worktreeRoot, `git-project-${nextId}`));
   assert.equal(await readFile(join(existing, "keep.txt"), "utf8"), "original contents\n");
-  await releaseReservedWorktreePath(reserved);
-  assert.deepEqual(await readdir(worktreeRoot), [`git-project-${collidedId}`]);
+  assert.deepEqual((await readdir(worktreeRoot)).sort(), [
+    `git-project-${collidedId}`,
+    `git-project-${nextId}`,
+  ]);
   assert.equal(await readFile(join(existing, "keep.txt"), "utf8"), "original contents\n");
 });
 
-test("managed worktree cleanup never removes a nonempty reserved directory", async (t) => {
+test("managed worktree reservation fails closed when all candidates collide", async (t) => {
   const context = await fixture(t);
   const gitRoot = await createGitProject(context.root);
-  const reserved = await reserveManagedWorktreePath({
-    worktreeRoot: context.config.worktreeRoot,
-    repoRoot: gitRoot,
-  });
-  await writeFile(join(reserved.path, "keep.txt"), "incomplete worktree data\n");
-
-  await releaseReservedWorktreePath(reserved);
-  assert.equal(await readFile(join(reserved.path, "keep.txt"), "utf8"), "incomplete worktree data\n");
+  const id = "0".repeat(24);
+  const occupied = join(context.config.worktreeRoot, `git-project-${id}`);
+  await mkdir(occupied, { recursive: true });
+  await writeFile(join(occupied, "keep.txt"), "user content\n");
+  let attempts = 0;
+  await assert.rejects(
+    () => reserveManagedWorktreePath({
+      worktreeRoot: context.config.worktreeRoot,
+      repoRoot: gitRoot,
+      generateId: () => {
+        attempts++;
+        return id;
+      },
+    }),
+    (error: unknown) => error instanceof GitWorktreeError && error.code === "GIT_WORKTREE_CREATE_FAILED",
+  );
+  assert.equal(attempts, 10);
+  assert.equal(await readFile(join(occupied, "keep.txt"), "utf8"), "user content\n");
 });
 
-test("managed worktree cleanup preserves a directory substituted after reservation", async (t) => {
+test("managed worktree reservation fails closed for symlink collision", { skip: platform() === "win32" }, async (t) => {
   const context = await fixture(t);
   const gitRoot = await createGitProject(context.root);
-  const reserved = await reserveManagedWorktreePath({
-    worktreeRoot: context.config.worktreeRoot,
-    repoRoot: gitRoot,
-  });
-  const moved = join(context.root, "original-reservation");
-  await rename(reserved.path, moved);
-  await mkdir(reserved.path);
-
-  await releaseReservedWorktreePath(reserved);
-  assert.equal((await stat(reserved.path)).isDirectory(), true, "unowned replacement must remain");
-  assert.equal((await stat(moved)).isDirectory(), true, "original directory must remain");
-});
-
-test("managed worktree cleanup does not follow a substituted symlink", { skip: platform() === "win32" }, async (t) => {
-  const context = await fixture(t);
-  const gitRoot = await createGitProject(context.root);
-  const reserved = await reserveManagedWorktreePath({
-    worktreeRoot: context.config.worktreeRoot,
-    repoRoot: gitRoot,
-  });
-  const moved = join(context.root, "original-reservation");
+  const id = "0".repeat(24);
   const foreign = join(context.root, "foreign-directory");
   await mkdir(foreign);
   await writeFile(join(foreign, "keep.txt"), "foreign data\n");
-  await rename(reserved.path, moved);
-  await symlink(foreign, reserved.path, "dir");
+  await mkdir(context.config.worktreeRoot, { recursive: true });
+  const link = join(context.config.worktreeRoot, `git-project-${id}`);
+  await symlink(foreign, link, "dir");
 
-  await releaseReservedWorktreePath(reserved);
-  assert.equal((await lstat(reserved.path)).isSymbolicLink(), true);
+  await assert.rejects(
+    () => reserveManagedWorktreePath({
+      worktreeRoot: context.config.worktreeRoot,
+      repoRoot: gitRoot,
+      generateId: () => id,
+    }),
+    /outside allowed roots/,
+  );
+  assert.equal((await lstat(link)).isSymbolicLink(), true);
   assert.equal(await readFile(join(foreign, "keep.txt"), "utf8"), "foreign data\n");
 });
 
-test("failed Git worktree creation cleans only its own empty reservation", async (t) => {
+test("failed Git worktree creation retains its reservation without deleting anything", async (t) => {
   const context = await fixture(t);
   const gitRoot = await createGitProject(context.root);
   await writeFile(join(gitRoot, ".git", "worktrees"), "prevent git metadata creation\n");
@@ -196,7 +195,10 @@ test("failed Git worktree creation cleans only its own empty reservation", async
     () => context.registry.openWorkspace({ path: gitRoot, mode: "worktree" }),
     (error: unknown) => error instanceof GitWorktreeError && error.code === "GIT_WORKTREE_CREATE_FAILED",
   );
-  assert.deepEqual(await readdir(context.config.worktreeRoot), [], "failed Git must not leave an empty reservation");
+  const paths = await readdir(context.config.worktreeRoot);
+  assert.equal(paths.length, 1, "failed Git must not delete or reuse the reserved path");
+  assert.match(paths[0]!, /^git-project-[a-f0-9]{24}$/);
+  assert.equal((await stat(join(context.config.worktreeRoot, paths[0]!))).isDirectory(), true);
 });
 
 test("persisted checkout and worktree sessions restore after recreating the registry", async (t) => {
