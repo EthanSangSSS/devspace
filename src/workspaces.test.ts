@@ -473,13 +473,16 @@ test("managed worktree checkout tolerates more than 1 MiB from a post-checkout h
   const hook = join(gitRoot, ".git", "hooks", "post-checkout");
   await writeFile(hook, [
     "#!/bin/sh",
-    "node -e 'process.stdout.write(\"x\".repeat(1250000))'",
+    "node -e 'require(\"node:fs\").writeFileSync(\"hook-output.marker\", \"ok\"); process.stdout.write(\"x\".repeat(1250000))'",
     "",
   ].join("\n"));
   await chmod(hook, 0o755);
 
   const opened = await context.registry.openWorkspace({ path: gitRoot, mode: "worktree" });
-  assert.equal(await readFile(join(opened.workspace.root, "README.md"), "utf8"), "hello\n");
+  assert.equal(await readFile(join(opened.workspace.root, "hook-output.marker"), "utf8"), "ok");
+  // Git normally converts checkout text to CRLF on Windows.
+  assert.equal((await readFile(join(opened.workspace.root, "README.md"), "utf8"))
+    .replace(/\r\n/g, "\n"), "hello\n");
 });
 
 test("managed worktree reservation retries collisions without touching existing files", async (t) => {
