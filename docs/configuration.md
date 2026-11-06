@@ -139,7 +139,9 @@ and restored checkout sessions are rechecked; newly created protected checkout
 sessions persist the expected UUID. Checkout paths outside the protected mount
 retain their existing behavior. Old sessions with no persisted UUID remain
 subject to the **currently configured** mount verification, so keep the opt-in
-policy configured throughout cutover and recovery.
+policy configured throughout cutover and recovery. A temporarily unavailable
+checkout does not erase an existing conversation-to-workspace binding: the
+binding is replaced only after another checkout has successfully opened.
 
 **Restart and persisted-session safety:** DevSpace also checks the configured
 mount UUID before restoring a saved managed workspace located under the **new**

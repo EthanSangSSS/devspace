@@ -180,16 +180,18 @@ export class WorkspaceRegistry {
         };
       }
 
-      this.workspaces.delete(binding.workspaceSessionId);
-      this.store?.deleteConversationBinding(conversationScopeId, targetKey);
     }
 
+    // Opening a replacement may fail while an external checkout volume is
+    // temporarily unavailable. Preserve the original durable binding until
+    // the new checkout has been verified and successfully opened.
     const context = await this.openCheckoutWorkspace(input.path);
     this.store?.setConversationBinding({
       conversationScopeId,
       targetKey,
       workspaceSessionId: context.workspace.id,
     });
+    if (binding) this.workspaces.delete(binding.workspaceSessionId);
     return {
       ...context,
       includeBootstrapContext: true,

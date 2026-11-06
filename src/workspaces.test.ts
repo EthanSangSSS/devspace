@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, copyFile, lstat, mkdtemp, mkdir, readFile, readdir, rename, rm, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdtemp, mkdir, readFile, readdir, realpath, rename, rm, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { platform, tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
@@ -290,6 +290,73 @@ test("a stored volume-bound checkout cannot be restored after its guard is remov
     });
     assert.throws(() => new WorkspaceRegistry(context.config, store)
       .getWorkspace("checkout_bound_test"), /protected checkout volume|unverified checkout volume/i);
+  } finally {
+    store.close();
+  }
+});
+
+test("a temporarily missing protected checkout never discards its persisted conversation binding", async (t) => {
+  const context = await fixture(t);
+  const missingMount = join(context.root, "offline-volume-with-bound-session");
+  const checkout = join(missingMount, "Developer", "historical-project");
+  const config = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "checkout-temporary-disconnect-config"),
+    { server: { port: 1 }, workspaces: {
+      allowedRoots: [context.root],
+      worktreeRoot: join(missingMount, "Worktrees"),
+      requireExistingWorktreeRoot: true,
+      managedWorktreeMountPoint: missingMount,
+      managedWorktreeVolumeUuid: "00000000-0000-0000-0000-000000000000",
+    } },
+  ));
+  const store = new SqliteWorkspaceStore(join(context.root, "checkout-offline-binding-store"));
+  const scopeId = "conversation_offline_mount_test";
+  const canonicalCheckout = join(await realpath(context.root),
+    "offline-volume-with-bound-session", "Developer", "historical-project");
+  const targetKey = JSON.stringify(["checkout", canonicalCheckout, null]);
+  const previousId = "ws_saved_offline_checkout";
+  try {
+    store.createSession({ id: previousId, root: checkout, mode: "checkout" });
+    store.setConversationBinding({
+      conversationScopeId: scopeId, targetKey, workspaceSessionId: previousId,
+    });
+    assert.equal(store.getConversationBinding(scopeId, targetKey)?.workspaceSessionId, previousId);
+
+    await assert.rejects(
+      () => new WorkspaceRegistry(config, store).openWorkspace(checkout, {
+        conversationScopeId: scopeId,
+      }),
+      /protected checkout volume|no such file|unverified/i,
+    );
+    assert.equal(store.getConversationBinding(scopeId, targetKey)?.workspaceSessionId, previousId);
+    assert.equal(store.getSession(previousId)?.root, checkout);
+    await assert.rejects(stat(missingMount), { code: "ENOENT" });
+  } finally {
+    store.close();
+  }
+});
+
+test("a successfully opened replacement checkout atomically updates a stale conversation binding", async (t) => {
+  const context = await fixture(t);
+  const store = new SqliteWorkspaceStore(join(context.root, "checkout-replacement-binding-store"));
+  const scopeId = "conversation_checkout_replacement_test";
+  const targetKey = JSON.stringify(["checkout", await realpath(context.root), null]);
+  const previousId = "ws_stale_checkout_binding";
+  const missingOldRoot = join(context.root, "missing-old-checkout");
+  try {
+    store.createSession({ id: previousId, root: missingOldRoot, mode: "checkout" });
+    store.setConversationBinding({
+      conversationScopeId: scopeId, targetKey, workspaceSessionId: previousId,
+    });
+
+    const opened = await new WorkspaceRegistry(context.config, store)
+      .openWorkspace(context.root, { conversationScopeId: scopeId });
+    assert.equal(opened.workspace.root, context.root);
+    assert.notEqual(opened.workspace.id, previousId);
+    assert.equal(store.getConversationBinding(scopeId, targetKey)?.workspaceSessionId,
+      opened.workspace.id);
+    assert.equal(store.getSession(previousId)?.root, missingOldRoot);
+    await assert.rejects(stat(missingOldRoot), { code: "ENOENT" });
   } finally {
     store.close();
   }
