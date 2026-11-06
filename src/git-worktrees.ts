@@ -2,7 +2,10 @@ import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { lstat, mkdir, realpath, stat } from "node:fs/promises";
-import { basename, join, relative, resolve } from "node:path";
+import { lstatSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { platform } from "node:os";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import type { ServerConfig } from "./config.js";
 import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
 import { gitEnvironment } from "./git-environment.js";
@@ -34,7 +37,7 @@ export interface ManagedWorktree {
   managed: boolean;
 }
 
-/** Reserve a new, empty directory atomically. An existing candidate is never reused. */
+/** Reserve one new child atomically, after the caller has verified/prepared its root. */
 export async function reserveManagedWorktreePath(input: {
   worktreeRoot: string;
   repoRoot: string;
@@ -42,7 +45,6 @@ export async function reserveManagedWorktreePath(input: {
 }): Promise<string> {
   const repoName = sanitizePathSegment(basename(input.repoRoot)) || "repo";
   const generateId = input.generateId ?? (() => randomBytes(12).toString("hex"));
-  await mkdir(input.worktreeRoot, { recursive: true });
 
   for (let attempt = 0; attempt < 10; attempt++) {
     const id = generateId();
@@ -93,20 +95,66 @@ export async function createManagedWorktree(input: {
   }
 
   const sourceRoot = await resolveGitRoot(sourcePath, input.config.allowedRoots);
+  if (input.config.managedWorktreeSourceRoots.length > 0) {
+    // These are exact Git repository roots, not ancestor-directory grants.
+    // A Developer parent contains snapshot-only projects and must not
+    // implicitly authorize them for new managed worktrees.
+    const sourceCanonical = await realpath(sourceRoot);
+    const authorized = await Promise.all(input.config.managedWorktreeSourceRoots.map(
+      async (candidate) => {
+        try {
+          return (await realpath(candidate)) === sourceCanonical;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+          throw error;
+        }
+      },
+    ));
+    if (!authorized.includes(true)) {
+      throw new GitWorktreeError(
+        "GIT_WORKTREE_CREATE_FAILED",
+        "Source Git repository is not an explicitly approved managed worktree source.",
+      );
+    }
+  }
   const baseRef = input.baseRef ?? "HEAD";
   const baseSha = await resolveBaseCommit(sourceRoot, baseRef);
   const dirtySource = (await git(["status", "--porcelain=v1"], sourceRoot)).trim().length > 0;
+
+  // Validate the opt-in mounted-volume policy before any mkdir. Even an
+  // invalid configuration must not create a fallback on the internal disk.
+  await verifyManagedWorktreeVolume(input.config);
+  if (input.config.requireExistingWorktreeRoot) {
+    // Never create a fallback directory on the host when an external
+    // worktree volume is disconnected. The operator must verify the actual
+    // mounted volume identity separately before enabling this policy.
+    try {
+      const rootStats = await lstat(input.config.worktreeRoot);
+      if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) {
+        throw new Error("not an ordinary directory");
+      }
+    } catch {
+      throw new GitWorktreeError(
+        "GIT_WORKTREE_CREATE_FAILED",
+        "Configured managed worktree root is unavailable or redirected; no fallback directory was created.",
+      );
+    }
+  } else {
+    await mkdir(input.config.worktreeRoot, { recursive: true });
+  }
+  // Only reserve the child after the mount and existing-root gates succeed.
+  // Reserving first could create a host fallback when DevSSD is unavailable.
   const worktreePath = await reserveManagedWorktreePath({
     worktreeRoot: input.config.worktreeRoot,
     repoRoot: sourceRoot,
   });
+  assertAllowedPath(worktreePath, [input.config.worktreeRoot]);
 
   try {
     await git(["worktree", "add", "--detach", worktreePath, baseSha], sourceRoot);
   } catch (error) {
-    // DevSpace does not remove this directory: pathname-based cleanup can
-    // race replacement. Git may clean up its own checkout on failure, so
-    // callers must verify the destination's current state before recovery.
+    // DevSpace never removes the reserved pathname: it may have been replaced
+    // while Git ran. Git's own failed-checkout cleanup is outside our control.
     const message = error instanceof Error ? error.message : String(error);
     throw new GitWorktreeError(
       "GIT_WORKTREE_CREATE_FAILED",
@@ -124,6 +172,93 @@ export async function createManagedWorktree(input: {
     detached: true,
     managed: true,
   };
+}
+
+/** Opt-in macOS external-volume guard. Does not change the v1.1 default. */
+export async function verifyManagedWorktreeVolume(config: ServerConfig): Promise<void> {
+  const mount = config.managedWorktreeMountPoint;
+  const uuid = config.managedWorktreeVolumeUuid;
+  if (!mount && !uuid) return;
+  const rejected = (): never => {
+    throw new GitWorktreeError(
+      "GIT_WORKTREE_CREATE_FAILED",
+      "Managed worktree destination volume is not the configured mounted encrypted APFS volume.",
+    );
+  };
+  if (!mount || !/^[0-9a-fA-F-]{36}$/.test(uuid)
+      || !config.requireExistingWorktreeRoot || platform() !== "darwin") rejected();
+
+  try {
+    const [volume, parent, target] = await Promise.all([
+      lstat(mount), stat(dirname(mount)), lstat(config.worktreeRoot),
+    ]);
+    if (!volume.isDirectory() || volume.isSymbolicLink()
+        || !target.isDirectory() || target.isSymbolicLink()
+        || volume.dev === parent.dev || target.dev !== volume.dev
+        || !isPathInsideRoot(config.worktreeRoot, mount)) rejected();
+
+    // diskutil info -plist requires the actual mount point (not a child path).
+    // Parse only known scalar fields. Missing/ambiguous values fail closed.
+    const { stdout } = await execFileAsync("/usr/sbin/diskutil",
+      ["info", "-plist", mount], { maxBuffer: 1024 * 1024, timeout: 12000 });
+    const field = (name: string): string | undefined => {
+      const match = new RegExp(
+        `<key>${name}</key>\\s*(?:<string>([^<]*)</string>|<(true|false)\\s*/>)`,
+      ).exec(stdout);
+      return match?.[1] ?? match?.[2];
+    };
+    if (field("VolumeUUID")?.toUpperCase() !== uuid.toUpperCase()
+        || field("MountPoint") !== mount
+        || field("FilesystemName") !== "APFS"
+        || field("Writable") !== "true"
+        || field("FileVault") !== "true") rejected();
+  } catch {
+    rejected();
+  }
+}
+
+/** Recheck the encrypted volume before *synchronous* persisted-session recovery.
+ *  This is deliberately independent of the new-worktree creation check: a
+ *  session may be restored long after its original mount has disappeared.
+ */
+export function verifyManagedWorktreeVolumeSync(config: ServerConfig): void {
+  const mount = config.managedWorktreeMountPoint;
+  const uuid = config.managedWorktreeVolumeUuid;
+  if (!mount && !uuid) return;
+  const rejected = (): never => {
+    throw new GitWorktreeError(
+      "GIT_WORKTREE_CREATE_FAILED",
+      "Managed worktree destination volume is not the configured mounted encrypted APFS volume.",
+    );
+  };
+  if (!mount || !/^[0-9a-fA-F-]{36}$/.test(uuid)
+      || !config.requireExistingWorktreeRoot || platform() !== "darwin") rejected();
+
+  try {
+    const volume = lstatSync(mount);
+    const parent = statSync(dirname(mount));
+    const target = lstatSync(config.worktreeRoot);
+    if (!volume.isDirectory() || volume.isSymbolicLink()
+        || !target.isDirectory() || target.isSymbolicLink()
+        || volume.dev === parent.dev || target.dev !== volume.dev
+        || !isPathInsideRoot(config.worktreeRoot, mount)) rejected();
+    const xml = execFileSync("/usr/sbin/diskutil", ["info", "-plist", mount], {
+      encoding: "utf8", timeout: 12000, maxBuffer: 1024 * 1024,
+    });
+    const field = (name: string): string | undefined => {
+      const match = new RegExp(
+        `<key>${name}</key>\\s*(?:<string>([^<]*)</string>|<(true|false)\\s*/>)`,
+      ).exec(xml);
+      return match?.[1] ?? match?.[2];
+    };
+    if (field("VolumeUUID")?.toUpperCase() !== uuid.toUpperCase()
+        || field("MountPoint") !== mount
+        || field("FilesystemName") !== "APFS"
+        || field("Writable") !== "true"
+        || field("FileVault") !== "true") rejected();
+  } catch {
+    rejected();
+  }
 }
 
 async function resolveGitRoot(path: string, allowedRoots: string[]): Promise<string> {

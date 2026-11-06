@@ -29,6 +29,11 @@ export interface ServerConfig {
   uiEnabled: boolean;
   stateDir: string;
   worktreeRoot: string;
+  legacyWorktreeRoots: string[];
+  requireExistingWorktreeRoot: boolean;
+  managedWorktreeSourceRoots: string[];
+  managedWorktreeMountPoint: string;
+  managedWorktreeVolumeUuid: string;
   artifactsEnabled: boolean;
   artifactMaxFileBytes: number;
   skillsEnabled: boolean;
@@ -84,6 +89,12 @@ export function loadConfig(
     uiEnabled: stored.ui.enabled,
     stateDir: normalizePath(stored.storage.stateDir),
     worktreeRoot: normalizePath(stored.workspaces.worktreeRoot),
+    legacyWorktreeRoots: normalizePaths(stored.workspaces.legacyWorktreeRoots),
+    requireExistingWorktreeRoot: stored.workspaces.requireExistingWorktreeRoot,
+    managedWorktreeSourceRoots: normalizePaths(stored.workspaces.managedWorktreeSourceRoots),
+    managedWorktreeMountPoint: stored.workspaces.managedWorktreeMountPoint
+      ? normalizePath(stored.workspaces.managedWorktreeMountPoint) : "",
+    managedWorktreeVolumeUuid: stored.workspaces.managedWorktreeVolumeUuid,
     artifactsEnabled: stored.artifacts.enabled,
     artifactMaxFileBytes: stored.artifacts.maxFileBytes,
     skillsEnabled: stored.skills.enabled,

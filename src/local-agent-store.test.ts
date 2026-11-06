@@ -79,6 +79,20 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
       name text not null,
       applied_at text not null
     );
+    -- A recorded v1 workspace-state migration necessarily had this table.
+    -- Keep the historical fixture consistent now that v7 adds its columns.
+    create table workspace_sessions (
+      id text primary key,
+      root text not null,
+      status text not null default 'active',
+      mode text not null default 'checkout',
+      source_root text,
+      base_ref text,
+      base_sha text,
+      managed text not null default 'false',
+      created_at text not null,
+      last_used_at text not null
+    );
     create table local_agent_sessions (
       id text primary key,
       workspace_id text,
