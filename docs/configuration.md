@@ -142,6 +142,10 @@ subject to the **currently configured** mount verification, so keep the opt-in
 policy configured throughout cutover and recovery. A temporarily unavailable
 checkout does not erase an existing conversation-to-workspace binding: the
 binding is replaced only after another checkout has successfully opened.
+MCP tool requests and opening protected checkouts verify volume identity
+through an asynchronous `diskutil` check so a slow volume query does not block
+other sessions on the shared server event loop. The same per-request physical
+path, device, inode and UUID checks remain fail-closed.
 
 **Restart and persisted-session safety:** DevSpace also checks the configured
 mount UUID before restoring a saved managed workspace located under the **new**

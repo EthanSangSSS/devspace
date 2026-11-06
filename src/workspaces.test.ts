@@ -79,6 +79,17 @@ test("opening a missing checkout creates its workspace root", async (t) => {
   assert.equal((await stat(missingRoot)).isDirectory(), true);
 });
 
+test("incomplete SSD policy does not disable unrelated internal checkouts", async (t) => {
+  const context = await fixture(t);
+  context.config.managedWorktreeVolumeUuid = "11111111-1111-1111-1111-111111111111";
+  context.config.managedWorktreeMountPoint = "";
+
+  const opened = await context.registry.openWorkspace(context.root);
+  assert.equal(opened.workspace.mode, "checkout");
+  assert.equal(opened.workspace.root, context.root);
+  assert.equal(context.registry.getWorkspace(opened.workspace.id).root, context.root);
+});
+
 test("protected SSD checkout refuses to create a host fallback when its mount is missing", async (t) => {
   const context = await fixture(t);
   const missingMount = join(context.root, "disconnected-external-ssd");
@@ -187,6 +198,67 @@ test("opt-in real encrypted SSD checkout retains its UUID across cache and resta
   } finally {
     store.close();
   }
+});
+
+test("a protected SSD tool lookup validates diskutil without blocking the event loop", async (t) => {
+  const mount = process.env.DEVSPACE_TEST_SSD_MOUNT_POINT;
+  const uuid = process.env.DEVSPACE_TEST_SSD_VOLUME_UUID;
+  if (platform() !== "darwin" || !mount || !uuid) {
+    t.skip("Requires explicitly configured real encrypted APFS SSD test volume");
+    return;
+  }
+  const context = await fixture(t);
+  const scratch = join(mount, "Scratch");
+  const config = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "async-checkout-volume-config"),
+    { server: { port: 1 }, workspaces: {
+      allowedRoots: [scratch], worktreeRoot: join(mount, "Worktrees"),
+      requireExistingWorktreeRoot: true, managedWorktreeMountPoint: mount,
+      managedWorktreeVolumeUuid: uuid,
+    }, skills: { agentDir: context.agentDir } },
+  ));
+  verifyManagedWorktreeVolumeSync(config);
+  const checkout = await mkdtemp(join(scratch, ".devspace-async-checkout-test-"));
+  t.after(async () => { await rmdir(checkout); });
+  const registry = new WorkspaceRegistry(config);
+  const opened = await registry.openWorkspace(checkout);
+
+  let eventLoopTicked = false;
+  setImmediate(() => { eventLoopTicked = true; });
+  const reused = await registry.getWorkspaceForTool(opened.workspace.id);
+  assert.equal(eventLoopTicked, true, "A diskutil check must not block unrelated MCP sessions");
+  assert.equal(reused.id, opened.workspace.id);
+  config.managedWorktreeVolumeUuid = "00000000-0000-0000-0000-000000000000";
+  await assert.rejects(() => registry.getWorkspaceForTool(opened.workspace.id),
+    /protected checkout volume/i);
+});
+
+test("opening a protected SSD checkout does not synchronously block the event loop", async (t) => {
+  const mount = process.env.DEVSPACE_TEST_SSD_MOUNT_POINT;
+  const uuid = process.env.DEVSPACE_TEST_SSD_VOLUME_UUID;
+  if (platform() !== "darwin" || !mount || !uuid) {
+    t.skip("Requires explicitly configured real encrypted APFS SSD test volume");
+    return;
+  }
+  const context = await fixture(t);
+  const scratch = join(mount, "Scratch");
+  const config = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "async-checkout-open-config"),
+    { server: { port: 1 }, workspaces: {
+      allowedRoots: [scratch], worktreeRoot: join(mount, "Worktrees"),
+      requireExistingWorktreeRoot: true, managedWorktreeMountPoint: mount,
+      managedWorktreeVolumeUuid: uuid,
+    }, skills: { agentDir: context.agentDir } },
+  ));
+  const checkout = await mkdtemp(join(scratch, ".devspace-async-open-test-"));
+  t.after(async () => { await rmdir(checkout); });
+  const registry = new WorkspaceRegistry(config);
+  const startedAt = performance.now();
+  const pending = registry.openWorkspace(checkout);
+  const synchronousDelayMs = performance.now() - startedAt;
+  assert.ok(synchronousDelayMs < 75,
+    `Opening an SSD checkout blocked the event loop for ${synchronousDelayMs.toFixed(0)} ms`);
+  assert.equal((await pending).workspace.root, checkout);
 });
 
 test("a verified removable SSD checkout still never auto-creates a missing directory", async (t) => {

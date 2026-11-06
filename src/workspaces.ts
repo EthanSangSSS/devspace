@@ -10,7 +10,11 @@ import { mkdir, opendir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
-import { createManagedWorktree, verifyManagedWorktreeVolumeSync } from "./git-worktrees.js";
+import {
+  createManagedWorktree,
+  verifyManagedWorktreeVolume,
+  verifyManagedWorktreeVolumeSync,
+} from "./git-worktrees.js";
 import {
   AccessDeniedError,
   assertAllowedPath,
@@ -93,6 +97,8 @@ type DirectoryOps = {
   stat: (path: string) => Promise<PathStats>;
   mkdir: (path: string, options: { recursive: true }) => Promise<unknown>;
 };
+
+type VerifiedCheckoutMount = { mount: string; uuid: string };
 
 export class WorkspaceRegistry {
   private readonly workspaces = new Map<string, Workspace>();
@@ -222,7 +228,7 @@ export class WorkspaceRegistry {
       throw error;
     }
 
-    const workspace = this.getWorkspace(binding.workspaceSessionId);
+    const workspace = await this.getWorkspaceForTool(binding.workspaceSessionId);
     if (workspace.mode !== "checkout" || workspace.root !== root) return undefined;
     return workspace;
   }
@@ -250,14 +256,51 @@ export class WorkspaceRegistry {
     };
   }
 
+  /** Tool requests must never block the shared event loop while diskutil runs.
+   *  Each protected checkout lookup verifies its volume asynchronously, then
+   *  performs the usual synchronous filesystem/inode checks on this request.
+   */
+  async getWorkspaceForTool(workspaceId: string): Promise<Workspace> {
+    const existing = this.workspaces.get(workspaceId) ?? this.store?.getSession(workspaceId);
+    if (existing?.mode !== "checkout") return this.getWorkspace(workspaceId);
+    const proof = await this.verifyCheckoutMountForOperation(existing.root);
+    return this.getWorkspaceVerified(workspaceId, proof);
+  }
+
+  private async verifyCheckoutMountForOperation(
+    root: string,
+  ): Promise<VerifiedCheckoutMount | undefined> {
+    const mount = this.config.managedWorktreeMountPoint;
+    if (!mount || !(isPathInsideRoot(root, mount)
+        || isPathInsideRoot(resolvePhysicalPath(root), resolvePhysicalPath(mount)))) {
+      return undefined;
+    }
+    const proof: VerifiedCheckoutMount = { mount, uuid: this.config.managedWorktreeVolumeUuid };
+    try {
+      await verifyManagedWorktreeVolume(this.config);
+    } catch {
+      throw new AccessDeniedError(`Unverified protected checkout volume identity: ${root}`);
+    }
+    return proof;
+  }
+
   getWorkspace(workspaceId: string): Workspace {
+    return this.getWorkspaceVerified(workspaceId);
+  }
+
+  private getWorkspaceVerified(
+    workspaceId: string,
+    verifiedCheckoutMount?: VerifiedCheckoutMount,
+  ): Workspace {
     const workspace = this.workspaces.get(workspaceId);
     if (workspace) {
       // A cached ID is not a permanent filesystem authorization. Recheck the
       // configured roots before using a checkout that may have been replaced.
       this.assertWorkspaceRootAllowed(workspace.root, workspace.mode, workspace.sourceRoot);
       if (workspace.mode === "checkout") {
-        this.verifyCheckoutVolumeIdentity(workspace.root, workspace.protectedCheckoutVolumeUuid);
+        this.verifyCheckoutVolumeIdentity(
+          workspace.root, workspace.protectedCheckoutVolumeUuid, verifiedCheckoutMount,
+        );
       }
       // The same device/inode can be observed again after a volume is
       // remounted. For opt-in SSD-managed worktrees, revalidate the actual
@@ -287,7 +330,7 @@ export class WorkspaceRegistry {
 
     const root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
     const protectedCheckoutVolumeUuid = session.mode === "checkout"
-      ? this.verifyCheckoutVolumeIdentity(root, session.rootVolumeUuid)
+      ? this.verifyCheckoutVolumeIdentity(root, session.rootVolumeUuid, verifiedCheckoutMount)
       : undefined;
     const canonicalRoot = this.resolveCanonicalWorkspaceRoot(
       root,
@@ -379,7 +422,8 @@ export class WorkspaceRegistry {
     const root = assertAllowedPath(path, this.config.allowedRoots);
     // An absent removable mount can leave an ordinary host directory at the
     // same path. Validate the configured physical volume before any mkdir.
-    const protectedCheckoutVolumeUuid = this.verifyCheckoutVolumeIdentity(root);
+    const verifiedMount = await this.verifyCheckoutMountForOperation(root);
+    const protectedCheckoutVolumeUuid = this.verifyCheckoutVolumeIdentity(root, undefined, verifiedMount);
     // A mounted SSD can disappear between a mount check and mkdir. Never
     // recursively create a checkout root on a protected removable volume.
     const rootStats = protectedCheckoutVolumeUuid
@@ -490,7 +534,11 @@ export class WorkspaceRegistry {
     return assertAllowedPath(root, this.config.allowedRoots);
   }
 
-  private verifyCheckoutVolumeIdentity(root: string, previouslyBoundUuid?: string): string | undefined {
+  private verifyCheckoutVolumeIdentity(
+    root: string,
+    previouslyBoundUuid?: string,
+    verifiedMount?: VerifiedCheckoutMount,
+  ): string | undefined {
     const mount = this.config.managedWorktreeMountPoint;
     const uuid = this.config.managedWorktreeVolumeUuid;
     const physicalRoot = mount ? resolvePhysicalPath(root) : undefined;
@@ -499,8 +547,12 @@ export class WorkspaceRegistry {
       && (isPathInsideRoot(root, mount)
         || isPathInsideRoot(physicalRoot!, physicalMount!));
 
-    if ((!mount && uuid) || (previouslyBoundUuid && (!protectedPath ||
-        previouslyBoundUuid.toUpperCase() !== uuid.toUpperCase()))) {
+    if (previouslyBoundUuid && (!protectedPath ||
+        previouslyBoundUuid.toUpperCase() !== uuid.toUpperCase())) {
+      throw new AccessDeniedError(`Unverified protected checkout volume identity: ${root}`);
+    }
+    if (verifiedMount && (!protectedPath
+        || verifiedMount.mount !== mount || verifiedMount.uuid !== uuid)) {
       throw new AccessDeniedError(`Unverified protected checkout volume identity: ${root}`);
     }
     if (!protectedPath) return undefined;
@@ -512,7 +564,7 @@ export class WorkspaceRegistry {
     }
 
     try {
-      verifyManagedWorktreeVolumeSync(this.config);
+      if (!verifiedMount) verifyManagedWorktreeVolumeSync(this.config);
       const mounted = statSync(mount);
       const checkout = statSync(root);
       if (!checkout.isDirectory() || checkout.dev !== mounted.dev) {
