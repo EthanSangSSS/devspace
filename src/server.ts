@@ -628,7 +628,7 @@ function registerAgyDelegationTools(
             policyDeniedAgyResult(input.profile, dryRun, config.agyDelegation),
           );
         }
-        const workspace = workspaces.getWorkspace(input.workspaceId);
+        const workspace = await workspaces.getWorkspaceForTool(input.workspaceId);
         request = {
           profile: input.profile,
           task: input.task,
@@ -1027,7 +1027,7 @@ export function createMcpServer(
     },
     async ({ workspaceId, ...input }, { requestId }) => observeToolOperation(config, "read", async () => {
       const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(workspaceId);
+      const workspace = await workspaces.getWorkspaceForTool(workspaceId);
       const readPath = workspaces.resolveReadPath(workspace, input.path);
       const response = await readFileTool(
         { ...input, path: readPath.absolutePath },
@@ -1091,7 +1091,7 @@ export function createMcpServer(
     },
     async ({ workspaceId }, { _meta, requestId }) => observeToolOperation(config, "show_changes", async () => {
       const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(workspaceId);
+      const workspace = await workspaces.getWorkspaceForTool(workspaceId);
       const reviewRef = typeof _meta?.["devspace/reviewRef"] === "string"
         ? _meta["devspace/reviewRef"]
         : undefined;

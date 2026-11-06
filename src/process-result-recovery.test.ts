@@ -26,6 +26,7 @@ async function fixture(t: TestContext) {
     config: { logging } as ToolRegistrationContext["config"],
     workspaces: {
       getWorkspace: () => ({ canonicalRoot: process.cwd() }),
+      getWorkspaceForTool: async () => ({ canonicalRoot: process.cwd() }),
       resolveWorkingDirectory: () => process.cwd(),
     } as unknown as ToolRegistrationContext["workspaces"],
   });

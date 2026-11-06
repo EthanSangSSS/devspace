@@ -117,7 +117,7 @@ export function registerArtifactTools(
       annotations: ARTIFACT_WRITE_ANNOTATIONS,
     },
     async (input) => executeArtifactTool(config, input, async () => {
-      const workspace = workspaces.getWorkspace(input.workspaceId);
+      const workspace = await workspaces.getWorkspaceForTool(input.workspaceId);
       const downloaded = await downloadIncomingArtifact({
         registry: incomingRegistry,
         workspaceId: workspace.id,

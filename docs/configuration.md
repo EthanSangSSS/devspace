@@ -128,6 +128,25 @@ guard requires macOS; non-macOS systems reject the opt-in settings.
 `git worktree add`, but it cannot eliminate all filesystem hot-unplug races;
 maintain backups and verify a stable physical connection.
 
+**Checkout mode on the same protected volume:** With this opt-in mount/UUID
+policy enabled, opening a checkout below the configured mount also requires
+that the encrypted APFS volume is online and that the **existing** checkout
+directory resolves to the same physical device. DevSpace will not create a
+missing protected checkout directory recursively: doing so after an unplug
+could create a same-named fallback on the host disk. Symlinks to the internal
+disk, missing mounts, wrong UUIDs, and replaced volumes are rejected. Cached
+and restored checkout sessions are rechecked; newly created protected checkout
+sessions persist the expected UUID. Checkout paths outside the protected mount
+retain their existing behavior. Old sessions with no persisted UUID remain
+subject to the **currently configured** mount verification, so keep the opt-in
+policy configured throughout cutover and recovery. A temporarily unavailable
+checkout does not erase an existing conversation-to-workspace binding: the
+binding is replaced only after another checkout has successfully opened.
+MCP tool requests and opening protected checkouts verify volume identity
+through an asynchronous `diskutil` check so a slow volume query does not block
+other sessions on the shared server event loop. The same per-request physical
+path, device, inode and UUID checks remain fail-closed.
+
 **Restart and persisted-session safety:** DevSpace also checks the configured
 mount UUID before restoring a saved managed workspace located under the **new**
 `worktreeRoot`. Sessions created with this opt-in guard remember their expected
