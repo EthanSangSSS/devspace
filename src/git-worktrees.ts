@@ -29,6 +29,8 @@ if (current.dev.toString() !== expectedDev || current.ino.toString() !== expecte
 const result = cp.spawnSync("git", ["worktree", "add", "--detach", ".", sha], {
   encoding: "utf8",
   env: { ...process.env, GIT_DIR: gitDir },
+  // Match the outer execFileAsync limit; verbose Git hooks can exceed 1 MiB.
+  maxBuffer: 10 * 1024 * 1024,
 });
 if (result.stdout) process.stdout.write(result.stdout);
 if (result.stderr) process.stderr.write(result.stderr);

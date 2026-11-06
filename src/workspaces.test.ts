@@ -467,6 +467,21 @@ test("worktree opens require Git and create an isolated managed workspace", asyn
   assert.equal(resolvedReadme.startsWith(opened.workspace.canonicalRoot), true);
 });
 
+test("managed worktree checkout tolerates more than 1 MiB from a post-checkout hook", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const hook = join(gitRoot, ".git", "hooks", "post-checkout");
+  await writeFile(hook, [
+    "#!/bin/sh",
+    "node -e 'process.stdout.write(\"x\".repeat(1250000))'",
+    "",
+  ].join("\n"));
+  await chmod(hook, 0o755);
+
+  const opened = await context.registry.openWorkspace({ path: gitRoot, mode: "worktree" });
+  assert.equal(await readFile(join(opened.workspace.root, "README.md"), "utf8"), "hello\n");
+});
+
 test("managed worktree reservation retries collisions without touching existing files", async (t) => {
   const context = await fixture(t);
   const gitRoot = await createGitProject(context.root);
