@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, copyFile, lstat, mkdtemp, mkdir, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdtemp, mkdir, readFile, readdir, rename, rm, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import { platform, tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 import Database from "better-sqlite3";
 import { loadConfig, type ServerConfig } from "./config.js";
-import { GitWorktreeError } from "./git-worktrees.js";
+import { GitWorktreeError, verifyManagedWorktreeVolumeSync } from "./git-worktrees.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 import { writeTestDevspaceConfig } from "./test-support/config.test.js";
@@ -76,6 +77,222 @@ test("opening a missing checkout creates its workspace root", async (t) => {
   const opened = await context.registry.openWorkspace(missingRoot);
   assert.equal(opened.workspace.root, missingRoot);
   assert.equal((await stat(missingRoot)).isDirectory(), true);
+});
+
+test("protected SSD checkout refuses to create a host fallback when its mount is missing", async (t) => {
+  const context = await fixture(t);
+  const missingMount = join(context.root, "disconnected-external-ssd");
+  const checkout = join(missingMount, "Developer", "new-project");
+  const config = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "checkout-offline-config"),
+    { server: { port: 1 }, workspaces: {
+      allowedRoots: [context.root], worktreeRoot: join(missingMount, "Worktrees"),
+      requireExistingWorktreeRoot: true,
+      managedWorktreeMountPoint: missingMount,
+      managedWorktreeVolumeUuid: "00000000-0000-0000-0000-000000000000",
+    } },
+  ));
+
+  await assert.rejects(
+    () => new WorkspaceRegistry(config).openWorkspace(checkout),
+    /configured mounted encrypted APFS volume|protected checkout volume/i,
+  );
+  await assert.rejects(stat(missingMount), { code: "ENOENT" });
+});
+
+test("protected SSD checkout rejects an existing directory on the wrong physical volume", async (t) => {
+  const context = await fixture(t);
+  const hostMount = join(context.root, "host-fallback-dir");
+  const checkout = join(hostMount, "Developer", "project");
+  await mkdir(checkout, { recursive: true });
+  const sentinel = join(checkout, "preserve-existing-data.txt");
+  await writeFile(sentinel, "untouched\n");
+  const config = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "checkout-wrong-volume-config"),
+    { server: { port: 1 }, workspaces: {
+      allowedRoots: [context.root], worktreeRoot: join(hostMount, "Worktrees"),
+      requireExistingWorktreeRoot: true,
+      managedWorktreeMountPoint: hostMount,
+      managedWorktreeVolumeUuid: "00000000-0000-0000-0000-000000000000",
+    } },
+  ));
+
+  await assert.rejects(
+    () => new WorkspaceRegistry(config).openWorkspace(checkout),
+    /configured mounted encrypted APFS volume|protected checkout volume/i,
+  );
+  assert.equal(await readFile(sentinel, "utf8"), "untouched\n");
+});
+
+test("a checkout symlink alias cannot bypass a configured protected SSD mount", { skip: platform() === "win32" }, async (t) => {
+  const context = await fixture(t);
+  const hostMount = join(context.root, "host-dir-impersonating-ssd");
+  const alias = join(context.root, "checkout-volume-alias");
+  const checkout = join(hostMount, "Developer", "project");
+  await mkdir(checkout, { recursive: true });
+  await symlink(hostMount, alias, "dir");
+  const config = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "checkout-aliased-offline-config"),
+    { server: { port: 1 }, workspaces: {
+      allowedRoots: [context.root], worktreeRoot: join(hostMount, "Worktrees"),
+      requireExistingWorktreeRoot: true,
+      managedWorktreeMountPoint: hostMount,
+      managedWorktreeVolumeUuid: "00000000-0000-0000-0000-000000000000",
+    } },
+  ));
+
+  await assert.rejects(
+    () => new WorkspaceRegistry(config).openWorkspace(join(alias, "Developer", "project")),
+    /protected checkout volume/i,
+  );
+  assert.equal((await stat(checkout)).isDirectory(), true);
+});
+
+test("opt-in real encrypted SSD checkout retains its UUID across cache and restart", async (t) => {
+  const mount = process.env.DEVSPACE_TEST_SSD_MOUNT_POINT;
+  const uuid = process.env.DEVSPACE_TEST_SSD_VOLUME_UUID;
+  if (platform() !== "darwin" || !mount || !uuid) {
+    t.skip("Requires explicitly configured real encrypted APFS SSD test volume");
+    return;
+  }
+
+  const context = await fixture(t);
+  const scratch = join(mount, "Scratch");
+  const config = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "checkout-real-ssd-config"),
+    { server: { port: 1 }, workspaces: {
+      allowedRoots: [scratch], worktreeRoot: join(mount, "Worktrees"),
+      requireExistingWorktreeRoot: true,
+      managedWorktreeMountPoint: mount,
+      managedWorktreeVolumeUuid: uuid,
+    }, skills: { agentDir: context.agentDir } },
+  ));
+  verifyManagedWorktreeVolumeSync(config);
+  assert.equal((await stat(scratch)).dev, (await stat(mount)).dev);
+
+  const checkout = await mkdtemp(join(scratch, ".devspace-checkout-volume-test-"));
+  t.after(async () => { await rmdir(checkout); });
+  const store = new SqliteWorkspaceStore(join(context.root, "checkout-real-ssd-store"));
+  try {
+    const registry = new WorkspaceRegistry(config, store);
+    const opened = await registry.openWorkspace(checkout);
+    assert.equal(store.getSession(opened.workspace.id)?.rootVolumeUuid?.toUpperCase(), uuid.toUpperCase());
+    assert.equal(registry.getWorkspace(opened.workspace.id).root, checkout);
+    assert.equal(new WorkspaceRegistry(config, store).getWorkspace(opened.workspace.id).root, checkout);
+
+    config.managedWorktreeVolumeUuid = "00000000-0000-0000-0000-000000000000";
+    assert.throws(() => registry.getWorkspace(opened.workspace.id), /protected checkout volume/i);
+    assert.throws(() => new WorkspaceRegistry(config, store).getWorkspace(opened.workspace.id),
+      /protected checkout volume/i);
+  } finally {
+    store.close();
+  }
+});
+
+test("a verified removable SSD checkout still never auto-creates a missing directory", async (t) => {
+  const mount = process.env.DEVSPACE_TEST_SSD_MOUNT_POINT;
+  const uuid = process.env.DEVSPACE_TEST_SSD_VOLUME_UUID;
+  if (platform() !== "darwin" || !mount || !uuid) {
+    t.skip("Requires explicitly configured real encrypted APFS SSD test volume");
+    return;
+  }
+  const context = await fixture(t);
+  const scratch = join(mount, "Scratch");
+  const config = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "checkout-no-auto-mkdir-config"),
+    { server: { port: 1 }, workspaces: {
+      allowedRoots: [scratch], worktreeRoot: join(mount, "Worktrees"),
+      requireExistingWorktreeRoot: true, managedWorktreeMountPoint: mount,
+      managedWorktreeVolumeUuid: uuid,
+    }, skills: { agentDir: context.agentDir } },
+  ));
+  verifyManagedWorktreeVolumeSync(config);
+  assert.equal((await stat(scratch)).dev, (await stat(mount)).dev);
+
+  const missingCheckout = join(scratch, `.checkout-not-created-${randomBytes(8).toString("hex")}`);
+  t.after(async () => {
+    try { await rmdir(missingCheckout); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  });
+  await assert.rejects(
+    () => new WorkspaceRegistry(config).openWorkspace(missingCheckout),
+    /protected checkout volume|ENOENT|no such file/i,
+  );
+  await assert.rejects(stat(missingCheckout), { code: "ENOENT" });
+});
+
+test("protected SSD checkout rejects a path symlinked onto an internal disk", async (t) => {
+  const mount = process.env.DEVSPACE_TEST_SSD_MOUNT_POINT;
+  const uuid = process.env.DEVSPACE_TEST_SSD_VOLUME_UUID;
+  if (platform() !== "darwin" || !mount || !uuid) {
+    t.skip("Requires explicitly configured real encrypted APFS SSD test volume");
+    return;
+  }
+  const context = await fixture(t);
+  const scratch = join(mount, "Scratch");
+  const config = loadConfig(writeTestDevspaceConfig(
+    join(context.root, "checkout-ssd-symlink-escape-config"),
+    { server: { port: 1 }, workspaces: {
+      allowedRoots: [scratch, context.root], worktreeRoot: join(mount, "Worktrees"),
+      requireExistingWorktreeRoot: true, managedWorktreeMountPoint: mount,
+      managedWorktreeVolumeUuid: uuid,
+    }, skills: { agentDir: context.agentDir } },
+  ));
+  verifyManagedWorktreeVolumeSync(config);
+  assert.equal((await stat(scratch)).dev, (await stat(mount)).dev);
+
+  const alias = join(scratch, `.checkout-wrong-device-${randomBytes(8).toString("hex")}`);
+  await symlink(context.root, alias, "dir");
+  t.after(async () => { await unlink(alias); });
+  await assert.rejects(
+    () => new WorkspaceRegistry(config).openWorkspace(alias),
+    /protected checkout volume/i,
+  );
+  assert.equal((await stat(context.root)).isDirectory(), true);
+});
+
+test("cached and restored checkout sessions revalidate an enabled protected SSD volume", async (t) => {
+  const context = await fixture(t);
+  const fakeMount = join(context.root, "host-mount-for-session");
+  const checkout = join(fakeMount, "Developer", "project");
+  await mkdir(checkout, { recursive: true });
+  const store = new SqliteWorkspaceStore(join(context.root, "checkout-volume-store"));
+  try {
+    const registry = new WorkspaceRegistry(context.config, store);
+    const opened = await registry.openWorkspace(checkout);
+    assert.equal(registry.getWorkspace(opened.workspace.id).root, checkout);
+
+    context.config.managedWorktreeMountPoint = fakeMount;
+    context.config.managedWorktreeVolumeUuid = "00000000-0000-0000-0000-000000000000";
+    context.config.worktreeRoot = join(fakeMount, "Worktrees");
+    context.config.requireExistingWorktreeRoot = true;
+
+    assert.throws(() => registry.getWorkspace(opened.workspace.id),
+      /configured mounted encrypted APFS volume|protected checkout volume/i);
+    assert.throws(() => new WorkspaceRegistry(context.config, store)
+      .getWorkspace(opened.workspace.id),
+    /configured mounted encrypted APFS volume|protected checkout volume/i);
+  } finally {
+    store.close();
+  }
+});
+
+test("a stored volume-bound checkout cannot be restored after its guard is removed", async (t) => {
+  const context = await fixture(t);
+  const checkout = join(context.root, "historical-ssd-checkout");
+  await mkdir(checkout);
+  const store = new SqliteWorkspaceStore(join(context.root, "bound-checkout-store"));
+  try {
+    store.createSession({
+      id: "checkout_bound_test", root: checkout, mode: "checkout", managed: false,
+      rootVolumeUuid: "11111111-1111-1111-1111-111111111111",
+    });
+    assert.throws(() => new WorkspaceRegistry(context.config, store)
+      .getWorkspace("checkout_bound_test"), /protected checkout volume|unverified checkout volume/i);
+  } finally {
+    store.close();
+  }
 });
 
 test("worktree opens require Git and create an isolated managed workspace", async (t) => {
