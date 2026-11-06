@@ -37,6 +37,11 @@ const migrations: Migration[] = [
     name: "local-agent-effort-rename",
     up: migrateLocalAgentEffortRename,
   },
+  {
+    version: 7,
+    name: "workspace-root-identity",
+    up: migrateWorkspaceRootIdentity,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -233,6 +238,14 @@ function migrateLocalAgentEffortRename(sqlite: Database.Database): void {
     return;
   }
   sqlite.exec("alter table local_agent_sessions rename column thinking to effort");
+}
+
+function migrateWorkspaceRootIdentity(sqlite: Database.Database): void {
+  // All existing sessions predate trustworthy recorded inode/volume identity;
+  // they remain NULL and must be validated against the Git admin backlink.
+  // Never silently backfill them from their current filesystem path.
+  addColumnIfMissing(sqlite, "workspace_sessions", "root_inode", "text");
+  addColumnIfMissing(sqlite, "workspace_sessions", "root_volume_uuid", "text");
 }
 
 function addColumnIfMissing(

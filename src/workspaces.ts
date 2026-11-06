@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
-import { realpathSync, type Stats } from "node:fs";
+import { lstatSync, readFileSync, realpathSync, statSync, type Stats } from "node:fs";
+import { platform } from "node:os";
 import type {
   WorkspaceConversationBinding,
   WorkspaceMode,
@@ -9,7 +10,7 @@ import { mkdir, opendir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
-import { createManagedWorktree } from "./git-worktrees.js";
+import { createManagedWorktree, verifyManagedWorktreeVolumeSync } from "./git-worktrees.js";
 import {
   AccessDeniedError,
   assertAllowedPath,
@@ -51,6 +52,8 @@ export interface Workspace {
   id: string;
   root: string;
   canonicalRoot: string;
+  rootDevice: number;
+  rootInode: number;
   mode: WorkspaceMode;
   sourceRoot?: string;
   worktree?: WorkspaceWorktree;
@@ -250,7 +253,21 @@ export class WorkspaceRegistry {
       // A cached ID is not a permanent filesystem authorization. Recheck the
       // configured roots before using a checkout that may have been replaced.
       this.assertWorkspaceRootAllowed(workspace.root, workspace.mode, workspace.sourceRoot);
+      // The same device/inode can be observed again after a volume is
+      // remounted. For opt-in SSD-managed worktrees, revalidate the actual
+      // encrypted APFS UUID on every cache hit, not just at session restore.
+      // Legacy roots retain their separate Git-backlink recovery policy.
+      if (workspace.mode === "worktree" && workspace.worktree?.managed
+          && isPathInsideRoot(workspace.root, this.config.worktreeRoot)
+          && (this.config.managedWorktreeMountPoint || this.config.managedWorktreeVolumeUuid)) {
+        verifyManagedWorktreeVolumeSync(this.config);
+      }
       this.assertWorkspaceRootUnchanged(workspace);
+      // An unchanged directory inode does not guarantee its .git metadata
+      // still belongs to the original managed source repository.
+      if (workspace.mode === "worktree" && workspace.worktree?.managed) {
+        assertManagedGitWorktreeBacklink(workspace.root, workspace.sourceRoot);
+      }
       this.store?.touchSession(workspaceId);
       return workspace;
     }
@@ -268,10 +285,14 @@ export class WorkspaceRegistry {
       session.mode,
       session.sourceRoot,
     );
+    this.assertRestoredWorkspaceIdentity(session, root, canonicalRoot);
+    const restoredRootStats = statSync(canonicalRoot);
     const restoredWorkspace: Workspace = {
       id: session.id,
       root,
       canonicalRoot,
+      rootDevice: restoredRootStats.dev,
+      rootInode: restoredRootStats.ino,
       mode: session.mode,
       sourceRoot: session.sourceRoot,
       worktree:
@@ -381,10 +402,13 @@ export class WorkspaceRegistry {
     sourceRoot?: string;
     worktree?: WorkspaceWorktree;
   }): Promise<WorkspaceContext> {
+    const initialRootStats = statSync(input.canonicalRoot);
     const workspace: Workspace = {
       id: `ws_${randomBytes(5).toString("hex")}`,
       root: input.root,
       canonicalRoot: input.canonicalRoot,
+      rootDevice: initialRootStats.dev,
+      rootInode: initialRootStats.ino,
       mode: input.mode,
       sourceRoot: input.sourceRoot,
       worktree: input.worktree,
@@ -401,6 +425,12 @@ export class WorkspaceRegistry {
       baseRef: workspace.worktree?.baseRef,
       baseSha: workspace.worktree?.baseSha,
       managed: workspace.worktree?.managed,
+      rootInode: statSync(input.canonicalRoot, { bigint: true }).ino.toString(),
+      rootVolumeUuid: input.mode === "worktree"
+        && input.worktree?.managed
+        && isPathInsideRoot(input.root, this.config.worktreeRoot)
+        ? this.config.managedWorktreeVolumeUuid || undefined
+        : undefined,
     });
     this.workspaces.set(workspace.id, workspace);
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
@@ -429,7 +459,10 @@ export class WorkspaceRegistry {
         throw new Error(`Stored worktree workspace is missing sourceRoot: ${root}`);
       }
       assertAllowedPath(sourceRoot, this.config.allowedRoots);
-      return assertAllowedPath(root, [this.config.worktreeRoot]);
+      return assertAllowedPath(root, [
+        this.config.worktreeRoot,
+        ...this.config.legacyWorktreeRoots,
+      ]);
     }
 
     return assertAllowedPath(root, this.config.allowedRoots);
@@ -445,7 +478,10 @@ export class WorkspaceRegistry {
         throw new Error(`Stored worktree workspace is missing sourceRoot: ${root}`);
       }
       assertAllowedPath(sourceRoot, this.config.allowedRoots);
-      assertAllowedPath(root, [this.config.worktreeRoot]);
+      assertAllowedPath(root, [
+        this.config.worktreeRoot,
+        ...this.config.legacyWorktreeRoots,
+      ]);
     }
 
     try {
@@ -455,16 +491,52 @@ export class WorkspaceRegistry {
     }
   }
 
+  private assertRestoredWorkspaceIdentity(
+    session: NonNullable<ReturnType<WorkspaceStore["getSession"]>>,
+    root: string,
+    canonicalRoot: string,
+  ): void {
+    const currentInode = statSync(canonicalRoot, { bigint: true }).ino.toString();
+    if (session.rootInode && session.rootInode !== currentInode) {
+      throw new AccessDeniedError(`Workspace root changed after it was opened: ${root}`);
+    }
+    if (session.mode !== "worktree" || !session.managed) return;
+
+    const isNewRoot = isPathInsideRoot(root, this.config.worktreeRoot);
+    const configuredUuid = this.config.managedWorktreeVolumeUuid;
+    const requiresVolume = Boolean(
+      this.config.managedWorktreeMountPoint || configuredUuid || session.rootVolumeUuid,
+    );
+    if (isNewRoot && requiresVolume) {
+      // Old sessions must never be rebound to a new physical SSD merely
+      // because the filesystem currently happens to have the same path.
+      if (!session.rootVolumeUuid
+          || session.rootVolumeUuid.toUpperCase() !== configuredUuid.toUpperCase()) {
+        throw new AccessDeniedError(`Unverified managed worktree volume identity: ${root}`);
+      }
+      verifyManagedWorktreeVolumeSync(this.config);
+    } else if (session.rootVolumeUuid) {
+      // A session once bound to an encrypted volume may not be restored with
+      // the volume guard removed or with a different configured root.
+      throw new AccessDeniedError(`Unverified managed worktree volume identity: ${root}`);
+    }
+    assertManagedGitWorktreeBacklink(root, session.sourceRoot);
+  }
+
   private assertWorkspaceRootUnchanged(workspace: Workspace): void {
     let currentRoot: string;
+    let currentRootStats: Stats;
     try {
       currentRoot = realpathSync(workspace.root);
+      currentRootStats = statSync(currentRoot);
     } catch {
       throw new AccessDeniedError(
         `Workspace root is no longer accessible: ${workspace.root}`,
       );
     }
-    if (currentRoot !== workspace.canonicalRoot) {
+    if (currentRoot !== workspace.canonicalRoot
+        || currentRootStats.dev !== workspace.rootDevice
+        || currentRootStats.ino !== workspace.rootInode) {
       throw new AccessDeniedError(
         `Workspace root changed after it was opened: ${workspace.root}`,
       );
@@ -521,6 +593,77 @@ export class WorkspaceRegistry {
 
     return discovered.sort((a, b) => a.path.localeCompare(b.path));
   }
+}
+
+/** A legacy worktree without persisted inode has to prove it still belongs
+ *  to the original source Git repository. This checks only Git admin pointer
+ *  metadata; it never reads or changes the worktree's user files.
+ */
+function assertManagedGitWorktreeBacklink(root: string, sourceRoot: string | undefined): void {
+  const rejected = (stage: string): never => {
+    throw new AccessDeniedError(`Unverified managed Git worktree (${stage}) at the original path: ${root}`);
+  };
+  if (!sourceRoot) return rejected("SOURCE_MISSING");
+  try {
+    const pointerPath = join(root, ".git");
+    const pointerStats = lstatSync(pointerPath);
+    if (!pointerStats.isFile() || pointerStats.isSymbolicLink() || pointerStats.size > 4096) rejected("WORKTREE_POINTER_TYPE");
+    const content = readFileSync(pointerPath, "utf8").trim();
+    if (!content.startsWith("gitdir: ")) rejected("WORKTREE_POINTER_FORMAT");
+    const gitAdmin = realpathSync(resolve(root, content.slice(8)));
+    const sourcePointerPath = join(sourceRoot, ".git");
+    const sourcePointerStats = lstatSync(sourcePointerPath);
+    if (sourcePointerStats.isSymbolicLink()) rejected("SOURCE_POINTER_SYMLINK");
+    let sourceGitDir: string;
+    if (sourcePointerStats.isDirectory()) {
+      sourceGitDir = realpathSync(sourcePointerPath);
+    } else if (sourcePointerStats.isFile() && sourcePointerStats.size <= 4096) {
+      // Historical nested managed worktrees may use another linked worktree
+      // as their source. Follow its Git admin `commondir` back to the real
+      // object store instead of requiring sourceRoot/.git to be a directory.
+      const sourceLink = readFileSync(sourcePointerPath, "utf8").trim();
+      if (!sourceLink.startsWith("gitdir: ")) rejected("SOURCE_POINTER_FORMAT");
+      const sourceAdmin = realpathSync(resolve(sourceRoot, sourceLink.slice(8)));
+      const sourceBack = readFileSync(join(sourceAdmin, "gitdir"), "utf8").trim();
+      if (!sameGitPathIdentity(sourceBack, sourcePointerPath)) rejected("SOURCE_BACKLINK");
+      const commonRelative = readFileSync(join(sourceAdmin, "commondir"), "utf8").trim();
+      if (!commonRelative || commonRelative.length > 4096) rejected("SOURCE_COMMONDIR_FORMAT");
+      sourceGitDir = realpathSync(resolve(sourceAdmin, commonRelative));
+      if (!lstatSync(sourceGitDir).isDirectory()
+          || !gitAdminInsideRoot(sourceAdmin, join(sourceGitDir, "worktrees"))) return rejected("SOURCE_COMMONDIR_IDENTITY");
+    } else {
+      return rejected("SOURCE_POINTER_TYPE");
+    }
+    const adminRoot = join(sourceGitDir, "worktrees");
+    if (!gitAdminInsideRoot(gitAdmin, adminRoot)
+        || !lstatSync(gitAdmin).isDirectory()) rejected("WORKTREE_ADMIN_IDENTITY");
+    const backPointer = readFileSync(join(gitAdmin, "gitdir"), "utf8").trim();
+    // macOS may report the same directory through /var and /private/var.
+    // Compare physical pointer paths, not the spelling Git used at creation.
+    if (!sameGitPathIdentity(backPointer, pointerPath)) rejected("WORKTREE_BACKLINK");
+  } catch (error) {
+    if (error instanceof AccessDeniedError) throw error;
+    rejected("METADATA_UNREADABLE");
+  }
+}
+
+/** Windows Git may store 8.3/long-path aliases for the same NTFS object.
+ *  Keep Unix canonical-path equality; accept the same nonzero physical file
+ *  identity on Windows only, never a name-only or zero-inode match.
+ */
+function sameGitPathIdentity(first: string, second: string): boolean {
+  if (realpathSync(first) === realpathSync(second)) return true;
+  if (platform() !== "win32") return false;
+  const left = statSync(first, { bigint: true });
+  const right = statSync(second, { bigint: true });
+  return left.ino !== 0n && left.ino === right.ino && left.dev === right.dev;
+}
+
+function gitAdminInsideRoot(admin: string, root: string): boolean {
+  if (admin !== root && isPathInsideRoot(admin, root)) return true;
+  // Physical parent equality accepts Windows 8.3 aliases while keeping the
+  // Git admin at exactly one child level of its verified common-dir/worktrees.
+  return platform() === "win32" && sameGitPathIdentity(dirname(admin), root);
 }
 
 async function canonicalPath(path: string): Promise<string> {

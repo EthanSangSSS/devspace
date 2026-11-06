@@ -36,6 +36,11 @@ Run `devspace init` to create both files. `devspace config set publicBaseUrl
   "workspaces": {
     "allowedRoots": ["~/personal", "~/work"],
     "worktreeRoot": "~/.devspace/worktrees",
+    "legacyWorktreeRoots": [],
+    "requireExistingWorktreeRoot": false,
+    "managedWorktreeSourceRoots": [],
+    "managedWorktreeMountPoint": "",
+    "managedWorktreeVolumeUuid": "",
   },
   "storage": {
     "stateDir": "~/.local/share/devspace",
@@ -79,6 +84,97 @@ Run `devspace init` to create both files. `devspace config set publicBaseUrl
 Omitted sections and keys use the defaults shown above. An empty
 `workspaces.allowedRoots` uses the current working directory. Unknown keys are
 rejected so spelling mistakes cannot silently alter behavior.
+
+### Moving managed worktrees without breaking older sessions
+
+`workspaces.worktreeRoot` is the destination for **new** managed worktrees.
+Changing it does not relocate old worktrees or rewrite persisted workspace
+session records. Add the previous root to `legacyWorktreeRoots` when changing
+the preferred destination, so already-stored managed sessions remain readable:
+
+```jsonc
+{
+  "workspaces": {
+    "allowedRoots": ["~/projects", "/Volumes/DevSSD/Developer"],
+    "worktreeRoot": "/Volumes/DevSSD/Worktrees",
+    "legacyWorktreeRoots": ["~/.devspace/worktrees"],
+    "requireExistingWorktreeRoot": true,
+    "managedWorktreeMountPoint": "/Volumes/DevSSD",
+    "managedWorktreeVolumeUuid": "00000000-0000-0000-0000-000000000000",
+    "managedWorktreeSourceRoots": [
+      "/Volumes/DevSSD/Developer/devspace-mcp-session-reliability-v1-1",
+      "/Volumes/DevSSD/Developer/app-legal-docs"
+    ]
+  }
+}
+```
+
+Legacy roots authorize persisted managed workspace access; they are **not**
+destinations for new managed worktrees. With `requireExistingWorktreeRoot=true`,
+an unavailable directory or a symlink at the configured new root causes new
+worktree creation to fail rather than creating a fallback directory.
+
+On macOS, replace the example all-zero UUID above with the **actual UUID** of
+the intended encrypted APFS volume as reported by `diskutil info -plist`.
+When `managedWorktreeMountPoint` and `managedWorktreeVolumeUuid` are both set,
+new worktree creation checks the exact volume UUID, mount point, APFS type,
+encryption (`FileVault` flag), writable status, and that the configured
+worktree directory resides on the mounted volume rather than the host disk.
+If either field is missing, the other does not grant permission: new worktree
+creation fails closed. Both fields default to empty to preserve current
+configurations, which means volume identity checking is **opt-in**. This
+guard requires macOS; non-macOS systems reject the opt-in settings.
+`requireExistingWorktreeRoot` must also be enabled. The check occurs before
+`git worktree add`, but it cannot eliminate all filesystem hot-unplug races;
+maintain backups and verify a stable physical connection.
+
+**Restart and persisted-session safety:** DevSpace also checks the configured
+mount UUID before restoring a saved managed workspace located under the **new**
+`worktreeRoot`. Sessions created with this opt-in guard remember their expected
+volume UUID and original directory inode in the state database. After a server
+restart, an unexpectedly replaced directory or an incorrect/missing encrypted
+APFS volume causes session restoration to **fail closed**, without creating,
+remapping or deleting any worktree files. A matching UUID can safely be
+accepted even if macOS assigned a different `st_dev` after remounting; directory
+inode and Git worktree links must still match.
+
+Database migration v7 adds nullable `workspace_sessions.root_inode` and
+`workspace_sessions.root_volume_uuid`. It never guesses physical identity for
+pre-existing session rows. Historical managed worktrees are instead checked
+against their source repository's Git admin directory **and its reverse
+`gitdir` backlink**, including sources that are themselves linked worktrees.
+Missing directories, inconsistent Git links or a new-root session without its
+original expected volume identity are not recreated or silently rebound.
+Old checkout sessions are retained for compatibility.
+
+This is a conservative filesystem/Git identity check, **not cryptographic
+attestation**: a legacy session with no recorded inode cannot distinguish a
+perfectly forged working-tree copy with equivalent Git metadata. Nor can it
+eliminate filesystem races between verification and subsequent file access.
+Back up the existing state database, confirm the volume UUID, test legacy
+session restoration on an isolated instance, and preserve rollback capability
+**before** installing the new binary: startup migrates the database schema.
+
+Do not delete or move old worktrees until their active sessions and
+uncommitted changes are independently accounted for. The global configuration
+change also affects sources outside the external volume; validate the backup
+allowlist before creating worktrees from those repositories.
+
+`managedWorktreeSourceRoots` restricts **new managed worktree creation** to
+the listed **exact Git repository roots** (without changing general checkout
+access or historical workspace recovery). The empty default retains v1.1
+behavior. For an SSD-only development cutover, list each approved repository
+under the verified SSD Developer directory **individually**, and keep that
+list synchronized with the local backup allowlist. Listing the parent
+`/Volumes/DevSSD/Developer` does *not* grant access to its children. This
+prevents snapshot-only or unprotected Git sources from gaining automatic
+worktree access through an overly broad parent. A new project needs separate
+source and backup authorization before using managed worktree mode.
+
+If Git fails to create a new managed worktree, DevSpace leaves any remaining
+target directory in place rather than recursively removing files whose
+ownership cannot be established. Inspect the resulting path before explicit
+cleanup; this intentionally favors preserving user data over automatic cleanup.
 
 `server.mcpSessionIdleTimeoutMs` applies only after a session has no in-flight
 requests. The cleanup timer never expires an active tool call or active MCP
