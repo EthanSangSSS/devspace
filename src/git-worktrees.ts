@@ -12,6 +12,33 @@ import { gitEnvironment } from "./git-environment.js";
 
 const execFileAsync = promisify(execFile);
 
+// The child checks the directory it actually entered before launching Git.
+// Git then checks out "." relative to that bound cwd, never via a mutable
+// absolute reservation pathname. No shell expansion or new runtime dependency.
+const PINNED_WORKTREE_CHECKOUT = String.raw`
+const fs = require("node:fs");
+const path = require("node:path");
+const cp = require("node:child_process");
+const [gitDir, sha, expectedDev, expectedIno, root] = process.argv.slice(1);
+const current = fs.statSync(".", { bigint: true });
+if (current.dev.toString() !== expectedDev || current.ino.toString() !== expectedIno
+    || path.dirname(fs.realpathSync(".")) !== fs.realpathSync(root)) {
+  process.stderr.write("Reserved managed worktree directory changed before checkout.\n");
+  process.exit(125);
+}
+const result = cp.spawnSync("git", ["worktree", "add", "--detach", ".", sha], {
+  encoding: "utf8",
+  env: { ...process.env, GIT_DIR: gitDir },
+});
+if (result.stdout) process.stdout.write(result.stdout);
+if (result.stderr) process.stderr.write(result.stderr);
+if (result.error) {
+  process.stderr.write(String(result.error) + "\n");
+  process.exit(127);
+}
+process.exit(result.status ?? 1);
+`;
+
 export class GitWorktreeError extends Error {
   constructor(
     readonly code:
@@ -69,6 +96,28 @@ export async function reserveManagedWorktreePath(input: {
   }
 
   throw new GitWorktreeError("GIT_WORKTREE_CREATE_FAILED", "Could not reserve a unique managed worktree path.");
+}
+
+/** Run Git against a child cwd verified by inode, not the mutable target path. */
+export async function checkoutPinnedWorktree(input: {
+  sourceRoot: string;
+  worktreeRoot: string;
+  worktreePath: string;
+  baseSha: string;
+  expectedDev: string;
+  expectedIno: string;
+}): Promise<void> {
+  const commonGitDir = (await git(
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"], input.sourceRoot,
+  )).trim();
+  await execFileAsync(process.execPath, [
+    "--input-type=commonjs", "-e", PINNED_WORKTREE_CHECKOUT,
+    commonGitDir, input.baseSha, input.expectedDev, input.expectedIno, input.worktreeRoot,
+  ], {
+    cwd: input.worktreePath,
+    env: gitEnvironment(),
+    maxBuffer: 10 * 1024 * 1024,
+  });
 }
 
 export async function createManagedWorktree(input: {
@@ -151,11 +200,30 @@ export async function createManagedWorktree(input: {
   assertAllowedPath(worktreePath, [input.config.worktreeRoot]);
 
   try {
-    await git(["worktree", "add", "--detach", worktreePath, baseSha], sourceRoot);
+    const reserved = await lstat(worktreePath, { bigint: true });
+    if (!reserved.isDirectory() || reserved.isSymbolicLink()) {
+      throw new Error("Reserved managed worktree directory was replaced before checkout.");
+    }
+    await checkoutPinnedWorktree({
+      sourceRoot,
+      worktreeRoot: input.config.worktreeRoot,
+      worktreePath,
+      baseSha,
+      expectedDev: reserved.dev.toString(),
+      expectedIno: reserved.ino.toString(),
+    });
+    const checkedOut = await lstat(worktreePath, { bigint: true });
+    if (!checkedOut.isDirectory() || checkedOut.isSymbolicLink()
+        || checkedOut.dev !== reserved.dev || checkedOut.ino !== reserved.ino) {
+      throw new Error("Reserved managed worktree directory changed during checkout.");
+    }
   } catch (error) {
     // DevSpace never removes the reserved pathname: it may have been replaced
     // while Git ran. Git's own failed-checkout cleanup is outside our control.
-    const message = error instanceof Error ? error.message : String(error);
+    const stderr = typeof error === "object" && error && "stderr" in error
+      ? String((error as { stderr?: unknown }).stderr ?? "").trim()
+      : "";
+    const message = stderr || (error instanceof Error ? error.message : String(error));
     throw new GitWorktreeError(
       "GIT_WORKTREE_CREATE_FAILED",
       `Git failed to create the managed worktree. ${message}`
