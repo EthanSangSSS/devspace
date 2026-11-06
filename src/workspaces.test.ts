@@ -201,6 +201,33 @@ test("failed Git worktree creation retains its reservation without deleting anyt
   assert.equal((await stat(join(context.config.worktreeRoot, paths[0]!))).isDirectory(), true);
 });
 
+test("checkout-stage failure never promises Git left its worktree target in place", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  await writeFile(join(gitRoot, ".gitattributes"), "README.md filter=checkout-fail\n");
+  await git(gitRoot, ["add", ".gitattributes"]);
+  await git(gitRoot, ["commit", "-m", "Require failing checkout filter"]);
+  await git(gitRoot, ["config", "filter.checkout-fail.clean", "cat"]);
+  await git(gitRoot, ["config", "filter.checkout-fail.smudge", "false"]);
+  await git(gitRoot, ["config", "filter.checkout-fail.required", "true"]);
+
+  await assert.rejects(
+    () => context.registry.openWorkspace({ path: gitRoot, mode: "worktree" }),
+    (error: unknown) =>
+      error instanceof GitWorktreeError
+      && error.code === "GIT_WORKTREE_CREATE_FAILED"
+      && /smudge filter '?checkout-fail'? failed/.test(error.message)
+      && /DevSpace did not delete the target/.test(error.message)
+      && /Git may have removed it/.test(error.message),
+  );
+  assert.equal(await readFile(join(gitRoot, "README.md"), "utf8"), "hello\n");
+  const remaining = await readdir(context.config.worktreeRoot);
+  assert.ok(remaining.length <= 1, "Git may retain or clean up its own failed checkout");
+  for (const entry of remaining) {
+    assert.match(entry, /^git-project-[a-f0-9]{24}$/);
+  }
+});
+
 test("persisted checkout and worktree sessions restore after recreating the registry", async (t) => {
   const context = await fixture(t);
   const gitRoot = await createGitProject(context.root);

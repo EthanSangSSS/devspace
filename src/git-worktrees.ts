@@ -104,14 +104,14 @@ export async function createManagedWorktree(input: {
   try {
     await git(["worktree", "add", "--detach", worktreePath, baseSha], sourceRoot);
   } catch (error) {
-    // Do not unlink by pathname after a separate identity check: another
-    // process could replace the directory between that check and the unlink.
-    // Preserve even an empty reservation for explicit, verified recovery.
+    // DevSpace does not remove this directory: pathname-based cleanup can
+    // race replacement. Git may clean up its own checkout on failure, so
+    // callers must verify the destination's current state before recovery.
     const message = error instanceof Error ? error.message : String(error);
     throw new GitWorktreeError(
       "GIT_WORKTREE_CREATE_FAILED",
       `Git failed to create the managed worktree. ${message}`
-        + ` The reserved worktree path was retained for inspection: ${worktreePath}`,
+        + ` DevSpace did not delete the target ${worktreePath}; Git may have removed it. Inspect before recovery.`,
     );
   }
 

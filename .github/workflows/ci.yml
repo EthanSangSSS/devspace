@@ -15,16 +15,20 @@ concurrency:
 
 jobs:
   smoke:
-    name: Smoke (${{ matrix.os }})
+    # Branch protection requires stable check contexts, independent of runner pins.
+    name: Smoke (${{ matrix.check_name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-24.04
-          - macos-latest
-          - windows-latest
+        include:
+          - os: ubuntu-24.04
+            check_name: ubuntu-latest
+          - os: macos-latest
+            check_name: macos-latest
+          - os: windows-latest
+            check_name: windows-latest
 
     env:
       DEVSPACE_OAUTH_OWNER_TOKEN: ci-owner-token-that-is-long-enough
