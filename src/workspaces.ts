@@ -260,11 +260,17 @@ export class WorkspaceRegistry {
    *  Each protected checkout lookup verifies its volume asynchronously, then
    *  performs the usual synchronous filesystem/inode checks on this request.
    */
-  async getWorkspaceForTool(workspaceId: string): Promise<Workspace> {
+  async getWorkspaceForTool(
+    workspaceId: string,
+    options: { touchSession?: boolean } = {},
+  ): Promise<Workspace> {
+    const touchSession = options.touchSession !== false;
     const existing = this.workspaces.get(workspaceId) ?? this.store?.getSession(workspaceId);
-    if (existing?.mode !== "checkout") return this.getWorkspace(workspaceId);
+    if (existing?.mode !== "checkout") {
+      return this.getWorkspaceVerified(workspaceId, undefined, touchSession);
+    }
     const proof = await this.verifyCheckoutMountForOperation(existing.root);
-    return this.getWorkspaceVerified(workspaceId, proof);
+    return this.getWorkspaceVerified(workspaceId, proof, touchSession);
   }
 
   private async verifyCheckoutMountForOperation(
@@ -291,6 +297,7 @@ export class WorkspaceRegistry {
   private getWorkspaceVerified(
     workspaceId: string,
     verifiedCheckoutMount?: VerifiedCheckoutMount,
+    touchSession = true,
   ): Workspace {
     const workspace = this.workspaces.get(workspaceId);
     if (workspace) {
@@ -317,7 +324,7 @@ export class WorkspaceRegistry {
       if (workspace.mode === "worktree" && workspace.worktree?.managed) {
         assertManagedGitWorktreeBacklink(workspace.root, workspace.sourceRoot);
       }
-      this.store?.touchSession(workspaceId);
+      if (touchSession) this.store?.touchSession(workspaceId);
       return workspace;
     }
 
@@ -363,7 +370,7 @@ export class WorkspaceRegistry {
       agentProfiles: [],
       activatedSkillDirs: new Set(),
     };
-    this.store?.touchSession(workspaceId);
+    if (touchSession) this.store?.touchSession(workspaceId);
     this.workspaces.set(restoredWorkspace.id, restoredWorkspace);
 
     return restoredWorkspace;

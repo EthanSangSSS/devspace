@@ -20,6 +20,45 @@ import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 
 const execFileAsync = promisify(execFile);
 
+test("read-only workspace lookup skips session timestamps on cache hits and cold restores", async (t) => {
+  const context = await fixture(t);
+  const stateDir = join(context.root, "readonly-lookup-store");
+  const store = new SqliteWorkspaceStore(stateDir);
+  const registry = new WorkspaceRegistry(context.config, store);
+  const opened = await registry.openWorkspace(context.root);
+  const workspaceId = opened.workspace.id;
+  const sentinel = "2001-01-01T00:00:00.000Z";
+  const db = new Database(join(stateDir, "devspace.sqlite"));
+  assert.equal(db.prepare("UPDATE workspace_sessions SET last_used_at = ? WHERE id = ?")
+    .run(sentinel, workspaceId).changes, 1);
+  db.close();
+
+  try {
+    assert.equal((await registry.getWorkspaceForTool(workspaceId, {
+      touchSession: false,
+    })).id, workspaceId);
+    assert.equal(store.getSession(workspaceId)?.lastUsedAt, sentinel,
+      "cached lookup must not write session metadata");
+  } finally {
+    store.close();
+  }
+
+  const reopened = new SqliteWorkspaceStore(stateDir);
+  try {
+    const cold = new WorkspaceRegistry(context.config, reopened);
+    assert.equal((await cold.getWorkspaceForTool(workspaceId, {
+      touchSession: false,
+    })).id, workspaceId);
+    assert.equal(reopened.getSession(workspaceId)?.lastUsedAt, sentinel,
+      "restored lookup must not write session metadata");
+    reopened.touchSession(workspaceId);
+    assert.notEqual(reopened.getSession(workspaceId)?.lastUsedAt, sentinel,
+      "ordinary explicit touches must retain their existing persistence");
+  } finally {
+    reopened.close();
+  }
+});
+
 test("a checkout exposes initial and nested instruction context while filtering outside symlinks", async (t) => {
   const context = await fixture(t);
   const opened = await context.registry.openWorkspace(context.root);

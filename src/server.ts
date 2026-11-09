@@ -1027,7 +1027,11 @@ export function createMcpServer(
     },
     async ({ workspaceId, ...input }, { requestId }) => observeToolOperation(config, "read", async () => {
       const startedAt = performance.now();
-      const workspace = await workspaces.getWorkspaceForTool(workspaceId);
+      // File inspection must not update the durable workspace last-used time.
+      // Root, mount UUID, inode and Git backlink checks still run normally.
+      const workspace = await workspaces.getWorkspaceForTool(workspaceId, {
+        touchSession: false,
+      });
       const readPath = workspaces.resolveReadPath(workspace, input.path);
       const response = await readFileTool(
         { ...input, path: readPath.absolutePath },
@@ -1087,7 +1091,8 @@ export function createMcpServer(
         reviewRef: z.string().regex(/^[0-9a-f]{40,64}$/),
       }),
       ...workspaceAppDescriptorMeta(config),
-      annotations: { readOnlyHint: true },
+      // Default reviews persist a reviewed checkpoint (markReviewed: true).
+      annotations: { readOnlyHint: false, destructiveHint: false },
     },
     async ({ workspaceId }, { _meta, requestId }) => observeToolOperation(config, "show_changes", async () => {
       const startedAt = performance.now();

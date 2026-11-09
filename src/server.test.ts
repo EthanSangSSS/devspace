@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
+import Database from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { loadConfig, type ServerConfig, type ToolMode } from "./config.js";
@@ -117,8 +118,46 @@ test("open_workspace is not advertised as read-only because worktree mode create
         assert.equal(openTool.annotations?.readOnlyHint, false);
         assert.equal(openTool.annotations?.destructiveHint, false);
         assert.equal(readTool.annotations?.readOnlyHint, true);
+        const reviewTool = tools.tools.find((tool) => tool.name === "show_changes");
+        assert.ok(reviewTool);
+        assert.equal(reviewTool.annotations?.readOnlyHint, false,
+          "show_changes marks checkpoints reviewed and must not claim read-only");
       });
     }
+  }
+});
+
+test("MCP read and process-session inspection preserve lastUsedAt after opening a checkout", async (t) => {
+  const context = await fixture(t, { toolMode: "codex" });
+  const opened = structuredContent(await callOpen(context.client, context.project));
+  const workspaceId = opened.workspaceId as string;
+  const db = new Database(join(context.stateDir, "devspace.sqlite"));
+  try {
+    const readTimestamp = db.prepare("SELECT last_used_at AS value FROM workspace_sessions WHERE id = ?");
+    const sentinel = "2001-01-01T00:00:00.000Z";
+    assert.equal(db.prepare("UPDATE workspace_sessions SET last_used_at = ? WHERE id = ?")
+      .run(sentinel, workspaceId).changes, 1);
+
+    const read = await context.client.callTool({
+      name: "read",
+      arguments: { workspaceId, path: "AGENTS.md" },
+    });
+    assert.equal(read.isError, undefined);
+    assert.match(JSON.stringify(read.content), /project instructions/);
+    assert.equal((readTimestamp.get(workspaceId) as { value: string }).value, sentinel,
+      "read must not persist a new last-used time");
+
+    const processes = await context.client.callTool({
+      name: "list_process_sessions",
+      arguments: { workspaceId },
+    });
+    assert.equal(processes.isError, undefined);
+    assert.equal((readTimestamp.get(workspaceId) as { value: string }).value, sentinel,
+      "read-only process metadata must not persist a new last-used time");
+  } finally {
+    // Close this extra reader before the fixture's after hook removes its
+    // SQLite WAL/SHM files. Windows refuses to unlink open SQLite handles.
+    db.close();
   }
 });
 
@@ -485,6 +524,7 @@ test("open_workspace scopes checkout reuse to OpenAI session metadata", async (t
 interface ServerFixture {
   client: Client;
   project: string;
+  stateDir: string;
 }
 
 async function fixture(
@@ -598,7 +638,7 @@ async function fixture(
     await rm(root, { recursive: true, force: true });
   });
 
-  return { client, project };
+  return { client, project, stateDir };
 }
 
 function fakeAgyService(): {
