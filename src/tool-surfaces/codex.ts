@@ -201,7 +201,8 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
           { tool: toolNames.listProcessSessions, workspaceId },
           startedAt,
           async () => {
-            await workspaces.getWorkspaceForTool(workspaceId);
+            // Listing process metadata must not persist a workspace touch.
+            await workspaces.getWorkspaceForTool(workspaceId, { touchSession: false });
             return processSessions.listRecoverable(workspaceId);
           },
         );
