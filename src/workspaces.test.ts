@@ -8,7 +8,12 @@ import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 import Database from "better-sqlite3";
 import { loadConfig, type ServerConfig } from "./config.js";
-import { GitWorktreeError, verifyManagedWorktreeVolumeSync } from "./git-worktrees.js";
+import {
+  checkoutPinnedWorktree,
+  GitWorktreeError,
+  reserveManagedWorktreePath,
+  verifyManagedWorktreeVolumeSync,
+} from "./git-worktrees.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 import { writeTestDevspaceConfig } from "./test-support/config.test.js";
@@ -460,6 +465,229 @@ test("worktree opens require Git and create an isolated managed workspace", asyn
 
   const resolvedReadme = context.registry.resolvePath(opened.workspace, "README.md");
   assert.equal(resolvedReadme.startsWith(opened.workspace.canonicalRoot), true);
+});
+
+test("managed worktree checkout tolerates more than 1 MiB from a post-checkout hook", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const hook = join(gitRoot, ".git", "hooks", "post-checkout");
+  await writeFile(hook, [
+    "#!/bin/sh",
+    "node -e 'require(\"node:fs\").writeFileSync(\"hook-output.marker\", \"ok\"); process.stdout.write(\"x\".repeat(1250000))'",
+    "",
+  ].join("\n"));
+  await chmod(hook, 0o755);
+
+  const opened = await context.registry.openWorkspace({ path: gitRoot, mode: "worktree" });
+  assert.equal(await readFile(join(opened.workspace.root, "hook-output.marker"), "utf8"), "ok");
+  // Git normally converts checkout text to CRLF on Windows.
+  assert.equal((await readFile(join(opened.workspace.root, "README.md"), "utf8"))
+    .replace(/\r\n/g, "\n"), "hello\n");
+});
+
+test("managed worktree reservation retries collisions without touching existing files", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const worktreeRoot = context.config.worktreeRoot;
+  await mkdir(worktreeRoot, { recursive: true });
+
+  const collidedId = "0".repeat(24);
+  const nextId = "1".repeat(24);
+  const existing = join(worktreeRoot, `git-project-${collidedId}`);
+  await mkdir(existing);
+  await writeFile(join(existing, "keep.txt"), "original contents\n");
+
+  const candidates = [collidedId, nextId];
+  const reserved = await reserveManagedWorktreePath({
+    worktreeRoot,
+    repoRoot: gitRoot,
+    generateId: () => {
+      const id = candidates.shift();
+      assert.ok(id, "reservation must not exhaust deterministic candidates");
+      return id;
+    },
+  });
+
+  assert.equal(reserved, join(worktreeRoot, `git-project-${nextId}`));
+  assert.equal(await readFile(join(existing, "keep.txt"), "utf8"), "original contents\n");
+  assert.deepEqual((await readdir(worktreeRoot)).sort(), [
+    `git-project-${collidedId}`,
+    `git-project-${nextId}`,
+  ]);
+  assert.equal(await readFile(join(existing, "keep.txt"), "utf8"), "original contents\n");
+});
+
+test("managed worktree reservation never creates an absent parent root", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const missingRoot = join(context.root, "not-mounted-worktree-root");
+
+  await assert.rejects(
+    () => reserveManagedWorktreePath({ worktreeRoot: missingRoot, repoRoot: gitRoot }),
+    { code: "ENOENT" },
+  );
+  await assert.rejects(stat(missingRoot), { code: "ENOENT" });
+});
+
+test("pinned worktree checkout rejects a replaced symlink target before Git writes", {
+  skip: platform() === "win32",
+}, async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const worktreeRoot = context.config.worktreeRoot;
+  await mkdir(worktreeRoot, { recursive: true });
+  const reserved = await reserveManagedWorktreePath({ worktreeRoot, repoRoot: gitRoot });
+  const identity = await lstat(reserved, { bigint: true });
+  const displaced = join(worktreeRoot, "original-reservation");
+  await rename(reserved, displaced);
+  await symlink(context.outsideRoot, reserved, "dir");
+  const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: gitRoot });
+
+  await assert.rejects(
+    () => checkoutPinnedWorktree({
+      sourceRoot: gitRoot,
+      worktreeRoot,
+      worktreePath: reserved,
+      baseSha: stdout.trim(),
+      expectedDev: identity.dev.toString(),
+      expectedIno: identity.ino.toString(),
+    }),
+    /Reserved managed worktree directory changed before checkout/,
+  );
+  assert.deepEqual(await readdir(context.outsideRoot), []);
+  assert.deepEqual(await readdir(displaced), []);
+});
+
+test("Git cannot follow a symlink swapped after the pinned child has entered its cwd", {
+  skip: platform() === "win32",
+}, async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const shimDir = join(context.root, "swap-before-git");
+  await mkdir(shimDir);
+  const shim = join(shimDir, "git");
+  await writeFile(shim, [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"worktree\" ] && [ \"$2\" = \"add\" ]; then",
+    "  original=$(/bin/pwd -P)",
+    "  /bin/mv \"$original\" \"$original-relocated\"",
+    "  /bin/ln -s \"$DEVSPACE_TEST_SWAPPED_TARGET\" \"$original\"",
+    "fi",
+    "exec /usr/bin/git \"$@\"",
+    "",
+  ].join("\n"));
+  await chmod(shim, 0o700);
+
+  const originalPath = process.env.PATH;
+  const originalTarget = process.env.DEVSPACE_TEST_SWAPPED_TARGET;
+  process.env.PATH = `${shimDir}:${originalPath ?? ""}`;
+  process.env.DEVSPACE_TEST_SWAPPED_TARGET = context.outsideRoot;
+  try {
+    await assert.rejects(
+      () => context.registry.openWorkspace({ path: gitRoot, mode: "worktree" }),
+      (error: unknown) => error instanceof GitWorktreeError &&
+        error.code === "GIT_WORKTREE_CREATE_FAILED" &&
+        /Reserved managed worktree directory changed during checkout/.test(error.message),
+    );
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    if (originalTarget === undefined) delete process.env.DEVSPACE_TEST_SWAPPED_TARGET;
+    else process.env.DEVSPACE_TEST_SWAPPED_TARGET = originalTarget;
+  }
+  assert.deepEqual(await readdir(context.outsideRoot), []);
+  const paths = await readdir(context.config.worktreeRoot);
+  const relocated = paths.find((name) => name.endsWith("-relocated"));
+  assert.ok(relocated, "the original directory should contain the checkout under a different name");
+  assert.equal(await readFile(join(context.config.worktreeRoot, relocated, "README.md"), "utf8"), "hello\n");
+});
+
+test("managed worktree reservation fails closed when all candidates collide", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const id = "0".repeat(24);
+  const occupied = join(context.config.worktreeRoot, `git-project-${id}`);
+  await mkdir(occupied, { recursive: true });
+  await writeFile(join(occupied, "keep.txt"), "user content\n");
+  let attempts = 0;
+  await assert.rejects(
+    () => reserveManagedWorktreePath({
+      worktreeRoot: context.config.worktreeRoot,
+      repoRoot: gitRoot,
+      generateId: () => {
+        attempts++;
+        return id;
+      },
+    }),
+    (error: unknown) => error instanceof GitWorktreeError && error.code === "GIT_WORKTREE_CREATE_FAILED",
+  );
+  assert.equal(attempts, 10);
+  assert.equal(await readFile(join(occupied, "keep.txt"), "utf8"), "user content\n");
+});
+
+test("managed worktree reservation fails closed for symlink collision", { skip: platform() === "win32" }, async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  const id = "0".repeat(24);
+  const foreign = join(context.root, "foreign-directory");
+  await mkdir(foreign);
+  await writeFile(join(foreign, "keep.txt"), "foreign data\n");
+  await mkdir(context.config.worktreeRoot, { recursive: true });
+  const link = join(context.config.worktreeRoot, `git-project-${id}`);
+  await symlink(foreign, link, "dir");
+
+  await assert.rejects(
+    () => reserveManagedWorktreePath({
+      worktreeRoot: context.config.worktreeRoot,
+      repoRoot: gitRoot,
+      generateId: () => id,
+    }),
+    /outside allowed roots/,
+  );
+  assert.equal((await lstat(link)).isSymbolicLink(), true);
+  assert.equal(await readFile(join(foreign, "keep.txt"), "utf8"), "foreign data\n");
+});
+
+test("failed Git worktree creation retains its reservation without deleting anything", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  await writeFile(join(gitRoot, ".git", "worktrees"), "prevent git metadata creation\n");
+
+  await assert.rejects(
+    () => context.registry.openWorkspace({ path: gitRoot, mode: "worktree" }),
+    (error: unknown) => error instanceof GitWorktreeError && error.code === "GIT_WORKTREE_CREATE_FAILED",
+  );
+  const paths = await readdir(context.config.worktreeRoot);
+  assert.equal(paths.length, 1, "failed Git must not delete or reuse the reserved path");
+  assert.match(paths[0]!, /^git-project-[a-f0-9]{24}$/);
+  assert.equal((await stat(join(context.config.worktreeRoot, paths[0]!))).isDirectory(), true);
+});
+
+test("checkout-stage failure never promises Git left its worktree target in place", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  await writeFile(join(gitRoot, ".gitattributes"), "README.md filter=checkout-fail\n");
+  await git(gitRoot, ["add", ".gitattributes"]);
+  await git(gitRoot, ["commit", "-m", "Require failing checkout filter"]);
+  await git(gitRoot, ["config", "filter.checkout-fail.clean", "cat"]);
+  await git(gitRoot, ["config", "filter.checkout-fail.smudge", "false"]);
+  await git(gitRoot, ["config", "filter.checkout-fail.required", "true"]);
+
+  await assert.rejects(
+    () => context.registry.openWorkspace({ path: gitRoot, mode: "worktree" }),
+    (error: unknown) =>
+      error instanceof GitWorktreeError
+      && error.code === "GIT_WORKTREE_CREATE_FAILED"
+      && /smudge filter '?checkout-fail'? failed/.test(error.message)
+      && /DevSpace did not delete the target/.test(error.message)
+      && /Git may have removed it/.test(error.message),
+  );
+  assert.equal(await readFile(join(gitRoot, "README.md"), "utf8"), "hello\n");
+  const remaining = await readdir(context.config.worktreeRoot);
+  assert.ok(remaining.length <= 1, "Git may retain or clean up its own failed checkout");
+  for (const entry of remaining) {
+    assert.match(entry, /^git-project-[a-f0-9]{24}$/);
+  }
 });
 
 test("persisted checkout and worktree sessions restore after recreating the registry", async (t) => {

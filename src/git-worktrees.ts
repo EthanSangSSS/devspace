@@ -12,6 +12,35 @@ import { gitEnvironment } from "./git-environment.js";
 
 const execFileAsync = promisify(execFile);
 
+// The child checks the directory it actually entered before launching Git.
+// Git then checks out "." relative to that bound cwd, never via a mutable
+// absolute reservation pathname. No shell expansion or new runtime dependency.
+const PINNED_WORKTREE_CHECKOUT = String.raw`
+const fs = require("node:fs");
+const path = require("node:path");
+const cp = require("node:child_process");
+const [gitDir, sha, expectedDev, expectedIno, root] = process.argv.slice(1);
+const current = fs.statSync(".", { bigint: true });
+if (current.dev.toString() !== expectedDev || current.ino.toString() !== expectedIno
+    || path.dirname(fs.realpathSync(".")) !== fs.realpathSync(root)) {
+  process.stderr.write("Reserved managed worktree directory changed before checkout.\n");
+  process.exit(125);
+}
+const result = cp.spawnSync("git", ["worktree", "add", "--detach", ".", sha], {
+  encoding: "utf8",
+  env: { ...process.env, GIT_DIR: gitDir },
+  // Match the outer execFileAsync limit; verbose Git hooks can exceed 1 MiB.
+  maxBuffer: 10 * 1024 * 1024,
+});
+if (result.stdout) process.stdout.write(result.stdout);
+if (result.stderr) process.stderr.write(result.stderr);
+if (result.error) {
+  process.stderr.write(String(result.error) + "\n");
+  process.exit(127);
+}
+process.exit(result.status ?? 1);
+`;
+
 export class GitWorktreeError extends Error {
   constructor(
     readonly code:
@@ -35,6 +64,62 @@ export interface ManagedWorktree {
   dirtySource: boolean;
   detached: boolean;
   managed: boolean;
+}
+
+/** Reserve one new child atomically, after the caller has verified/prepared its root. */
+export async function reserveManagedWorktreePath(input: {
+  worktreeRoot: string;
+  repoRoot: string;
+  generateId?: () => string;
+}): Promise<string> {
+  const repoName = sanitizePathSegment(basename(input.repoRoot)) || "repo";
+  const generateId = input.generateId ?? (() => randomBytes(12).toString("hex"));
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const id = generateId();
+    if (!/^[a-f0-9]{24}$/.test(id)) {
+      throw new GitWorktreeError("GIT_WORKTREE_CREATE_FAILED", "Invalid managed worktree identifier.");
+    }
+    const path = join(input.worktreeRoot, `${repoName}-${id}`);
+    assertAllowedPath(path, [input.worktreeRoot]);
+    try {
+      // Non-recursive mkdir is exclusive: EEXIST is a collision, not ownership.
+      await mkdir(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+      throw error;
+    }
+
+    const identity = await lstat(path);
+    if (!identity.isDirectory() || identity.isSymbolicLink()) {
+      throw new GitWorktreeError("GIT_WORKTREE_CREATE_FAILED", "Reserved worktree path changed during creation.");
+    }
+    return path;
+  }
+
+  throw new GitWorktreeError("GIT_WORKTREE_CREATE_FAILED", "Could not reserve a unique managed worktree path.");
+}
+
+/** Run Git against a child cwd verified by inode, not the mutable target path. */
+export async function checkoutPinnedWorktree(input: {
+  sourceRoot: string;
+  worktreeRoot: string;
+  worktreePath: string;
+  baseSha: string;
+  expectedDev: string;
+  expectedIno: string;
+}): Promise<void> {
+  const commonGitDir = (await git(
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"], input.sourceRoot,
+  )).trim();
+  await execFileAsync(process.execPath, [
+    "--input-type=commonjs", "-e", PINNED_WORKTREE_CHECKOUT,
+    commonGitDir, input.baseSha, input.expectedDev, input.expectedIno, input.worktreeRoot,
+  ], {
+    cwd: input.worktreePath,
+    env: gitEnvironment(),
+    maxBuffer: 10 * 1024 * 1024,
+  });
 }
 
 export async function createManagedWorktree(input: {
@@ -86,10 +171,6 @@ export async function createManagedWorktree(input: {
   const baseRef = input.baseRef ?? "HEAD";
   const baseSha = await resolveBaseCommit(sourceRoot, baseRef);
   const dirtySource = (await git(["status", "--porcelain=v1"], sourceRoot)).trim().length > 0;
-  const worktreePath = managedWorktreePath({
-    worktreeRoot: input.config.worktreeRoot,
-    repoRoot: sourceRoot,
-  });
 
   // Validate the opt-in mounted-volume policy before any mkdir. Even an
   // invalid configuration must not create a fallback on the internal disk.
@@ -112,19 +193,43 @@ export async function createManagedWorktree(input: {
   } else {
     await mkdir(input.config.worktreeRoot, { recursive: true });
   }
+  // Only reserve the child after the mount and existing-root gates succeed.
+  // Reserving first could create a host fallback when DevSSD is unavailable.
+  const worktreePath = await reserveManagedWorktreePath({
+    worktreeRoot: input.config.worktreeRoot,
+    repoRoot: sourceRoot,
+  });
   assertAllowedPath(worktreePath, [input.config.worktreeRoot]);
 
   try {
-    await git(["worktree", "add", "--detach", worktreePath, baseSha], sourceRoot);
+    const reserved = await lstat(worktreePath, { bigint: true });
+    if (!reserved.isDirectory() || reserved.isSymbolicLink()) {
+      throw new Error("Reserved managed worktree directory was replaced before checkout.");
+    }
+    await checkoutPinnedWorktree({
+      sourceRoot,
+      worktreeRoot: input.config.worktreeRoot,
+      worktreePath,
+      baseSha,
+      expectedDev: reserved.dev.toString(),
+      expectedIno: reserved.ino.toString(),
+    });
+    const checkedOut = await lstat(worktreePath, { bigint: true });
+    if (!checkedOut.isDirectory() || checkedOut.isSymbolicLink()
+        || checkedOut.dev !== reserved.dev || checkedOut.ino !== reserved.ino) {
+      throw new Error("Reserved managed worktree directory changed during checkout.");
+    }
   } catch (error) {
-    // A different process (or the user) may have created this path while Git
-    // was running. Never recursively remove a path we cannot prove we own.
-    // Leave any partial directory for explicit diagnosis rather than risking
-    // the destruction of worktree or user files.
-    const message = error instanceof Error ? error.message : String(error);
+    // DevSpace never removes the reserved pathname: it may have been replaced
+    // while Git ran. Git's own failed-checkout cleanup is outside our control.
+    const stderr = typeof error === "object" && error && "stderr" in error
+      ? String((error as { stderr?: unknown }).stderr ?? "").trim()
+      : "";
+    const message = stderr || (error instanceof Error ? error.message : String(error));
     throw new GitWorktreeError(
       "GIT_WORKTREE_CREATE_FAILED",
-      `Git failed to create the managed worktree. ${message}`,
+      `Git failed to create the managed worktree. ${message}`
+        + ` DevSpace did not delete the target ${worktreePath}; Git may have removed it. Inspect before recovery.`,
     );
   }
 
@@ -277,12 +382,6 @@ async function resolveBaseCommit(sourceRoot: string, baseRef: string): Promise<s
       `Cannot open workspace in worktree mode because baseRef ${JSON.stringify(baseRef)} does not resolve to a commit.`,
     );
   }
-}
-
-function managedWorktreePath(input: { worktreeRoot: string; repoRoot: string }): string {
-  const repoName = sanitizePathSegment(basename(input.repoRoot)) || "repo";
-  const worktreeId = randomBytes(4).toString("hex");
-  return join(input.worktreeRoot, `${repoName}-${worktreeId}`);
 }
 
 function sanitizePathSegment(value: string): string {
