@@ -132,28 +132,33 @@ test("MCP read and process-session inspection preserve lastUsedAt after opening 
   const opened = structuredContent(await callOpen(context.client, context.project));
   const workspaceId = opened.workspaceId as string;
   const db = new Database(join(context.stateDir, "devspace.sqlite"));
-  t.after(() => db.close());
-  const readTimestamp = db.prepare("SELECT last_used_at AS value FROM workspace_sessions WHERE id = ?");
-  const sentinel = "2001-01-01T00:00:00.000Z";
-  assert.equal(db.prepare("UPDATE workspace_sessions SET last_used_at = ? WHERE id = ?")
-    .run(sentinel, workspaceId).changes, 1);
+  try {
+    const readTimestamp = db.prepare("SELECT last_used_at AS value FROM workspace_sessions WHERE id = ?");
+    const sentinel = "2001-01-01T00:00:00.000Z";
+    assert.equal(db.prepare("UPDATE workspace_sessions SET last_used_at = ? WHERE id = ?")
+      .run(sentinel, workspaceId).changes, 1);
 
-  const read = await context.client.callTool({
-    name: "read",
-    arguments: { workspaceId, path: "AGENTS.md" },
-  });
-  assert.equal(read.isError, undefined);
-  assert.match(JSON.stringify(read.content), /project instructions/);
-  assert.equal((readTimestamp.get(workspaceId) as { value: string }).value, sentinel,
-    "read must not persist a new last-used time");
+    const read = await context.client.callTool({
+      name: "read",
+      arguments: { workspaceId, path: "AGENTS.md" },
+    });
+    assert.equal(read.isError, undefined);
+    assert.match(JSON.stringify(read.content), /project instructions/);
+    assert.equal((readTimestamp.get(workspaceId) as { value: string }).value, sentinel,
+      "read must not persist a new last-used time");
 
-  const processes = await context.client.callTool({
-    name: "list_process_sessions",
-    arguments: { workspaceId },
-  });
-  assert.equal(processes.isError, undefined);
-  assert.equal((readTimestamp.get(workspaceId) as { value: string }).value, sentinel,
-    "read-only process metadata must not persist a new last-used time");
+    const processes = await context.client.callTool({
+      name: "list_process_sessions",
+      arguments: { workspaceId },
+    });
+    assert.equal(processes.isError, undefined);
+    assert.equal((readTimestamp.get(workspaceId) as { value: string }).value, sentinel,
+      "read-only process metadata must not persist a new last-used time");
+  } finally {
+    // Close this extra reader before the fixture's after hook removes its
+    // SQLite WAL/SHM files. Windows refuses to unlink open SQLite handles.
+    db.close();
+  }
 });
 
 test("open_workspace stays model-only without a widget while show_changes keeps its widget", async (t) => {
